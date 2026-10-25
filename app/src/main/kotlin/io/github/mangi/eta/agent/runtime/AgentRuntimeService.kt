@@ -457,29 +457,46 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     }
 
     private fun executeRun(run: RuntimeRunRegistry.Run) {
-        val outcome = AgentRuntimeRunExecutor(
-            context = this,
-            guiControl = guiControl,
-            currentPermissions = ::currentRuntimePermissions,
-            snapshotRequest = run::snapshotRequest,
-            onAcceptedEvent = { event, _ ->
-                handleAcceptedRunEvent(run, event)
-            },
-            persistArtifacts = ::persistRunArtifacts,
-        ).execute(run.session, run.request)
-        if (!outcome.shouldUpdateHost) return
-        postTerminalOverlay(
-            run = run,
-            result = outcome.result,
-            completedContext = outcome.response?.let { completedResponse ->
-                outcome.completedRequest?.let { completedRequest ->
-                    RuntimeRunRegistry.CompletedContext(
-                        request = completedRequest,
-                        response = completedResponse,
-                    )
-                }
-            },
-        )
+        // etax: 任务开始/结束的通知栏钩子。3.3.4 把执行重构到这里，ok/error 从 outcome.result 取；
+        // try/finally 保证成功、出错、提前返回都发出收尾通知。
+        val shadowChat = run.request.operation == AgentRuntimeWire.OP_CHAT
+        if (shadowChat) com.eta.shadow.ShadowNotice.onRunStarted()
+        var shadowResult: AgentRuntimeWire.RunResult? = null
+        try {
+            val outcome = AgentRuntimeRunExecutor(
+                context = this,
+                guiControl = guiControl,
+                currentPermissions = ::currentRuntimePermissions,
+                snapshotRequest = run::snapshotRequest,
+                onAcceptedEvent = { event, _ ->
+                    handleAcceptedRunEvent(run, event)
+                },
+                persistArtifacts = ::persistRunArtifacts,
+            ).execute(run.session, run.request)
+            shadowResult = outcome.result
+            if (!outcome.shouldUpdateHost) return
+            postTerminalOverlay(
+                run = run,
+                result = outcome.result,
+                completedContext = outcome.response?.let { completedResponse ->
+                    outcome.completedRequest?.let { completedRequest ->
+                        RuntimeRunRegistry.CompletedContext(
+                            request = completedRequest,
+                            response = completedResponse,
+                        )
+                    }
+                },
+            )
+        } finally {
+            // etax: 成功 / 出错 / 停止都走这里，明确发出收尾通知
+            if (shadowChat) {
+                com.eta.shadow.ShadowNotice.onRunFinished(
+                    this,
+                    shadowResult?.ok == true,
+                    shadowResult?.error ?: if (shadowResult == null) "运行异常中断" else null,
+                )
+            }
+        }
     }
 
     private fun handleAcceptedRunEvent(
