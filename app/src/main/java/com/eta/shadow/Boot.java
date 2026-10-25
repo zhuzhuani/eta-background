@@ -332,8 +332,31 @@ public final class Boot {
             }
             fields.add(n);
         }
-        if (fields.isEmpty())
-            return new JSONObject().put("ok", false).put("code", "NO_EDITABLE").put("displayId", did);
+        if (fields.isEmpty()) {
+            // C: 不只回一句 NO_EDITABLE——把屏上可点/有文字的节点作为候选返回，
+            // 模型可以先 screen_click 点进某个控件再写，而不是瞎猜。
+            JSONArray cand = new JSONArray();
+            for (AccessibilityNodeInfo n : flatten(windowsOf(did), 400)) {
+                if (cand.length() >= 12) break;
+                String t = n.getText() == null ? "" : n.getText().toString().trim();
+                String d = n.getContentDescription() == null ? ""
+                        : n.getContentDescription().toString().trim();
+                String v = n.getViewIdResourceName() == null ? "" : n.getViewIdResourceName();
+                if (!n.isClickable() && t.isEmpty() && d.isEmpty()) continue;
+                if (t.isEmpty() && d.isEmpty() && v.isEmpty()) continue;
+                Rect r = new Rect();
+                n.getBoundsInScreen(r);
+                cand.put(new JSONObject()
+                        .put("text", t.length() > 24 ? t.substring(0, 24) : t)
+                        .put("desc", d.length() > 24 ? d.substring(0, 24) : d)
+                        .put("vid", v)
+                        .put("click", n.isClickable())
+                        .put("bounds", new JSONArray().put(r.left).put(r.top).put(r.right).put(r.bottom)));
+            }
+            return new JSONObject().put("ok", false).put("code", "NO_EDITABLE").put("displayId", did)
+                    .put("candidates", cand)
+                    .put("hint", "没有可编辑输入框；可能要先 screen_click 点进某个控件再写，或此屏本就没有输入框。");
+        }
 
         if (req.has("index") && index < 0) {
             return new JSONObject().put("ok", false).put("code", "INDEX_OUT_OF_RANGE")

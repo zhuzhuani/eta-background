@@ -168,13 +168,19 @@ public final class ShadowNotice {
         return -1;
     }
 
+    /** A: 把模型回答里的常见 markdown 去干净，通知栏里更像人话。 */
     private static String clean(String s) {
-        return s.replace("**", "")
-                .replace("`", "")
-                .replace("##", "")
-                .replace("\n", " ")
-                .replace("\r", " ")
-                .trim();
+        if (s == null) return "";
+        String t = s;
+        t = t.replaceAll("\\[([^\\]]*)\\]\\([^)]*\\)", "$1");   // 链接 [文字](url) -> 文字
+        t = t.replaceAll("(?m)^\\s{0,3}#{1,6}\\s*", "");          // 行首标题 #/##/###
+        t = t.replaceAll("(?m)^\\s*[-*+]\\s+", "");               // 行首列表符 - / * / +
+        t = t.replaceAll("(?m)^\\s*>\\s*", "");                   // 行首引用 >
+        t = t.replace("**", "").replace("__", "").replace("~~", "")
+                .replace("*", "").replace("`", "");               // 加粗/斜体/行内代码标记
+        t = t.replace("\n", " ").replace("\r", " ");
+        t = t.replaceAll("\\s{2,}", " ");                         // 压掉多余空白
+        return t.trim();
     }
 
     /** 保留句尾，从自然断点开始截，避免截在词中间。 */
