@@ -66,6 +66,12 @@ public final class ShadowSettings {
         }
     }
 
+    /** 由 Engine 在确认引擎起落后主动刷新缓存，避免 screen_state / 工具表等 3s 缓存过期。 */
+    public static void markEngineReady(boolean ready) {
+        engineReady = ready;
+        lastProbe = SystemClock.elapsedRealtime();
+    }
+
     /** Root engine (creates the hidden display, injects input, captures). */
     public static boolean engineReady(Context ctx) {
         long now = SystemClock.elapsedRealtime();

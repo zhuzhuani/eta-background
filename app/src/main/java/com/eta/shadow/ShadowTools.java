@@ -45,8 +45,13 @@ public final class ShadowTools {
 
         android.content.Context ctx = ShadowSettings.app();
         if (needsEngine(name) && !ShadowSettings.engineReady(ctx)) {
-            // 引擎没在跑：先用打进包里的 dex 自己拉起来（需 root），拉不起来再拒绝。
-            if (!Engine.ensureRunning(ctx)) {
+            // 引擎没在跑：用打进包里的 dex 自启（需 root）。冷启动最坏十几秒，这里只有界等待 8s：
+            // B — 还在启动就让模型过几秒重试，不把这次调用卡死；明确失败才给修复提示。
+            int st = Engine.ensureRunningBounded(ctx, 8000);
+            if (st == Engine.STARTING) {
+                return "后台虚拟屏引擎正在启动中，请过几秒重试该操作。";
+            }
+            if (st != Engine.UP) {
                 android.util.Log.w("EtaShadow", "engine down, refusing " + name);
                 return Engine.reasonHint();
             }
@@ -65,7 +70,13 @@ public final class ShadowTools {
             if (msg != null && msg.contains("OBSERVER_DOWN")) {
                 text = ShadowSettings.observerFixHint();
             } else if (msg != null && (msg.contains("ConnectException")
-                    || msg.contains("Connection refused") || msg.contains("timed out"))) {
+                    || msg.contains("Connection refused"))) {
+                // #1 自愈：引擎中途掉线——重置失效的虚拟屏会话并后台重启，提示模型重新 screen_open。
+                resetSession();
+                ShadowSettings.markEngineReady(false);
+                Engine.warm(ctx);
+                text = "后台虚拟屏引擎连接中断，已在后台尝试重启。请重新 screen_open 后再继续。";
+            } else if (msg != null && msg.contains("timed out")) {
                 text = ShadowSettings.engineFixHint();
             } else {
                 text = "失败：" + e.getClass().getSimpleName() + (msg == null ? "" : "：" + msg);
@@ -318,6 +329,12 @@ public final class ShadowTools {
 
     private static void requireSession() {
         if (mode == null || display < 0) throw new IllegalStateException("NO_SESSION: call screen_open first");
+    }
+
+    /** #1：引擎掉线或收尾后清掉本地会话句柄（旧虚拟屏已随引擎消失）。 */
+    static void resetSession() {
+        mode = null;
+        display = -1;
     }
 
     /**
