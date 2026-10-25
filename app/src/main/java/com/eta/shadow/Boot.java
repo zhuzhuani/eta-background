@@ -36,6 +36,11 @@ public final class Boot {
 
     private static volatile AccessibilityService service;
     private static ServerSocket server;
+    // S3: 观察者连接是长连接（wait/idle 可占线程数分钟），不宜用固定小池（会饿死长等待）；
+    // 改为对并发处理线程数设上限，过载时直接拒掉多余连接，挡住线程无上限增长。
+    private static final java.util.concurrent.atomic.AtomicInteger ACTIVE =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+    private static final int MAX_ACTIVE = 32;
     private static volatile long lastEventAt = SystemClock.elapsedRealtime();
     private static volatile int eventCount = 0;
     private static final SparseLongArray lastEventByDisplay = new SparseLongArray();
@@ -78,28 +83,6 @@ public final class Boot {
         }
     }
 
-    private static String readAsset(String name) {
-        try (java.io.InputStream in = service.getAssets().open(name)) {
-            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
-            byte[] buf = new byte[4096];
-            int n;
-            while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
-            return new String(bo.toByteArray(), "UTF-8");
-        } catch (Throwable t) {
-            return "";
-        }
-    }
-
-    private static void copyAsset(String name, java.io.File out) throws Exception {
-        try (java.io.InputStream in = service.getAssets().open(name);
-             java.io.FileOutputStream fo = new java.io.FileOutputStream(out)) {
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) > 0) fo.write(buf, 0, n);
-            fo.getFD().sync();
-        }
-    }
-
     private static String readText(java.io.File f) {
         try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
             java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
@@ -109,15 +92,6 @@ public final class Boot {
             return new String(bo.toByteArray(), "UTF-8");
         } catch (Throwable t) {
             return "";
-        }
-    }
-
-    private static void writeText(java.io.File f, String s) {
-        try (java.io.FileOutputStream fo = new java.io.FileOutputStream(f)) {
-            fo.write(s.getBytes("UTF-8"));
-            fo.getFD().sync();
-        } catch (Throwable t) {
-            android.util.Log.w("EtaShadow", "write " + f + " failed: " + t);
         }
     }
 
@@ -186,8 +160,15 @@ public final class Boot {
                     while (true) {
                         try {
                             final Socket s = server.accept();
+                            if (ACTIVE.get() >= MAX_ACTIVE) {
+                                try { s.close(); } catch (Throwable ignored) { }   // 过载保护
+                                continue;
+                            }
+                            ACTIVE.incrementAndGet();
                             Thread c = new Thread(new Runnable() {
-                                public void run() { serve(s); }
+                                public void run() {
+                                    try { serve(s); } finally { ACTIVE.decrementAndGet(); }
+                                }
                             });
                             c.setDaemon(true);
                             c.start();

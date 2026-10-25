@@ -38,6 +38,19 @@ public final class ShadowTools {
      * (the Kotlin side wraps it into ToolResult, no reflection needed).
      */
     public static String intercept(String name, String argumentsJson) {
+        // S1: 影子入口全程异常隔离——这里出任何未捕获的异常都不许冒回上游宿主。
+        try {
+            return interceptInner(name, argumentsJson);
+        } catch (Throwable t) {
+            android.util.Log.w("EtaShadow", "intercept crashed: " + t);
+            // screen_* 是我们自己的工具，回一句错误；其它工具返回 null 交还上游正常处理。
+            return (name != null && name.startsWith("screen_"))
+                    ? "后台操作内部错误：" + t.getClass().getSimpleName()
+                    : null;
+        }
+    }
+
+    private static String interceptInner(String name, String argumentsJson) {
         if ("terminal".equals(name)) {
             return guardTerminal(argumentsJson);
         }
@@ -115,7 +128,7 @@ public final class ShadowTools {
 
     private static final String[] GUI_SHELL = {
             "am start", "am force-stop", "input tap", "input swipe", "input text",
-            "input keyevent", "input keyevent", "screencap", "uiautomator dump",
+            "input keyevent", "screencap", "uiautomator dump",
             "input roll", "monkey -p"};
 
     /** Bring a parked session back to the main display (used by notification taps). */

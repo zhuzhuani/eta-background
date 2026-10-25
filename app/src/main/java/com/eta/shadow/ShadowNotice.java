@@ -203,13 +203,18 @@ public final class ShadowNotice {
     /** 前台通知正文：刚执行的工具步骤优先，否则显示最新一句。 */
     public static String decorate(Object original) {
         String base = original == null ? "" : original.toString();
-        if (!active) return base;
-        long now = SystemClock.elapsedRealtime();
-        String s = step;
-        if (!s.isEmpty() && now - stepAt < STEP_SHOW_MS) return s;
-        if (now - lastAppend > STREAM_STALE_MS) return base;
-        String line = lastLine;
-        return line.isEmpty() ? base : line;
+        // S4: 这是上游构建前台通知时调的热路径，出任何异常都退回原文，绝不往上游抛。
+        try {
+            if (!active) return base;
+            long now = SystemClock.elapsedRealtime();
+            String s = step;
+            if (!s.isEmpty() && now - stepAt < STEP_SHOW_MS) return s;
+            if (now - lastAppend > STREAM_STALE_MS) return base;
+            String line = lastLine;
+            return line.isEmpty() ? base : line;
+        } catch (Throwable t) {
+            return base;
+        }
     }
 
     /** 前台通知的多行展开视图（每句一行）。 */
