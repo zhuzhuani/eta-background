@@ -60,9 +60,23 @@ jobs:
         id: sign
         env:
           ETAX_KEYSTORE_BASE64: ${{ secrets.ETAX_KEYSTORE_BASE64 }}
+          ETAX_STORE_PASSWORD: ${{ secrets.ETAX_STORE_PASSWORD }}
+          ETAX_KEY_ALIAS: ${{ secrets.ETAX_KEY_ALIAS }}
+          ETAX_KEY_PASSWORD: ${{ secrets.ETAX_KEY_PASSWORD }}
         run: |
           if [[ -n "$ETAX_KEYSTORE_BASE64" ]]; then
+            # 配了 keystore 就必须四个都齐，否则 gradle 会产出未签名 APK。缺哪个报哪个（不打印值）。
+            missing=""
+            [[ -z "$ETAX_STORE_PASSWORD" ]] && missing="$missing ETAX_STORE_PASSWORD"
+            [[ -z "$ETAX_KEY_ALIAS" ]]      && missing="$missing ETAX_KEY_ALIAS"
+            [[ -z "$ETAX_KEY_PASSWORD" ]]   && missing="$missing ETAX_KEY_PASSWORD"
+            if [[ -n "$missing" ]]; then
+              echo "::error::已配置 ETAX_KEYSTORE_BASE64，但这些签名 Secret 缺失或为空：$missing"
+              echo "::error::请到 仓库 Settings → Secrets and variables → Actions 补齐（名字须完全一致：ETAX_KEYSTORE_BASE64 / ETAX_STORE_PASSWORD / ETAX_KEY_ALIAS / ETAX_KEY_PASSWORD）。或暂时删掉 ETAX_KEYSTORE_BASE64 改用临时证书。"
+              exit 1
+            fi
             printf '%s' "$ETAX_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/etax.jks"
+            echo "签名证书就绪：四个 Secret 齐全，将用你的 keystore 签名"
             echo "has_key=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::没有配置 ETAX_KEYSTORE_BASE64：用临时证书签名，装机前需先卸载旧的 etax"
