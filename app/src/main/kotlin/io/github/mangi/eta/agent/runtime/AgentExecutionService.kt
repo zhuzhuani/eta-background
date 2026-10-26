@@ -164,6 +164,7 @@ internal class AgentExecutionService : Service() {
 
     /** 状态栏胶囊约 7 个字符可完整显示；更长时只取动作，工具名留在展开态。 */
     private fun AgentOverlayStatus.shortText(): String = when (this) {
+        is AgentOverlayStatus.BackgroundScreen, AgentOverlayStatus.WaitingForModel -> localizedText(resources).take(7)
         is AgentOverlayStatus.RunningTool, is AgentOverlayStatus.HostedToolRunning -> getString(R.string.execution_chip_running)
         AgentOverlayStatus.Paused -> getString(R.string.overlay_paused)
         AgentOverlayStatus.Stopping -> getString(R.string.overlay_stopping)
@@ -231,6 +232,12 @@ internal class AgentExecutionService : Service() {
 
         internal fun usesSystemTaskSurface(): Boolean = Build.VERSION.SDK_INT >= 36 &&
             Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1
+
+        internal fun taskNotificationsEnabled(context: Context): Boolean {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            return manager.areNotificationsEnabled() &&
+                manager.getNotificationChannel(CHANNEL)?.importance != NotificationManager.IMPORTANCE_NONE
+        }
 
         private fun conversationIntent(context: Context, conversationId: String?): PendingIntent {
             val intent = Intent(context, MainActivity::class.java)

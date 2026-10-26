@@ -5,7 +5,21 @@ import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlin.concurrent.thread
+
+internal enum class BackgroundScreenPhase { WaitingForApp, ReleasingScreen, OpeningApp, RestoringDisplay }
+
+internal interface ScreenToolConnection {
+    fun execute(name: String, arguments: String): String?
+    fun release(keepFinished: Boolean): Boolean
+    fun keepAlive()
+}
+
+private class ShadowScreenConnection(id: String) : ScreenToolConnection {
+    private val tools = ShadowTools(id)
+    override fun execute(name: String, arguments: String) = tools.intercept(name, arguments)
+    override fun release(keepFinished: Boolean) = tools.closeSession(keepFinished)
+    override fun keepAlive() = tools.keepAlive()
+}
 
 /** Capacity is reserved before launch; a cancelled owner keeps its slot until engine cleanup ACK. */
 internal class ScreenLeaseRegistry(private val capacity: Int = 3) {
@@ -13,15 +27,18 @@ internal class ScreenLeaseRegistry(private val capacity: Int = 3) {
     private val monitor = Object()
     private val leases = linkedMapOf<String, Lease>()
 
-    fun acquire(owner: String, app: String, checkCancelled: () -> Unit, stop: () -> Unit) {
+    fun acquire(owner: String, app: String, checkCancelled: () -> Unit, stop: () -> Unit,
+        onWaiting: (BackgroundScreenPhase) -> Unit = {}) {
         val deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(10)
         while (true) {
             checkCancelled()
             var victim: (() -> Unit)? = null
+            var waiting = BackgroundScreenPhase.WaitingForApp
             synchronized(monitor) {
                 if (leases[owner]?.app == app) return
                 // Two tasks using one Android app must never race its existing Activity task.
                 if (leases.values.none { it.app == app }) {
+                    waiting = BackgroundScreenPhase.ReleasingScreen
                     if (leases.size < capacity) {
                         leases[owner] = Lease(owner, app, stop)
                         return
@@ -32,6 +49,7 @@ internal class ScreenLeaseRegistry(private val capacity: Int = 3) {
                 }
                 if (victim == null) monitor.wait(100)
             }
+            onWaiting(waiting)
             victim?.invoke() // cancellation may initiate cleanup; never call it under the registry lock
             check(System.nanoTime() < deadline) { "等待后台应用或屏幕释放超时，请检查正在运行的任务" }
         }
@@ -48,9 +66,12 @@ internal class ScreenLeaseRegistry(private val capacity: Int = 3) {
 internal class BackgroundScreenTools(
     private val runId: String,
     private val controller: AgentRunController,
+    private val onPhase: (BackgroundScreenPhase?) -> Unit = {},
+    private val registry: ScreenLeaseRegistry = sharedLeases,
+    private val connectionFactory: (String) -> ScreenToolConnection = ::ShadowScreenConnection,
+    private val retryDelayMs: Long = 1500,
 ) : AutoCloseable {
-    private class Binding(val id: String, val app: String) {
-        val tools = ShadowTools(id)
+    private class Binding(val id: String, val app: String, val tools: ScreenToolConnection) {
         val closing = java.util.concurrent.atomic.AtomicBoolean()
         val released = CountDownLatch(1)
         var heartbeat: java.util.concurrent.ScheduledFuture<*>? = null
@@ -58,8 +79,20 @@ internal class BackgroundScreenTools(
     private val lock = Any()
     private var binding: Binding? = null
     @Volatile private var closed = false
+    @Volatile private var phase: BackgroundScreenPhase? = null
 
-    fun execute(name: String, arguments: String): String? {
+    private fun phase(next: BackgroundScreenPhase?) {
+        if (phase == next) return
+        phase = next
+        RuntimeDiagnostics.record("screen_phase", next?.name ?: "ready")
+        onPhase(next)
+    }
+
+    @Synchronized fun execute(name: String, arguments: String): String? {
+        return try { executeInternal(name, arguments) } finally { phase(null) }
+    }
+
+    private fun executeInternal(name: String, arguments: String): String? {
         if (!name.startsWith("screen_") && name != "terminal") return null
         controller.throwIfCancelled()
         if (name == "screen_open") {
@@ -68,20 +101,26 @@ internal class BackgroundScreenTools(
                 .map { args.optString(it).trim() }.firstOrNull { it.isNotEmpty() }.orEmpty().substringBefore('/')
             if (!app.contains('.')) return "需要有效的应用包名"
             val previous = synchronized(lock) { binding }
-            if (previous != null && previous.app != app) {
-                cleanup(previous)
-                if (!previous.released.await(40, TimeUnit.SECONDS)) error("旧屏幕尚未释放，未打开新应用")
+            if (previous != null && (previous.app != app || previous.closing.get())) {
+                phase(BackgroundScreenPhase.ReleasingScreen)
+                cleanup(previous, keepFinished = false)
+                val deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(2)
+                while (!previous.released.await(100, TimeUnit.MILLISECONDS)) {
+                    controller.throwIfCancelled()
+                    check(System.nanoTime() < deadline) { "屏幕仍在回收，后台会继续恢复；可稍后重试或停止任务" }
+                }
             }
             var next = synchronized(lock) { binding?.takeIf { it.app == app && !it.closing.get() } }
             if (next == null) {
-                next = Binding("$runId:${UUID.randomUUID()}", app)
+                val id = "$runId:${UUID.randomUUID()}"
+                next = Binding(id, app, connectionFactory(id))
                 val candidate = next
-                leases.acquire(candidate.id, app, controller::throwIfCancelled) {
-                    controller.cancel("已停止：三个虚拟屏已占满，本任务按创建顺序被新任务替换")
-                }
+                registry.acquire(candidate.id, app, controller::throwIfCancelled,
+                    stop = { controller.cancel("已停止：三个虚拟屏已占满，本任务按创建顺序被新任务替换") },
+                    onWaiting = ::phase)
                 synchronized(lock) {
                     if (closed || controller.isCancelled) {
-                        leases.release(candidate.id)
+                        registry.release(candidate.id)
                         controller.throwIfCancelled()
                         error("任务已结束")
                     }
@@ -89,7 +128,21 @@ internal class BackgroundScreenTools(
                     candidate.heartbeat = heartbeat.scheduleWithFixedDelay(candidate.tools::keepAlive, 30, 30, TimeUnit.SECONDS)
                 }
             }
-            return next.tools.intercept(name, arguments)
+            phase(BackgroundScreenPhase.OpeningApp)
+            return try {
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+                var result = next.tools.execute(name, arguments)
+                // A parked screen may need asynchronous engine cleanup after the app lease
+                // has been returned. Retry only the explicit pre-launch rejection, never a timeout.
+                while (runCatching { JSONObject(result.orEmpty()).optString("code") == "CLEANUP_PENDING" }.getOrDefault(false)
+                    && System.nanoTime() < deadline) {
+                    phase(BackgroundScreenPhase.ReleasingScreen)
+                    Thread.sleep(250)
+                    controller.throwIfCancelled()
+                    result = next.tools.execute(name, arguments)
+                }
+                result
+            } finally { phase(null) }
         }
         val current = synchronized(lock) { binding }
         if (current == null) {
@@ -97,31 +150,48 @@ internal class BackgroundScreenTools(
             return if (name == "terminal" || name == "screen_state") ShadowTools(runId).intercept(name, arguments)
             else "后台屏幕尚未打开，请先调用 screen_open"
         }
-        return current.tools.intercept(name, arguments)
+        if (current.closing.get()) return "屏幕正在回收，请先调用 screen_open 打开下一应用"
+        if (name == "screen_finish") phase(BackgroundScreenPhase.RestoringDisplay)
+        return try {
+            current.tools.execute(name, arguments).also { result ->
+                if (name == "screen_finish" && runCatching { JSONObject(result.orEmpty()).optBoolean("ok") }.getOrDefault(false)) {
+                    // Release ownership at the tool's confirmed finish, not only when the model
+                    // eventually finishes replying. The same run can then open the next app.
+                    cleanup(current, keepFinished = true)
+                }
+            }
+        } finally { if (name == "screen_finish") phase(null) }
     }
 
-    private fun cleanup(value: Binding) {
+    private fun cleanup(value: Binding, keepFinished: Boolean) {
         if (!value.closing.compareAndSet(false, true)) return
         value.heartbeat?.cancel(false)
-        thread(name = "eta-screen-release", isDaemon = true) {
-            // A transient socket timeout is not a cleanup acknowledgement. Retry the idempotent close.
-            var released = false
-            repeat(3) { if (!released) released = value.tools.closeSession(!controller.isCancelled) }
-            if (released) {
-                leases.release(value.id)
+        fun attempt() {
+            val acknowledged = runCatching { value.tools.release(keepFinished && !controller.isCancelled) }.getOrDefault(false)
+            if (acknowledged) {
+                registry.release(value.id)
                 synchronized(lock) { if (binding === value) binding = null }
                 value.released.countDown()
+                RuntimeDiagnostics.record("screen_cleanup", "acknowledged")
+            } else {
+                RuntimeDiagnostics.record("screen_cleanup", "retrying")
+                // Keep ownership until an engine ACK; a later engine restart also ACKs missing sessions.
+                cleanupExecutor.schedule(::attempt, retryDelayMs, TimeUnit.MILLISECONDS)
             }
         }
+        cleanupExecutor.execute(::attempt)
     }
 
     override fun close() {
         closed = true
-        synchronized(lock) { binding }?.let(::cleanup)
+        synchronized(lock) { binding }?.let { cleanup(it, keepFinished = true) }
     }
 
     companion object {
-        private val leases = ScreenLeaseRegistry()
+        private val sharedLeases = ScreenLeaseRegistry()
+        private val cleanupExecutor = java.util.concurrent.Executors.newScheduledThreadPool(3) { runnable ->
+            Thread(runnable, "eta-screen-release").apply { isDaemon = true }
+        }
         private val heartbeat = java.util.concurrent.Executors.newScheduledThreadPool(3) { runnable ->
             Thread(runnable, "eta-screen-heartbeat").apply { isDaemon = true }
         }

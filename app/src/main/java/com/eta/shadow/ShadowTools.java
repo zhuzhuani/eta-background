@@ -426,13 +426,18 @@ public final class ShadowTools {
     public boolean closeSession(boolean keepFinished) {
         closed = true;
         try {
-            send(ENGINE_PORT, new JSONObject().put("cmd", "cancel").put("sessionId", sessionId).toString(), 3000);
+            // release_session cancels the worker itself. A failed preliminary cancel must never
+            // prevent the actual release request from reaching the engine.
             JSONObject reply = new JSONObject(send(ENGINE_PORT,
                     new JSONObject().put("cmd", "release_session").put("sessionId", sessionId)
-                            .put("keep", keepFinished && parked).toString(), 35000));
+                            .put("keep", keepFinished && parked).toString(), 5000));
             return reply.optBoolean("ok", false);
         } catch (Exception e) {
             android.util.Log.w("EtaShadow", "screen cleanup not acknowledged: " + e.getClass().getSimpleName());
+            if (e instanceof java.net.ConnectException) {
+                ShadowSettings.markEngineReady(false);
+                Engine.warm(ShadowSettings.app());
+            }
             return false;
         }
     }
@@ -441,6 +446,30 @@ public final class ShadowTools {
         if (closed) return;
         try { send(ENGINE_PORT, new JSONObject().put("cmd", "keepalive").put("sessionId", sessionId).toString(), 2000); }
         catch (Exception ignored) { }
+    }
+
+    /** Read-only, allowlisted export; never expose raw session IDs, package names or tool payloads. */
+    public static JSONObject diagnosticSnapshot() {
+        JSONObject out = new JSONObject();
+        try {
+            JSONObject status = new JSONObject(new ShadowTools("diagnostics").send(ENGINE_PORT,
+                    "{\"cmd\":\"status\"}", 2500));
+            out.put("reachable", true).put("sessionCount", status.optInt("count"))
+                    .put("sessionLimit", status.optInt("limit"));
+            String build = status.optString("build");
+            out.put("build", build.matches("[A-Za-z0-9._-]{1,80}") ? build : "unknown");
+            String restore = status.optString("displayRestore");
+            out.put("displayRestore", restore.matches("[a-z_]{1,64}") ? restore : "unknown")
+                    .put("compatibilityRestarts", status.optInt("compatibilityRestarts"));
+            JSONArray sessions = status.optJSONArray("sessions");
+            int closing = 0;
+            if (sessions != null) for (int i = 0; i < sessions.length(); i++)
+                if (sessions.optJSONObject(i) != null && sessions.optJSONObject(i).optBoolean("closing")) closing++;
+            out.put("closingCount", closing);
+        } catch (Exception ignored) {
+            try { out.put("reachable", false); } catch (Exception unused) { }
+        }
+        return out;
     }
 
     // ---------------------------------------------------------------- transport

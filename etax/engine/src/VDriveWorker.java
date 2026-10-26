@@ -43,7 +43,7 @@ final class VDriveWorker implements VDrive.Worker {
     /** Build stamp: lets status() prove which dex is actually running. */
     final String BUILD = VDrive.BUILD;
     final long ORPHAN_EMPTY_MS = 20_000;   // task left the display -> release it
-    final long ORPHAN_HOLD_MS = 300_000;   // keep the parked task for 5 minutes
+    final long ORPHAN_HOLD_MS = 60_000;    // brief handover window after completion
     final long IDLE_MS = 300_000;    // screen exists but no commands at all
     final long EMPTY_MS = 20_000;    // display held but no session and no task
     final long EXIT_MS = 0;           // 0 = resident: never exit on idle
@@ -74,11 +74,18 @@ final class VDriveWorker implements VDrive.Worker {
      * they never overlap. Each frame carries the size it was actually produced at.
      */
     final class Frame {
+        Image image;         // newest native buffer; copy pixels only when a screenshot is requested
         byte[] data;
         int len;
         int stridePx;
         int w, h;
         Bitmap bmp;          // reused bitmap for this display only
+        void close() {
+            if (image != null) { image.close(); image = null; }
+            if (bmp != null) { bmp.recycle(); bmp = null; }
+            data = null;
+            len = 0;
+        }
     }
 
     final java.util.HashMap<Integer, Frame> frames = new java.util.HashMap<>();
@@ -281,8 +288,9 @@ final class VDriveWorker implements VDrive.Worker {
                 }
             });
         }
-        try { return released.await(32, java.util.concurrent.TimeUnit.SECONDS); }
-        catch (InterruptedException e) { Thread.currentThread().interrupt(); return false; }
+        // Acknowledge only actual cleanup, but do not tie up a socket for 32 seconds.
+        // The transport and app retry this idempotent request while the worker drains.
+        return released.getCount() == 0;
     }
 
     /** Resident engine: ask the kernel to keep us alive under memory pressure. */
@@ -407,6 +415,24 @@ final class VDriveWorker implements VDrive.Worker {
         }
     }
 
+    /** Completed screens are watched briefly while the user can open them from the launcher. */
+    void watchCompletedHandover(Session session) {
+        work.postDelayed(() -> {
+            if (retired || sessions.get(session.pkg) != session || session.orphanAt == 0) return;
+            if (SystemClock.elapsedRealtime() - session.orphanAt > ORPHAN_HOLD_MS) return;
+            android.os.PowerManager power = ctx.getSystemService(android.os.PowerManager.class);
+            if (power != null && power.isInteractive()) {
+                Integer task = taskOfPackage(session.pkg);
+                if (task != null && displayOfTask(task) == Display.DEFAULT_DISPLAY) {
+                    restoreMainDisplayLayout(task);
+                    releaseSessionFully(session, false);
+                    return;
+                }
+            }
+            watchCompletedHandover(session);
+        }, 1000);
+    }
+
     /** A display that was created but never got a session (create -> launch failed). */
     void tickIdleDisplay(long now) {
         if (vd == null || current != null) return;
@@ -426,7 +452,7 @@ final class VDriveWorker implements VDrive.Worker {
     void syncWake() {
         try {
             if (ctx == null) return;
-            boolean want = !frames.isEmpty();
+            boolean want = !frames.isEmpty() && orphanAt == 0 && !retired;
             if (want) {
                 if (wake == null) {
                     android.os.PowerManager pm = ctx.getSystemService(android.os.PowerManager.class);
@@ -445,6 +471,8 @@ final class VDriveWorker implements VDrive.Worker {
     }
 
     void destroyIdleDisplay() {
+        Frame frame = frames.get(displayId);
+        if (frame != null) frame.close();
         try { if (reader != null) reader.close(); } catch (Throwable ignored) { }
         if (vd != null) vd.release();
         if (displayId >= 0) {
@@ -463,6 +491,12 @@ final class VDriveWorker implements VDrive.Worker {
      */
     void releaseSessionFully(Session x, boolean returnTask) {
         if (x == null) return;
+        // A launcher handover can race cancellation/eviction before the watchdog notices it.
+        // Restore that escaped task on every cleanup path, before forgetting its owner.
+        Integer escaped = taskOfPackage(x.pkg);
+        if (escaped != null && displayOfTask(escaped) == Display.DEFAULT_DISPLAY) {
+            restoreMainDisplayLayout(escaped);
+        }
         if (!x.protectedPkg.isEmpty()) {
             try { protectApp(x.protectedPkg, false); } catch (Throwable ignored) { }
         }
@@ -479,6 +513,8 @@ final class VDriveWorker implements VDrive.Worker {
                 log("return task failed: " + t);
             }
         }
+        Frame frame = frames.get(x.displayId);
+        if (frame != null) frame.close();
         try { if (x.reader != null) x.reader.close(); } catch (Throwable ignored) { }
         if (x.vd != null) x.vd.release();
         int gone = x.displayId;
@@ -797,6 +833,7 @@ final class VDriveWorker implements VDrive.Worker {
         try {
             JSONObject out = dispatch(cmd0, req);
             save();
+            syncWake();
             return out;
         } catch (Throwable t) {
             save();
@@ -1099,32 +1136,18 @@ final class VDriveWorker implements VDrive.Worker {
         DPI = req.has("density") && req.optInt("density", 0) > 0
                 ? req.optInt("density") : mainDensity();
         final Frame fr = new Frame();
-        reader = ImageReader.newInstance(W, H, PixelFormat.RGBA_8888, 1);
+        // One retained image plus two free slots lets acquireLatestImage discard stale buffers.
+        reader = ImageReader.newInstance(W, H, PixelFormat.RGBA_8888, 3);
         reader.setOnImageAvailableListener(r -> {
             Image img = null;
             try {
                 img = r.acquireLatestImage();
                 if (img == null) return;
-                Image.Plane p = img.getPlanes()[0];
-                ByteBuffer buf = p.getBuffer();
-                int stride = p.getRowStride();
-                int px = p.getPixelStride();
-                int need = buf.remaining();
-                byte[] data = fr.data;
-                if (data == null || data.length < need) {
-                    data = new byte[need];
-                    fr.data = data;
-                }
-                buf.get(data, 0, need);
-                fr.len = need;
-                fr.stridePx = stride / px;
-                // size of *this* image, not the global W/H: another display may have been
-                // created with a different size since this one started
-                fr.w = img.getWidth();
-                fr.h = img.getHeight();
-                if (frameOk++ < 3)
-                    log("frame ok " + need + "B " + fr.w + "x" + fr.h
-                            + " stride=" + stride + " px=" + px);
+                if (orphanAt > 0 || retired) return;
+                if (fr.image != null) fr.image.close();
+                fr.image = img;
+                img = null; // Owned by this frame until the next image or release.
+                frameOk++;
             } catch (Throwable t) {
                 if (frameErr++ < 3) log("frame error: " + t);
             } finally {
@@ -1714,6 +1737,7 @@ final class VDriveWorker implements VDrive.Worker {
         String path = req.optString("path", SHOT_DIR + (jpeg ? "/shot.jpg" : "/shot.png"));
         float scale = clampScale((float) req.optDouble("scale", 0.45));
         int quality = req.optInt("quality", 80);
+
         String tmp = SHOT_DIR + "/.cap_main.png";
         long t = SystemClock.elapsedRealtime();
         exec("screencap -p " + tmp);
@@ -1767,6 +1791,17 @@ final class VDriveWorker implements VDrive.Worker {
         float scale = clampScale((float) req.optDouble("scale", 0.5));
         int quality = req.optInt("quality", 80);
 
+        if (fr.image != null) {
+            Image.Plane plane = fr.image.getPlanes()[0];
+            ByteBuffer buffer = plane.getBuffer().duplicate();
+            int needed = buffer.remaining();
+            if (fr.data == null || fr.data.length < needed) fr.data = new byte[needed];
+            buffer.get(fr.data, 0, needed);
+            fr.len = needed;
+            fr.stridePx = plane.getRowStride() / plane.getPixelStride();
+            fr.w = fr.image.getWidth();
+            fr.h = fr.image.getHeight();
+        }
         byte[] data = fr.data;
         int len = fr.len;
         int stridePx = fr.stridePx;
@@ -1889,8 +1924,12 @@ final class VDriveWorker implements VDrive.Worker {
             s.orphanAt = SystemClock.elapsedRealtime();
             if (s == current) orphanAt = s.orphanAt;
             save();
+            Frame frame = frames.get(did);
+            if (frame != null) frame.close();
+            syncWake();
+            watchCompletedHandover(s);
             out.put("parked", true)
-                    .put("hint", "任务留在后台虚拟屏，用户点通知才会切过去；闲置 5 分钟自动回收");
+                    .put("hint", "任务已完成；可从桌面打开应用，后台屏幕最多保留 1 分钟");
         }
         return out.put("ok", true);
     }
@@ -2049,7 +2088,7 @@ final class VDriveWorker implements VDrive.Worker {
             List<?> tasks = (List<?>) atmAllRootTasks.invoke(atm);
             if (tasks != null) for (Object task : tasks) {
                 if (readInt(task.getClass(), task, "taskId") != taskId) continue;
-                if (TaskLayoutRestorer.restore(readField(task, "token"))) {
+                if (TaskLayoutRestorer.restore(taskId, task)) {
                     log("restored real-display fullscreen configuration for task " + taskId);
                     return true;
                 }

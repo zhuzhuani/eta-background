@@ -8,7 +8,7 @@ import java.util.*;
 
 /** Root transport. Mutable display/input/capture state lives in independent workers. */
 public final class VDrive {
-    static final String BUILD = "20261026-e27-system-ui";
+    static final String BUILD = "20261026-e28-recovery";
     interface Worker {
         JSONObject processLine(String request);
         boolean closeSession();
@@ -64,7 +64,8 @@ public final class VDrive {
                 synchronized (workers) {
                     long now = now();
                     for (Map.Entry<String, Slot> entry : workers.entrySet()) {
-                        if (now - entry.getValue().touched > 300000) expired.add(entry.getKey());
+                        Slot slot = entry.getValue();
+                        if (slot.closing || now - slot.touched > (slot.parked ? 60000 : 300000)) expired.add(entry.getKey());
                     }
                 }
                 for (String id : expired) release(id);
@@ -119,7 +120,9 @@ public final class VDrive {
                     }
                 }
                 return new JSONObject().put("ok", true).put("pong", true).put("build", BUILD)
-                        .put("sessions", sessions).put("count", sessions.length()).put("limit", LIMIT);
+                        .put("sessions", sessions).put("count", sessions.length()).put("limit", LIMIT)
+                        .put("displayRestore", TaskLayoutRestorer.lastOutcome)
+                        .put("compatibilityRestarts", TaskLayoutRestorer.compatibilityRestarts);
             }
             if (cmd.equals("quit")) {
                 List<String> ids;

@@ -293,6 +293,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         val run = admitRun(incoming.request, replyTo, incoming) ?: return
         thread(name = "agent-runtime-image-ingest") {
             val prepared = runCatching {
+                run.entryPersistence.join()
                 run.session.controller.throwIfCancelled()
                 run.awaitPredecessors()
                 val request = AgentRuntimeRequestConfigResolver.constrainPresentation(
@@ -440,7 +441,9 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         }
         // Persist the entry before preparation so a newly opened UI can discover it immediately.
         if (request.handoff?.let(AssistantRunRecovery::payload) != null) {
-            AgentRunCheckpointStore.start(this, request)
+            run.entryPersistence = java.util.concurrent.CompletableFuture.runAsync({
+                AgentRunCheckpointStore.start(applicationContext, request)
+            }, entryPersistenceIo)
         }
         publishExecutionState()
         return run
@@ -453,6 +456,9 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             operation = run.request.operation, rewriteTargetMessageId = run.request.rewriteTargetMessageId,
         )
         dispatchResultIo {
+            // A cancellation during preparation must commit after the initial entry write,
+            // so a late database write cannot resurrect an already completed task.
+            runCatching { run.entryPersistence.join() }
             run.session.complete(result) {
                 runCatching { persistRunArtifacts(run.snapshotRequest(), result, emptyList()) }
                     .onFailure { throwable ->
@@ -467,6 +473,11 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         val screenOnBinding = run.session.controller.register { mainHandler.post(::updateKeepScreenOn) }
         thread(name = "agent-runtime") {
             try {
+                try { run.entryPersistence.join() } catch (_: Exception) {
+                    RuntimeDiagnostics.record("entry_persistence", "checkpoint_failed")
+                    failBeforeExecution(run, "无法保存任务记录，请稍后重试")
+                    return@thread
+                }
                 executeRun(run)
             } finally {
                 screenOnBinding.close()
@@ -490,6 +501,12 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                     handleAcceptedRunEvent(run, event)
                 },
                 persistArtifacts = ::persistRunArtifacts,
+                onBackgroundScreenPhase = { phase -> mainHandler.post {
+                    if (!destroyed && !run.session.isTerminal) {
+                        run.backgroundScreenPhase = phase
+                        publishExecutionState()
+                    }
+                } },
             ).execute(run.session, run.request)
             shadowResult = outcome.result
             if (!outcome.shouldUpdateHost) return
@@ -983,7 +1000,8 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         val selected = displayedRun?.takeIf { it in active } ?: active.lastOrNull()
         if (selected != null) {
             if (displayedRun !== selected) bindDisplayedRun(selected)
-            state.value = selected.overlayState
+            state.value = selected.backgroundScreenPhase?.takeUnless { selected.session.controller.isPaused }
+                ?.let { selected.overlayState.copy(status = AgentOverlayStatus.BackgroundScreen(it)) } ?: selected.overlayState
             ambientState.value = state.value.copy(phase = if (active.any { !it.session.controller.isPaused })
                 AgentOverlayPhase.RUNNING else AgentOverlayPhase.PAUSED)
             if (getSystemService(android.os.PowerManager::class.java).isInteractive) ensureOverlayVisible()
@@ -992,7 +1010,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             removeAmbientWindows()
         }
         AgentExecutionService.updateRunStatus(
-            this, selected?.overlayState?.status,
+            this, selected?.let { state.value.status },
             activeRunCount = active.size,
             preview = selected?.overlayState?.let { if (it.status == AgentOverlayStatus.GeneratingAnswer)
                 it.detailText.takeLast(80) else it.thought.takeLast(80) }.orEmpty(),
@@ -1043,7 +1061,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         }
 
         // System Live Updates own the task surface. The edge glow remains an independent window.
-        if (AgentExecutionService.usesSystemTaskSurface()) {
+        if (AgentExecutionService.usesSystemTaskSurface() && AgentExecutionService.taskNotificationsEnabled(this)) {
             capsuleView?.let { runCatching { wm.removeView(it) } }
             capsuleView = null
             capsuleParams = null
@@ -1391,7 +1409,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     private fun enterFinalState(finalState: AgentOverlayState) {
         state.value = finalState
 
-        if (AgentExecutionService.usesSystemTaskSurface()) {
+        if (AgentExecutionService.usesSystemTaskSurface() && AgentExecutionService.taskNotificationsEnabled(this)) {
             dismissAndStop()
             return
         }
@@ -1468,6 +1486,9 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         )
 
     companion object {
+        private val entryPersistenceIo = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "eta-entry-persistence").apply { isDaemon = true }
+        }
         @Volatile private var notificationOwner: AgentRuntimeService? = null
 
         internal fun dispatchNotificationAction(action: String, runId: String) {
