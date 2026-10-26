@@ -40,7 +40,7 @@ import java.util.List;
 public final class VDrive {
     static final long T0 = SystemClock.elapsedRealtime();
     /** Build stamp: lets status() prove which dex is actually running. */
-    static final String BUILD = "20261025-e24";
+    static final String BUILD = "20261026-e25";
     static final long ORPHAN_EMPTY_MS = 20_000;   // task left the display -> release it
     static final long ORPHAN_HOLD_MS = 300_000;   // keep the parked task for 5 minutes
     static final long IDLE_MS = 300_000;    // screen exists but no commands at all
@@ -53,6 +53,9 @@ public final class VDrive {
     static Handler work;
     static DisplayManager dm;
     static VirtualDisplay vd;
+    // etax ③: 有活动虚拟屏时持有 PARTIAL_WAKE_LOCK，防 Doze 冻结引擎进程，
+    // 争取物理屏熄灭后仍能在独立显示组的隐藏屏上继续跑（真·息屏尝试）。
+    static android.os.PowerManager.WakeLock wake;
     static ImageReader reader;
     static int W = 1440, H = 3168, DPI = 560;
     static volatile int displayId = -1;
@@ -434,6 +437,28 @@ public final class VDrive {
         }
     }
 
+    /** etax ③: 按活动虚拟屏数量开/关 wakelock。有屏就持有（CPU 不被 Doze 挂起），全关就释放。 */
+    static void syncWake() {
+        try {
+            if (ctx == null) return;
+            boolean want = !frames.isEmpty();
+            if (want) {
+                if (wake == null) {
+                    android.os.PowerManager pm = ctx.getSystemService(android.os.PowerManager.class);
+                    if (pm == null) return;
+                    wake = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "eta:vdrive");
+                    wake.setReferenceCounted(false);
+                }
+                if (!wake.isHeld()) { wake.acquire(); log("wakelock acquired"); }
+            } else if (wake != null && wake.isHeld()) {
+                wake.release();
+                log("wakelock released");
+            }
+        } catch (Throwable t) {
+            log("wake sync failed: " + t);
+        }
+    }
+
     static void destroyIdleDisplay() {
         try { if (reader != null) reader.close(); } catch (Throwable ignored) { }
         try { if (vd != null) vd.release(); } catch (Throwable ignored) { }
@@ -442,6 +467,7 @@ public final class VDrive {
             if (fr != null && fr.bmp != null) fr.bmp.recycle();
             if (fr != null) { fr.bmp = null; fr.data = null; }
         }
+        syncWake();   // etax ③: 虚拟屏可能已清空，释放 wakelock
         resetGlobals();
     }
 
@@ -475,6 +501,7 @@ public final class VDrive {
             if (fr != null && fr.bmp != null) fr.bmp.recycle();
             fr.bmp = null; fr.data = null;
         }
+        syncWake();   // etax ③: 虚拟屏可能已清空，释放 wakelock
         x.reader = null;
         x.vd = null;
         x.displayId = -1;
@@ -1136,6 +1163,7 @@ public final class VDrive {
         log("virtual display flags = 0x" + Integer.toHexString(flags));
         displayId = vd.getDisplay().getDisplayId();
         frames.put(displayId, fr);   // keyed by the display id, which only exists now
+        syncWake();                  // etax ③: 有虚拟屏了，持有 wakelock
         return new JSONObject().put("ok", true).put("displayId", displayId)
                 .put("createMs", SystemClock.elapsedRealtime() - t)
                 .put("width", W).put("height", H);
