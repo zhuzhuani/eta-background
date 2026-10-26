@@ -202,7 +202,7 @@ internal class EtaAssistantOverlayService : Service(), LifecycleOwner, SavedStat
         entryGeneration++
         EtaAssistantScreenContexts.release(entryScreenContext?.id)
         entryScreenContext = null
-        cancelCurrentRun()
+        detachCurrentRun()   // ⑤: 销毁时脱钩而非取消，任务留在后台继续跑
         removeWindow()
         scope.cancel()
         cancellationExecutor.shutdown()
@@ -222,7 +222,7 @@ internal class EtaAssistantOverlayService : Service(), LifecycleOwner, SavedStat
         }
         dismissalJob?.cancel()
         dismissalJob = null
-        cancelCurrentRun()
+        detachCurrentRun()   // ⑤: 重新唤起助手时，旧任务脱钩继续后台跑，不取消
         if (entryScreenContext?.id != screenContextId) {
             EtaAssistantScreenContexts.release(entryScreenContext?.id)
             entryScreenContext = EtaAssistantScreenContexts.find(screenContextId)
@@ -693,6 +693,22 @@ internal class EtaAssistantOverlayService : Service(), LifecycleOwner, SavedStat
         }
     }
 
+    /**
+     * ⑤: 离开半窗不停任务——只清本 overlay 的本地状态，**绝不发 MSG_CANCEL**
+     * （不调 requestRuntimeCancellation）。AgentRuntimeClient.run 阻塞在 latch 上、
+     * 协程取消不会中断它，所以这次 run 留在 AgentRuntimeService 继续跑完，
+     * 进度/结果走通知；用户要停用通知里的「停止」。runJob 不 cancel，让它自然收尾并 ack。
+     */
+    private fun detachCurrentRun() {
+        playback.stop()
+        speechInput.cancel()
+        speechState = EtaSpeechState()
+        val runId = activeRunId ?: return
+        flushPendingDelta(runId)
+        activeRunId = null
+        runJob = null
+    }
+
     private fun updateSoftInput(visible: Boolean) {
         val wm = windowManager ?: return
         val view = windowView ?: return
@@ -787,7 +803,7 @@ internal class EtaAssistantOverlayService : Service(), LifecycleOwner, SavedStat
         entryGeneration++
         EtaAssistantScreenContexts.release(entryScreenContext?.id)
         entryScreenContext = null
-        cancelCurrentRun()
+        detachCurrentRun()   // ⑤: 关闭/返回半窗也只脱钩，任务后台继续，停止走通知
         handoffExitRequested = true
         dismissalJob = scope.launch(Dispatchers.Main.immediate) {
             delay(HANDOFF_EXIT_DURATION_MS)
