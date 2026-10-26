@@ -291,15 +291,14 @@ public final class ShadowNotice {
 
     // ----------------------------------------------------------------- utils
 
-    /** 让 Eta 的前台通知立即重绘（上游只在状态文字变化时才刷新）。 */
+    /**
+     * 让 Eta 的前台通知立即重绘（上游只在状态文字变化时才刷新）。
+     * 直接请服务用自己的 NotificationManager 刷新；不再用 startService——
+     * App 退到后台后后台启动服务会被系统拦，导致回桌面后流式不再更新。
+     */
     private static void kick() {
         try {
-            Context ctx = ShadowSettings.app();
-            if (ctx == null) return;
-            Intent i = new Intent();
-            i.setComponent(new ComponentName(ctx.getPackageName(),
-                    "io.github.mangi.eta.agent.runtime.AgentExecutionService"));
-            ctx.startService(i);
+            io.github.mangi.eta.agent.runtime.AgentExecutionService.pokeStreaming();
         } catch (Throwable ignored) {
         }
     }

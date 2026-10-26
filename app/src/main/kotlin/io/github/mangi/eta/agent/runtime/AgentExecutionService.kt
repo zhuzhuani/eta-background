@@ -193,5 +193,15 @@ internal class AgentExecutionService : Service() {
             leases.release(id)
             mainHandler.post { instance?.refreshNotification() }
         }
+
+        /**
+         * etax: 供 ShadowNotice 在后台刷新前台通知（流式正文）。走服务自身的
+         * NotificationManager.notify，不用 startService——后台启动服务会被系统拦，
+         * 回桌面后流式就不再更新了。
+         */
+        @JvmStatic
+        fun pokeStreaming() {
+            mainHandler.post { instance?.takeIf { it.foregroundActive }?.refreshNotification() }
+        }
     }
 }
