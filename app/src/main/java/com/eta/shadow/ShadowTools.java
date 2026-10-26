@@ -226,6 +226,25 @@ public final class ShadowTools {
         }
     }
 
+    /** ④: 用默认显示屏的真实 width/height/densityDpi 补全 launch 请求（显式指定的不覆盖）。 */
+    private static void fillDeviceMetrics(JSONObject req, JSONObject a) {
+        try {
+            if (a.has("width") && a.has("height") && a.has("density")) return;
+            android.content.Context ctx = ShadowSettings.app();
+            if (ctx == null) return;
+            android.hardware.display.DisplayManager dm = (android.hardware.display.DisplayManager)
+                    ctx.getSystemService(android.content.Context.DISPLAY_SERVICE);
+            android.view.Display d = dm == null ? null : dm.getDisplay(android.view.Display.DEFAULT_DISPLAY);
+            if (d == null) return;
+            android.util.DisplayMetrics m = new android.util.DisplayMetrics();
+            d.getRealMetrics(m);
+            if (!a.has("width") && m.widthPixels > 0) req.put("width", m.widthPixels);
+            if (!a.has("height") && m.heightPixels > 0) req.put("height", m.heightPixels);
+            if (!a.has("density") && m.densityDpi > 0) req.put("density", m.densityDpi);
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static String open(JSONObject a) throws Exception {
         String component = a.optString("component", "").trim();
         if (component.isEmpty()) component = a.optString("package", "").trim();
@@ -242,6 +261,8 @@ public final class ShadowTools {
         for (String k : new String[]{"width", "height", "density"}) {
             if (a.has(k)) req.put(k, a.optInt(k, 0));
         }
+        // ④: 没显式指定就让隐藏虚拟屏匹配手机当前分辨率/密度，避免引擎用默认值跟实机对不上
+        fillDeviceMetrics(req, a);
         // the engine decides: reuse this package's session, or give it a display of its
         // own. Creating a display here is what put two apps on one screen.
         JSONObject launched = new JSONObject(engine(req.toString()));
