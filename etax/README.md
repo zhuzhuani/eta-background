@@ -28,15 +28,19 @@
 
 不配置 Secret 也能编译，只是会用临时证书签名，装之前要先卸载旧的 etax。
 
-**root 引擎（内嵌 + 自启）**：引擎文件放在 `etax/engine/`（`vdrive.dex`、`vdrive.version`、
-`vd.sh`、`install_vdrive.sh`、`check_pair.sh`），编译时打进 APK 的 assets。装完 APK 后，
-无障碍服务一连上、或第一条 `screen_*` 工具调用时，`com.eta.shadow.Engine` 会自动用 `su` 把这些文件
-释放到 `/data/local/tmp/eta/` 并跑 `vd.sh` 把引擎拉起来 —— **装完授一次 root 就能用，不用再手动部署**。
+**root 引擎（源码内嵌 + 自启）**：引擎**源码**在 `etax/engine/src/`（`VDrive.java`、`McpEndpoint.java`、
+`UiaProbe.java`），加上 `build_engine.sh` 和部署脚本（`vd.sh`、`install_vdrive.sh`、`check_pair.sh`）。
+CI 用 `javac + D8` 从源码现编出 `vdrive.dex`（不是 Gradle 模块），版本串从 `VDrive.java` 的 `BUILD`
+常量抽取写入 `vdrive.version`，一起打进 APK 的 assets。**不再提交二进制 dex，以源码为准。**
+
+装完 APK 后，无障碍服务一连上、或第一条 `screen_*` 工具调用时，`com.eta.shadow.Engine` 会自动用 `su`
+把这些文件释放到 `/data/local/tmp/eta/` 并跑 `vd.sh` 把引擎拉起来 —— **装完授一次 root 就能用，不用再手动部署**。
 
 - 引擎需要 **root**：未 root 的手机 `su` 会失败，`screen_*` 会提示去授权（通知栏流式输出那条链路不吃 root，照常可用）。
-- 自启是幂等的：引擎在跑就不动它（`vd.sh status`）；换了新版 APK（dex 变了）会自动重铺并重启。
+- 自启幂等：引擎在跑就不动它（`vd.sh status`）；换了新版（dex 变了）会自动重铺并重启；运行中 build 与内置版本不符也会强制重启到内置版。
+- 工具链会影响 dex 字节：CI 用现成 JDK/D8，产物与本地逐字节不一定相同，但功能等价、且 APK 自洽（App 首次运行会把手机上旧 dex 换成 APK 内这版）。想字节级复刻需钉死 JDK/r8/android.jar 版本。
+- 升级引擎：改 `etax/engine/src/` 源码并把 `VDrive.java` 的 `BUILD` 常量改成新 stamp，CI 自动现编、配对。
 - 仍可手动管理：`sh /data/local/tmp/eta/vd.sh`（重启）、`vd.sh stop`、`vd.sh status`、`check_pair.sh`（配对校验）照常能用。
-- 若 `etax/engine/vdrive.dex` 为空，APK 不内嵌引擎，`screen_*` 会提示“引擎没打进包”。
 
 ## 跟上游升级
 
