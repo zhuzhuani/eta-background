@@ -85,15 +85,15 @@ public final class ShadowSchema {
             tools.put(tool("screen_shot", "把当前屏幕截图保存到文件。",
                     props3("path", "string", "保存路径", "scale", "number", "缩放比例"), ""));
             tools.put(tool("screen_diag", "当前屏幕的诊断快照（包名、节点数、最近文本）。", new JSONObject(), ""));
-            tools.put(tool("screen_finish", "结束后台操作，由统一运行通知展示完成结果。"
+            tools.put(tool("screen_finish", "结束后台操作，由该任务的运行通知展示完成结果。"
                     + "应用会留在后台虚拟屏里继续待命，用户的屏幕完全不动，"
-                    + "用户点系统通知进入聊天记录；自行打开目标应用时恢复主屏窗口。虚拟屏在闲置 5 分钟后自动回收。",
+                    + "运行中通知打开聊天，完成后原卡片更新为已完成，用户点击才打开目标应用。虚拟屏最多保留 1 分钟。"
+                    + "后台收尾不会自动打开目标应用或切换用户当前页面。",
                     props3("title", "string", "通知标题",
-                            "text", "string", "通知内容（点通知打开目标应用）",
+                            "text", "string", "结果摘要（点通知打开聊天）",
                             "open", "string", "结果涉及的应用包名（兼容旧参数；通知统一打开聊天）")
                             .put("mode", props("mode", "string",
                                     "收尾方式：notify（默认，留在后台虚拟屏并发通知）、"
-                                    + "handover（移回主屏并释放虚拟屏）、"
                                     + "destroy（直接释放虚拟屏）")),
                     ""));
         } catch (Throwable ignored) { }

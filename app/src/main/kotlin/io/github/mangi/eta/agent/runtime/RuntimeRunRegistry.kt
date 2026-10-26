@@ -32,6 +32,7 @@ internal class RuntimeRunRegistry(private val capacity: Int = MAX_ACTIVE_RUNS) {
         @Volatile var guiStatus: GuiControlStatus? = null
         var overlayState: AgentOverlayState = AgentOverlayState.Initial
         var backgroundScreenPhase: BackgroundScreenPhase? = null
+        var lastBackgroundApp: String? = null
         var entryPersistence: java.util.concurrent.CompletableFuture<Void> = java.util.concurrent.CompletableFuture.completedFuture(null)
         var hasExecutedForegroundTool: Boolean = false
         var completedContext: CompletedContext? = null

@@ -30,19 +30,23 @@ final class TaskLayoutRestorer {
 
     static boolean shouldRestart(Object info) {
         return Integer.valueOf(0).equals(field(info, "displayId"))
-                && Boolean.TRUE.equals(field(info, "isVisible")) && inSizeCompat(info);
+                && isUserViewing(info) && inSizeCompat(info);
+    }
+
+    static boolean isUserViewing(Object info) {
+        return Boolean.TRUE.equals(field(info, "isVisible")) && Boolean.TRUE.equals(field(info, "isFocused"));
     }
 
     static boolean restore(int taskId, Object info) {
         Object token = field(info, "token");
         if (token == null) return false;
-        boolean cleared = clearOverrides(token);
         handler().post(() -> {
+            if (token.equals(pending.get(taskId))) return;
             pending.put(taskId, token);
             while (pending.size() > 32) pending.remove(pending.keySet().iterator().next());
             handler().postDelayed(() -> verify(taskId, token, 0), 350);
         });
-        return cleared;
+        return true; // Queued; no layout mutation while a task is finishing in the background.
     }
 
     private static void verify(int taskId, Object expectedToken, int attempt) {
@@ -61,6 +65,21 @@ final class TaskLayoutRestorer {
                 lastOutcome = "task_changed";
                 return;
             }
+            if (!VDrive.mainDisplayOn() || !isUserViewing(target)) {
+                lastOutcome = "waiting_for_user_open";
+                handler().postDelayed(() -> verify(taskId, expectedToken, 0), 5000);
+                return;
+            }
+            // Require two focused samples so a transient ROM handover cannot trigger a relaunch.
+            if (attempt == 0) {
+                handler().postDelayed(() -> verify(taskId, expectedToken, 1), 750);
+                return;
+            }
+            if (attempt == 1) {
+                clearOverrides(expectedToken);
+                handler().postDelayed(() -> verify(taskId, expectedToken, 2), 350);
+                return;
+            }
             if (shouldRestart(target)) {
                 // This is Android's compat-restart-button path: clear size-compat config and
                 // let ActivityManager save/recreate the visible activity. Never force-stop a package.
@@ -73,14 +92,9 @@ final class TaskLayoutRestorer {
                 pending.remove(taskId);
                 return;
             }
-            if (!Boolean.TRUE.equals(field(target, "isVisible"))) {
-                // The app may be opened from the launcher much later. Keep a bounded
-                // pending entry without a wake lock; never restart an invisible app.
-                lastOutcome = "waiting_for_visible_task";
-                handler().postDelayed(() -> verify(taskId, expectedToken, 0), 5000);
-                return;
-            }
-            lastOutcome = inSizeCompat(target) ? "waiting_for_visible_task" : "normal_configuration";
+            lastOutcome = "normal_configuration";
+            pending.remove(taskId);
+            return;
         } catch (Exception error) {
             lastOutcome = "compatibility_api_unavailable";
             VDrive.log("compatibility restore: " + error.getClass().getSimpleName());

@@ -21,6 +21,29 @@ import org.robolectric.annotation.Config
 @Config(sdk = [36], application = Application::class)
 class AgentRuntimeScreenOnTest {
     @Test
+    fun physicalScreenOffKeepsBackgroundRunWithoutRecreatingOverlayWindows() {
+        val controller = Robolectric.buildService(AgentRuntimeService::class.java).create()
+        val service = controller.get()
+        val display = service.getSystemService(android.hardware.display.DisplayManager::class.java).getDisplay(0)
+        try {
+            val run = service.registerRun("screen-off", ownsGui = false)
+            // Another display may keep global power interactive while the phone's screen is off.
+            shadowOf(service.getSystemService(android.os.PowerManager::class.java)).setIsInteractive(true)
+            shadowOf(display).setState(android.view.Display.STATE_OFF)
+            org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(true)
+            service.invoke("publishExecutionState")
+            assertFalse(run.session.controller.isCancelled)
+            assertFalse(run.session.controller.isPaused)
+            org.junit.Assert.assertNull(service.field<ComposeView?>("glowView"))
+            org.junit.Assert.assertNull(service.field<ComposeView?>("capsuleView"))
+        } finally {
+            shadowOf(display).setState(android.view.Display.STATE_ON)
+            org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(false)
+            controller.destroy()
+        }
+    }
+
+    @Test
     @Config(sdk = [37])
     fun systemTaskSurfaceKeepsOnlyTheGlowAndNotificationControlsTargetTheirOriginalRun() {
         org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(false)

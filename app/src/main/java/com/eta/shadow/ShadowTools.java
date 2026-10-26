@@ -319,7 +319,8 @@ public final class ShadowTools {
             // Only a close-out the engine accepted clears the handle: keeping it after a
             // failure is what lets the caller retry instead of losing the display.
             if (new JSONObject(out).optBoolean("ok", false)) {
-                parked = "notify".equals(a.optString("mode", "notify"));
+                JSONObject finish = new JSONObject(out).optJSONObject("finish");
+                parked = finish != null && finish.optBoolean("parked", false);
                 mode = null;
                 display = -1;
             }
@@ -329,10 +330,12 @@ public final class ShadowTools {
 
     private String doFinish(JSONObject a) throws Exception {
         JSONObject out = new JSONObject();
-        // Runtime owns the one notification and its chat destination. Tool completion only
+        // Runtime owns each task notification and its chat destination. Tool completion only
         // parks/hands over the screen; it must not post a second app-launch notification.
         out.put("notificationManagedByRuntime", true);
         String mode = a.optString("mode", "notify");
+        // Old conversations may still request handover; background completion never opens an app.
+        if ("handover".equals(mode) || "background".equals(mode)) mode = "notify";
         boolean finOk = false;
         try {
             JSONObject fin = new JSONObject(engine(new JSONObject()
@@ -462,10 +465,17 @@ public final class ShadowTools {
             out.put("displayRestore", restore.matches("[a-z_]{1,64}") ? restore : "unknown")
                     .put("compatibilityRestarts", status.optInt("compatibilityRestarts"));
             JSONArray sessions = status.optJSONArray("sessions");
-            int closing = 0;
-            if (sessions != null) for (int i = 0; i < sessions.length(); i++)
-                if (sessions.optJSONObject(i) != null && sessions.optJSONObject(i).optBoolean("closing")) closing++;
-            out.put("closingCount", closing);
+            int closing = 0, isolated = 0, unsupported = 0;
+            if (sessions != null) for (int i = 0; i < sessions.length(); i++) {
+                JSONObject session = sessions.optJSONObject(i);
+                if (session == null) continue;
+                if (session.optBoolean("closing")) closing++;
+                String power = session.optString("displayPower");
+                if ("isolated_awake".equals(power)) isolated++;
+                if ("cpu_only_shared_group".equals(power) || "display_power_unavailable".equals(power)) unsupported++;
+            }
+            out.put("closingCount", closing).put("isolatedAwakeDisplays", isolated)
+                    .put("screenOffUnsupportedDisplays", unsupported);
         } catch (Exception ignored) {
             try { out.put("reachable", false); } catch (Exception unused) { }
         }

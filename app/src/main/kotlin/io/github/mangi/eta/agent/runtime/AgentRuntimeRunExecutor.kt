@@ -55,6 +55,7 @@ internal class AgentRuntimeRunExecutor(
         List<AgentEvent>,
     ) -> Unit,
     private val onBackgroundScreenPhase: (BackgroundScreenPhase?) -> Unit = {},
+    private val onBackgroundAppOpened: (String) -> Unit = {},
 ) {
     data class Outcome(
         val result: AgentRuntimeWire.RunResult,
@@ -242,7 +243,7 @@ internal class AgentRuntimeRunExecutor(
             val routingExecutor = RoutingToolExecutor(
                 local = executor,
                 mcp = McpToolExecutor(mcpSnapshot),
-                shadow = BackgroundScreenTools(request.runId, runController, onBackgroundScreenPhase),
+                shadow = BackgroundScreenTools(request.runId, runController, onBackgroundScreenPhase, onBackgroundAppOpened),
             )
             toolExecutor = routingExecutor
             toolsBinding = runController.register(routingExecutor::close)

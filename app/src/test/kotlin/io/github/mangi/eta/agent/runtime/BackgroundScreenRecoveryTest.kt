@@ -32,11 +32,13 @@ class BackgroundScreenRecoveryTest {
 
     @Test fun retriesOnlyEngineConfirmedPendingCleanupBeforeLaunch() {
         val connection = Connection().apply { pendingLaunches = 2 }
-        val tools = BackgroundScreenTools("parked-reclaim", AgentRunController(), registry = ScreenLeaseRegistry(),
+        val opened = mutableListOf<String>()
+        val tools = BackgroundScreenTools("parked-reclaim", AgentRunController(), onAppOpened = { opened += it }, registry = ScreenLeaseRegistry(),
             connectionFactory = { connection }, retryDelayMs = 20)
         try {
             assertEquals("{\"ok\":true}", tools.execute("screen_open", "{\"package\":\"app.one\"}"))
             assertEquals(3, connection.calls.size)
+            assertEquals(listOf("app.one"), opened)
         } finally { tools.close() }
     }
 

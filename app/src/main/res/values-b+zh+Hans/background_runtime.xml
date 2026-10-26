@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="background_task_completed">任务已完成</string>
     <string name="background_waiting_model">等待模型回复</string>
     <string name="background_waiting_app">等待应用空闲</string>
     <string name="background_releasing_screen">正在回收屏幕</string>

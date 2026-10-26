@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="background_task_completed">Task completed</string>
     <string name="background_waiting_model">Waiting for model</string>
     <string name="background_waiting_app">Waiting for app</string>
     <string name="background_releasing_screen">Releasing screen</string>

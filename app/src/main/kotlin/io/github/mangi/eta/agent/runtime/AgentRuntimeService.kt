@@ -189,7 +189,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         }
         displayedRun = null
         serviceScope.cancel()
-        AgentExecutionService.updateRunStatus(this, null, activeRunCount = 0)
+        AgentExecutionService.updateTasks(this, emptyList())
         resultIo.shutdownNow()
         mainHandler.removeCallbacksAndMessages(null)
         AgentOverlayClearance.detach(clearanceHost)
@@ -451,6 +451,10 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
 
     private fun failBeforeExecution(run: RuntimeRunRegistry.Run, message: String) {
         run.releaseIncoming()
+        mainHandler.post {
+            if (!destroyed) AgentExecutionService.completeTask(this, notificationState(run).copy(
+                completed = true, status = AgentOverlayStatus.RunFailed, streamPreview = message.takeLast(240)))
+        }
         val result = AgentRuntimeWire.RunResult(
             run.runId, false, "", message,
             operation = run.request.operation, rewriteTargetMessageId = run.request.rewriteTargetMessageId,
@@ -507,6 +511,9 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                         publishExecutionState()
                     }
                 } },
+                onBackgroundAppOpened = { packageName -> mainHandler.post {
+                    if (!destroyed) { run.lastBackgroundApp = packageName; publishExecutionState() }
+                } },
             ).execute(run.session, run.request)
             shadowResult = outcome.result
             if (!outcome.shouldUpdateHost) return
@@ -559,6 +566,10 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             }
             runCatching {
                 run.overlayState = run.overlayState.applyEvent(event)
+                if (event is AgentEvent.RunFinished || event is AgentEvent.RunFailed) {
+                    AgentExecutionService.completeTask(this, notificationState(run).copy(
+                        completed = true, status = run.overlayState.status))
+                }
                 if (displayedRun === run && !run.session.isTerminal) {
                     state.value = run.overlayState
                     ensureOverlayVisible()
@@ -596,6 +607,11 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         mainHandler.post {
             if (destroyed) return@post
             run.completedContext = completedContext
+            AgentExecutionService.completeTask(this, notificationState(run).copy(
+                completed = true,
+                status = if (result.ok) AgentOverlayStatus.ResultReady else AgentOverlayStatus.RunFailed,
+                streamPreview = (if (result.ok) result.content else result.error.orEmpty()).takeLast(240),
+            ))
             if (runs.all().any { !it.session.isTerminal }) {
                 publishExecutionState()
                 return@post
@@ -1004,22 +1020,23 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                 ?.let { selected.overlayState.copy(status = AgentOverlayStatus.BackgroundScreen(it)) } ?: selected.overlayState
             ambientState.value = state.value.copy(phase = if (active.any { !it.session.controller.isPaused })
                 AgentOverlayPhase.RUNNING else AgentOverlayPhase.PAUSED)
-            if (getSystemService(android.os.PowerManager::class.java).isInteractive) ensureOverlayVisible()
+            if (isMainDisplayOn()) ensureOverlayVisible()
         } else if (displayedRun?.hasExecutedForegroundTool != true && !guiControl.state.value.userPaused) {
             displayedRun = null
             removeAmbientWindows()
         }
-        AgentExecutionService.updateRunStatus(
-            this, selected?.let { state.value.status },
-            activeRunCount = active.size,
-            preview = selected?.overlayState?.let { if (it.status == AgentOverlayStatus.GeneratingAnswer)
-                it.detailText.takeLast(80) else it.thought.takeLast(80) }.orEmpty(),
-            conversationId = selected?.conversationId,
-            runId = selected?.runId,
-            taskTitle = selected?.request?.prompt.orEmpty(),
-            paused = selected?.session?.controller?.isPaused == true,
-        )
+        AgentExecutionService.updateTasks(this, active.map(::notificationState))
     }
+
+    private fun notificationState(run: RuntimeRunRegistry.Run) = TaskNotificationState(
+        runId = run.runId, conversationId = run.conversationId, title = run.request.prompt,
+        status = run.backgroundScreenPhase?.takeUnless { run.session.controller.isPaused }
+            ?.let { AgentOverlayStatus.BackgroundScreen(it) } ?: run.overlayState.status,
+        streamPreview = if (run.overlayState.status == AgentOverlayStatus.GeneratingAnswer || run.overlayState.status == AgentOverlayStatus.ResultReady)
+            run.overlayState.detailText.takeLast(80) else run.overlayState.thought.takeLast(80),
+        paused = run.session.controller.isPaused,
+        targetPackage = run.lastBackgroundApp,
+    )
 
     private fun selectOverlayTask(id: String) {
         val run = runs.get(id) ?: return
@@ -1036,8 +1053,11 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         glowView?.keepScreenOn = enabled
     }
 
+    private fun isMainDisplayOn(): Boolean = getSystemService(android.hardware.display.DisplayManager::class.java)
+        .getDisplay(android.view.Display.DEFAULT_DISPLAY)?.state == android.view.Display.STATE_ON
+
     private fun showOverlay() {
-        if (!getSystemService(android.os.PowerManager::class.java).isInteractive) return
+        if (!isMainDisplayOn()) return
         // TYPE_ACCESSIBILITY_OVERLAY 免 SYSTEM_ALERT_WINDOW 权限；仅回退态（无障碍未启用）才需检查
         if (AgentAccessibilityService.current() == null && !Settings.canDrawOverlays(this)) return
         val wm = overlayContext().getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return

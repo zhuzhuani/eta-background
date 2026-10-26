@@ -5,6 +5,7 @@ public class TaskLayoutRestorerTest {
     public static class LegacyTask {
         public int displayId;
         public boolean isVisible = true;
+        public boolean isFocused = true;
         public boolean topActivityInSizeCompat = true;
     }
     public static class CompatInfo {
@@ -13,11 +14,15 @@ public class TaskLayoutRestorerTest {
     public static class ModernTask {
         public int displayId;
         public boolean isVisible = true;
+        public boolean isFocused = true;
         public CompatInfo appCompatTaskInfo = new CompatInfo();
     }
     @Test public void neverRestartsNormalHiddenOrInvisibleActivities() {
         LegacyTask task = new LegacyTask();
         assertTrue(TaskLayoutRestorer.shouldRestart(task));
+        task.isFocused = false;
+        assertFalse(TaskLayoutRestorer.shouldRestart(task));
+        task.isFocused = true;
         task.displayId = 12;
         assertFalse(TaskLayoutRestorer.shouldRestart(task));
         task.displayId = 0;

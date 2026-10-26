@@ -1,5 +1,6 @@
 package io.github.mangi.eta.agent.runtime
 
+import android.app.ActivityOptions
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,12 +9,13 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.net.Uri
-import android.graphics.drawable.Icon
+import android.os.PowerManager
 import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.overlay.AgentOverlayStatus
 import io.github.mangi.eta.agent.overlay.localizedText
@@ -22,36 +24,43 @@ import io.github.mangi.eta.core.safeLogType
 import io.github.mangi.eta.ui.MainActivity
 import java.util.concurrent.atomic.AtomicLong
 
-/** 只在用户任务存活期间持有前台执行生命周期；进程被系统停止后不重放任务。 */
+/** A task keeps its notification identity from admission through completion. */
+internal data class TaskNotificationState(
+    val runId: String,
+    val conversationId: String?,
+    val title: String,
+    val status: AgentOverlayStatus,
+    val streamPreview: String = "",
+    val paused: Boolean = false,
+    val completed: Boolean = false,
+    val targetPackage: String? = null,
+)
+
+/** One execution service; each task owns one card, including its final state. */
 internal class AgentExecutionService : Service() {
     private val stopQueue = ExecutionStopQueue { failure ->
         AndroidAgentLogger.warn("Execution task stop failed: type=${failure.safeLogType()}")
     }
     private val owner = ownerSequence.incrementAndGet()
     private var foregroundActive = false
+    private var foregroundId = 0
     @Volatile private var startRejected = false
+    private var cpuWake: PowerManager.WakeLock? = null
+    private val renewCpuWake = Runnable { syncCpuWake() }
 
     override fun onCreate() {
         super.onCreate()
         instance = this
         leases.attachOwner(owner)
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(
-            NotificationChannel(CHANNEL, getString(R.string.execution_channel), NotificationManager.IMPORTANCE_DEFAULT).apply {
-                setSound(null, null); enableVibration(false); setShowBadge(false)
-            },
-        )
+        ensureChannel(this)
         ensureForeground()
     }
 
     private fun ensureForeground() {
         if (foregroundActive || startRejected) return
         leases.attachOwner(owner)
-        try {
-            postForegroundNotification()
-            foregroundActive = true
-            publishedCompletionId = null // This foreground card replaced any previous completion.
-        } catch (failure: RuntimeException) {
+        try { postForegroundNotification() }
+        catch (failure: RuntimeException) {
             startRejected = true
             AndroidAgentLogger.warn("Execution service foreground failed: type=${failure.safeLogType()}")
             stopTasks(startFailed = true)
@@ -59,123 +68,98 @@ internal class AgentExecutionService : Service() {
     }
 
     private fun postForegroundNotification() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIFICATION_ID, notification())
+        val task = cards.values.firstOrNull { !it.completed } ?: cards.values.lastOrNull()
+        val id = task?.let { idFor(it.runId) } ?: NOTIFICATION_ID
+        if (!foregroundActive || foregroundId != id || task == null || posted[id] != task) {
+            val card = notification(this, task, id)
+            val oldId = foregroundId
+            if (foregroundActive && oldId != id) {
+                // Detach first so Android cannot cancel the old card during ownership transfer.
+                stopForeground(STOP_FOREGROUND_DETACH)
+                foregroundActive = false
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(id, card, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else startForeground(id, card)
+            foregroundActive = true
+            foregroundId = id
+            if (task != null) posted[id] = task
+            // Refresh the detached card in place with its final state.
+            if (oldId != id) {
+                posted.remove(oldId)
+                if (oldId != 0 && oldId !in notificationIds.values) getSystemService(NotificationManager::class.java).cancel(oldId)
+            }
         }
+        publishCards(this, exceptId = id)
+        syncCpuWake()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action in RUN_ACTIONS) {
-            intent?.getStringExtra(EXTRA_RUN_ID)?.let { runId ->
-                AgentRuntimeService.dispatchNotificationAction(intent.action.orEmpty(), runId)
+            intent?.getStringExtra(EXTRA_RUN_ID)?.let {
+                AgentRuntimeService.dispatchNotificationAction(intent.action.orEmpty(), it)
             }
-            refreshNotification() // A stale PendingIntent must not keep an empty service alive.
-        } else if (intent?.action == ACTION_STOP) {
-            stopTasks()
-        } else {
-            ensureForeground()
             refreshNotification()
-        }
+        } else if (intent?.action == ACTION_STOP) stopTasks()
+        else { ensureForeground(); refreshNotification() }
         return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        if (instance === this) instance = null
-        // 销毁时同样收回本服务拥有的任务。回收在独立有界工作线程上完成，不阻塞 Main。
+        val current = instance === this
+        if (current) instance = null
         stopQueue.close(leases.drainOwner(owner))
+        if (current) cards.values.filterNot { it.completed }.map { it.runId }.forEach { removeCard(this, it) }
+        releaseCpuWake()
         super.onDestroy()
     }
 
+    private fun releaseCpuWake() {
+        mainHandler.removeCallbacks(renewCpuWake)
+        cpuWake?.takeIf { it.isHeld }?.release()
+        cpuWake = null
+    }
+
+    private fun syncCpuWake() {
+        mainHandler.removeCallbacks(renewCpuWake)
+        val needed = leases.count() > 0 && cards.values.any { !it.completed && !it.paused }
+        // A lease can also cover request preparation or result persistence with no active GUI card.
+        val saving = leases.count() > 0 && cards.values.none { !it.completed }
+        if (!needed && !saving) { releaseCpuWake(); return }
+        val wake = cpuWake ?: getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "etax:execution").also {
+                it.setReferenceCounted(false); cpuWake = it
+            }
+        wake.acquire(120_000L)
+        mainHandler.postDelayed(renewCpuWake, 60_000L)
+    }
+
     private fun stopTasks(startFailed: Boolean = false) {
-        val callbacks = leases.drain(startFailed)
-        stopQueue.submit(callbacks) {
+        stopQueue.submit(leases.drain(startFailed)) {
             mainHandler.post { if (instance === this) refreshNotification() }
         }
     }
 
     private fun refreshNotification() {
         if (leases.closeOwnerIfIdle(owner)) {
+            releaseCpuWake()
             if (foregroundActive) {
                 foregroundActive = false
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopForeground(STOP_FOREGROUND_DETACH)
+                posted.remove(foregroundId)
             }
-            publishCompletionIfIdle(this)
+            publishCards(this, completedOnly = true)
             stopSelf()
-        } else {
-            // Keep the service's notification record and SystemUI's promoted card on the same snapshot.
-            // Updating only NotificationManager leaves the service holding the initial generic summary.
-            postForegroundNotification()
-        }
-    }
-
-    private fun notification(): Notification {
-        val status = runStatus
-        val open = conversationIntent(this, selectedConversationId)
-        val stop = PendingIntent.getService(
-            this, 1, Intent(this, AgentExecutionService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val taskCount = if (activeRunCount > 0) activeRunCount else leases.count()
-        val builder = Notification.Builder(this, CHANNEL)
-            .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle(getString(R.string.execution_title))
-            // etax: 运行中显示最新一句流式输出（包住 3.3.4 新提的 executionText）
-            .setContentText(executionText(this, status, taskCount) + streamPreview.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty())
-            .setContentIntent(open)
-            .setSubText(selectedTaskTitle.take(60).takeIf(String::isNotBlank))
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-        val runId = selectedRunId
-        if (status != null && runId != null) {
-            if (activeRunCount > 1) builder.addAction(runAction(
-                runId, ACTION_NEXT_TASK, R.string.execution_next_task, android.R.drawable.ic_media_next,
-            ))
-            builder.addAction(runAction(runId,
-                if (selectedRunPaused) ACTION_RESUME_RUN else ACTION_PAUSE_RUN,
-                if (selectedRunPaused) R.string.overlay_resume else R.string.overlay_pause,
-                if (selectedRunPaused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause,
-            ))
-            builder.addAction(runAction(runId, ACTION_STOP_RUN, R.string.overlay_stop_task, R.drawable.ic_assistant_stop))
-        } else {
-            builder.addAction(Notification.Action.Builder(null, getString(R.string.execution_stop), stop).build())
-        }
-        builder.setVisibility(Notification.VISIBILITY_PRIVATE)
-        // 只有 Agent run 在跑时才申请提升为 Live Update；终端会话、Linux 启动等长驻任务不属于"正在进行、需要持续关注"的活动。
-        if (status != null && usesSystemTaskSurface()) {
-            builder
-                .setStyle(Notification.ProgressStyle().setProgressIndeterminate(true))
-                .setShortCriticalText(if (activeRunCount > 1) getString(R.string.execution_chip_tasks, activeRunCount) else status.shortText())
-                .setRequestPromotedOngoing(true)
-        }
-        return builder.build()
-    }
-
-    private fun runAction(runId: String, action: String, label: Int, icon: Int): Notification.Action {
-        val intent = Intent(this, AgentExecutionService::class.java).setAction(action)
-            .setData(Uri.Builder().scheme("eta-task").authority("control").appendPath(runId).appendPath(action).build())
-            .putExtra(EXTRA_RUN_ID, runId)
-        val pending = PendingIntent.getService(this, 2, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        return Notification.Action.Builder(Icon.createWithResource(this, icon), getString(label), pending).build()
-    }
-
-    /** 状态栏胶囊约 7 个字符可完整显示；更长时只取动作，工具名留在展开态。 */
-    private fun AgentOverlayStatus.shortText(): String = when (this) {
-        is AgentOverlayStatus.BackgroundScreen, AgentOverlayStatus.WaitingForModel -> localizedText(resources).take(7)
-        is AgentOverlayStatus.RunningTool, is AgentOverlayStatus.HostedToolRunning -> getString(R.string.execution_chip_running)
-        AgentOverlayStatus.Paused -> getString(R.string.overlay_paused)
-        AgentOverlayStatus.Stopping -> getString(R.string.overlay_stopping)
-        AgentOverlayStatus.GeneratingAnswer -> getString(R.string.execution_chip_answering)
-        else -> getString(R.string.overlay_reasoning)
+        } else postForegroundNotification()
     }
 
     companion object {
         private const val CHANNEL = "eta_execution_tasks_v2"
         private const val NOTIFICATION_ID = 1107
         private const val ACTION_STOP = "io.github.mangi.eta.action.STOP_USER_EXECUTION"
+        // Accepted only for PendingIntents left by older builds; new cards have no switch action.
         internal const val ACTION_NEXT_TASK = "io.github.mangi.etax.action.NEXT_TASK"
         internal const val ACTION_PAUSE_RUN = "io.github.mangi.etax.action.PAUSE_RUN"
         internal const val ACTION_RESUME_RUN = "io.github.mangi.etax.action.RESUME_RUN"
@@ -186,53 +170,98 @@ internal class AgentExecutionService : Service() {
         private val ownerSequence = AtomicLong()
         private val mainHandler = Handler(Looper.getMainLooper())
         @Volatile private var instance: AgentExecutionService? = null
-        private var streamPreview = ""
-        private var selectedConversationId: String? = null
-        private var selectedRunId: String? = null
-        private var selectedTaskTitle = ""
-        private var selectedRunPaused = false
-        private data class Completion(val runId: String, val conversationId: String, val status: String, val text: String)
-        @Volatile private var completion: Completion? = null
-        private var publishedCompletionId: String? = null
+        private val cards = linkedMapOf<String, TaskNotificationState>()
+        private val notificationIds = mutableMapOf<String, Int>()
+        private val posted = mutableMapOf<Int, TaskNotificationState>()
+        private var nextId = 0x45540000
         private var refreshPending = false
-        private var runStatus: AgentOverlayStatus? = null
-        private var activeRunCount = 0
-        private var publishedStatusText: String? = null
+        private val refresh = Runnable {
+            refreshPending = false
+            instance?.takeIf { it.foregroundActive }?.refreshNotification()
+        }
 
-        /**
-         * Agent run 的当前状态，供通知与状态栏胶囊展示；null 表示没有 Agent run 在跑。
-         * 只在显示文字变化时刷新通知，避免流式事件把通知更新频率推到系统限流。
-         */
-        fun updateRunStatus(context: Context, status: AgentOverlayStatus?, activeRunCount: Int, preview: String = "", conversationId: String? = null,
-            runId: String? = null, taskTitle: String = "", paused: Boolean = false) {
-            mainHandler.post {
-                runStatus = status
-                streamPreview = preview
-                selectedConversationId = conversationId
-                selectedRunId = runId
-                selectedTaskTitle = taskTitle
-                selectedRunPaused = paused
-                this.activeRunCount = activeRunCount
-                if (activeRunCount == 0 && instance?.foregroundActive != true) publishCompletionIfIdle(context)
-                val count = if (activeRunCount > 0) activeRunCount else leases.count()
-                val text = listOf(executionText(context, status, count), preview, conversationId, runId, taskTitle, paused).joinToString("\u0000")
-                if (text == publishedStatusText) return@post
-                publishedStatusText = text
-                // A later service start reads this state directly; there is no notification to refresh yet.
-                if (instance?.foregroundActive != true) return@post
-                if (!refreshPending) {
-                    refreshPending = true
-                    mainHandler.postDelayed({
-                        refreshPending = false
-                        instance?.takeIf { it.foregroundActive }?.refreshNotification()
-                    }, 500)
+        private fun onMain(block: () -> Unit) {
+            if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post(block)
+        }
+
+        private fun idFor(runId: String): Int = notificationIds.getOrPut(runId) {
+            if (notificationIds.isEmpty()) NOTIFICATION_ID else nextId++
+        }
+
+        private fun ensureChannel(context: Context) {
+            context.getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CHANNEL, context.getString(R.string.execution_channel), NotificationManager.IMPORTANCE_DEFAULT).apply {
+                    setSound(null, null); enableVibration(false); setShowBadge(false)
+                })
+        }
+
+        private fun removeCard(context: Context, runId: String) {
+            cards.remove(runId)
+            notificationIds.remove(runId)?.let { id ->
+                context.getSystemService(NotificationManager::class.java).cancel(id)
+                posted.remove(id)
+            }
+        }
+
+        /** Ordinary streaming updates share one throttle. Completed cards are retained unchanged. */
+        fun updateTasks(context: Context, snapshot: List<TaskNotificationState>) = onMain {
+            val liveIds = snapshot.map { it.runId }.toSet()
+            val removed = cards.values.filter { !it.completed && it.runId !in liveIds }.map { it.runId }
+            removed.forEach { removeCard(context, it) }
+            var changed = removed.isNotEmpty()
+            snapshot.forEach { task ->
+                if (cards[task.runId]?.completed != true && cards[task.runId] != task) {
+                    cards[task.runId] = task
+                    idFor(task.runId)
+                    changed = true
+                }
+            }
+            instance?.syncCpuWake()
+            if (changed || snapshot.isEmpty()) scheduleRefresh()
+        }
+
+        /** Terminal events bypass streaming throttles and update the original task card immediately. */
+        fun completeTask(context: Context, task: TaskNotificationState) = onMain {
+            val previous = cards[task.runId]
+            if (previous?.completed == true && previous.status == task.status && previous.targetPackage == task.targetPackage) return@onMain
+            cards[task.runId] = task.copy(completed = true, paused = false)
+            idFor(task.runId)
+            cards.values.filter { it.completed }.dropLast(3).map { it.runId }.forEach { removeCard(context, it) }
+            mainHandler.removeCallbacks(refresh)
+            refreshPending = false
+            val service = instance
+            if (service != null) service.refreshNotification() else publishCards(context, completedOnly = true)
+        }
+
+        @JvmStatic fun publishRunCompletion(context: Context, runId: String, conversationId: String, status: String, text: String) = onMain {
+            val previous = cards[runId] ?: return@onMain
+            if (previous.completed) return@onMain // Runtime's terminal event already updated the original card.
+            completeTask(context, previous.copy(conversationId = conversationId,
+                status = if (status == "已完成") AgentOverlayStatus.ResultReady else AgentOverlayStatus.RunFailed,
+                streamPreview = text.takeLast(240)))
+        }
+
+        private fun scheduleRefresh() {
+            if (instance?.foregroundActive != true || refreshPending) return
+            refreshPending = true
+            mainHandler.postDelayed(refresh, 750)
+        }
+
+        private fun publishCards(context: Context, exceptId: Int = 0, completedOnly: Boolean = false) {
+            ensureChannel(context)
+            val manager = context.getSystemService(NotificationManager::class.java)
+            cards.values.forEach { task ->
+                val id = idFor(task.runId)
+                if (id != exceptId && (!completedOnly || task.completed) && posted[id] != task) {
+                    manager.notify(id, notification(context, task, id))
+                    posted[id] = task
                 }
             }
         }
 
+        internal fun cpuExecutionHeld(): Boolean = instance?.cpuWake?.isHeld == true
         internal fun usesSystemTaskSurface(): Boolean = Build.VERSION.SDK_INT >= 36 &&
             Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1
-
         internal fun taskNotificationsEnabled(context: Context): Boolean {
             val manager = context.getSystemService(NotificationManager::class.java)
             return manager.areNotificationsEnabled() &&
@@ -250,51 +279,73 @@ internal class AgentExecutionService : Service() {
             return PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
 
-        /** Completion replaces the same notification after foreground ownership has ended. */
-        @JvmStatic fun publishRunCompletion(context: Context, runId: String, conversationId: String, status: String, text: String) {
-            mainHandler.post {
-                completion = Completion(runId, conversationId, status, text)
-                if (instance?.foregroundActive == true) instance?.refreshNotification()
-                else publishCompletionIfIdle(context.applicationContext)
+        private fun destination(context: Context, task: TaskNotificationState?, id: Int): PendingIntent {
+            if (task?.completed == true) {
+                val launch = task.targetPackage?.let { context.packageManager.getLaunchIntentForPackage(it) }
+                if (launch != null) return PendingIntent.getActivity(context, id,
+                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                    ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle())
             }
+            return conversationIntent(context, task?.conversationId)
         }
 
-        private fun publishCompletionIfIdle(context: Context) {
-            val result = completion ?: return
-            if (leases.count() != 0 || activeRunCount > 0 || result.runId == publishedCompletionId) return
-            val manager = context.getSystemService(NotificationManager::class.java)
-            if (manager.getNotificationChannel(CHANNEL) == null || !manager.areNotificationsEnabled()) return
-            val notification = Notification.Builder(context, CHANNEL)
+        private fun notification(context: Context, task: TaskNotificationState?, id: Int): Notification {
+            val status = task?.status
+            val completed = task?.completed == true
+            val label = if (completed && status == AgentOverlayStatus.ResultReady) context.getString(R.string.background_task_completed)
+                else status?.localizedText(context.resources)
+                    ?: context.resources.getQuantityString(R.plurals.execution_summary, leases.count(), leases.count())
+            val builder = Notification.Builder(context, CHANNEL)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle("Etax · ${result.status}")
-                .setContentText(result.text.takeLast(240))
-                .setStyle(Notification.BigTextStyle().bigText(result.text))
-                .setContentIntent(conversationIntent(context, result.conversationId))
-                .setOnlyAlertOnce(true).setAutoCancel(true).setVisibility(Notification.VISIBILITY_PRIVATE).build()
-            runCatching { manager.notify(NOTIFICATION_ID, notification) }
-                .onSuccess { publishedCompletionId = result.runId }
-                .onFailure { AndroidAgentLogger.warn("Completion notification failed: type=${it.safeLogType()}") }
-        }
-
-        private fun executionText(context: Context, status: AgentOverlayStatus?, taskCount: Int): String {
-            val summary = context.resources.getQuantityString(R.plurals.execution_summary, taskCount, taskCount)
-            return when {
-                status == null -> summary
-                taskCount <= 1 -> status.localizedText(context.resources)
-                else -> "$summary · ${status.localizedText(context.resources)}"
+                .setContentTitle(task?.title?.take(60)?.takeIf(String::isNotBlank) ?: context.getString(R.string.execution_title))
+                .setContentText(label + task?.streamPreview?.takeIf(String::isNotBlank)?.let { " · $it" }.orEmpty())
+                .setContentIntent(destination(context, task, id))
+                .setOngoing(!completed).setAutoCancel(completed).setOnlyAlertOnce(true)
+                .setVisibility(Notification.VISIBILITY_PRIVATE)
+            if (task != null && !completed) {
+                builder.addAction(runAction(context, task.runId,
+                    if (task.paused) ACTION_RESUME_RUN else ACTION_PAUSE_RUN,
+                    if (task.paused) R.string.overlay_resume else R.string.overlay_pause,
+                    if (task.paused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause))
+                builder.addAction(runAction(context, task.runId, ACTION_STOP_RUN, R.string.overlay_stop_task, R.drawable.ic_assistant_stop))
+            } else if (task == null) {
+                val stop = PendingIntent.getService(context, 1, Intent(context, AgentExecutionService::class.java).setAction(ACTION_STOP),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                builder.addAction(Notification.Action.Builder(null, context.getString(R.string.execution_stop), stop).build())
             }
+            if (task != null && usesSystemTaskSurface()) {
+                builder.setStyle(Notification.ProgressStyle().setProgressIndeterminate(!completed)
+                    .setProgressSegments(listOf(Notification.ProgressStyle.Segment(100))).setProgress(if (completed) 100 else 0))
+                    .setShortCriticalText(if (completed) label.take(7) else shortText(context, task.status))
+                if (!completed) builder.setRequestPromotedOngoing(true)
+            }
+            return builder.build()
         }
 
-        /** 必须从有效的用户入口取得引用，再创建会话或子进程；失败时调用方不启动任务。 */
-        fun acquire(
-            context: Context,
-            id: String,
-            allowBoundFallback: Boolean = false,
-            onStop: () -> Unit,
-        ): Boolean {
+        private fun runAction(context: Context, runId: String, action: String, label: Int, icon: Int): Notification.Action {
+            val intent = Intent(context, AgentExecutionService::class.java).setAction(action)
+                .setData(Uri.Builder().scheme("eta-task").authority("control").appendPath(runId).appendPath(action).build())
+                .putExtra(EXTRA_RUN_ID, runId)
+            val pending = PendingIntent.getService(context, 2, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            return Notification.Action.Builder(Icon.createWithResource(context, icon), context.getString(label), pending).build()
+        }
+
+        private fun shortText(context: Context, status: AgentOverlayStatus): String = when (status) {
+            is AgentOverlayStatus.BackgroundScreen, AgentOverlayStatus.WaitingForModel -> status.localizedText(context.resources).take(7)
+            is AgentOverlayStatus.RunningTool, is AgentOverlayStatus.HostedToolRunning -> context.getString(R.string.execution_chip_running)
+            AgentOverlayStatus.Paused -> context.getString(R.string.overlay_paused)
+            AgentOverlayStatus.Stopping -> context.getString(R.string.overlay_stopping)
+            AgentOverlayStatus.GeneratingAnswer -> context.getString(R.string.execution_chip_answering)
+            else -> context.getString(R.string.overlay_reasoning)
+        }
+
+        fun acquire(context: Context, id: String, allowBoundFallback: Boolean = false, onStop: () -> Unit): Boolean {
             if (instance?.startRejected == true) return false
+            val newBatch = leases.count() == 0
             if (!leases.acquire(id, allowBoundFallback, onStop)) return true
-            completion = null
+            if (newBatch) onMain {
+                cards.values.filter { it.completed }.map { it.runId }.forEach { removeCard(context, it) }
+            }
             return try {
                 context.applicationContext.startForegroundService(Intent(context, AgentExecutionService::class.java))
                 true
@@ -310,14 +361,6 @@ internal class AgentExecutionService : Service() {
             mainHandler.post { instance?.refreshNotification() }
         }
 
-        /**
-         * etax: 供 ShadowNotice 在后台刷新前台通知（流式正文）。走服务自身的
-         * 同一服务的前台通知更新，不用 startService——后台启动服务会被系统拦，
-         * 回桌面后流式就不再更新了。
-         */
-        @JvmStatic
-        fun pokeStreaming() {
-            mainHandler.post { instance?.takeIf { it.foregroundActive }?.refreshNotification() }
-        }
+        @JvmStatic fun pokeStreaming() { mainHandler.post { scheduleRefresh() } }
     }
 }

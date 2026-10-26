@@ -54,9 +54,7 @@ final class VDriveWorker implements VDrive.Worker {
     Handler work;
     DisplayManager dm;
     VirtualDisplay vd;
-    // etax ③: 有活动虚拟屏时持有 PARTIAL_WAKE_LOCK，防 Doze 冻结引擎进程，
-    // 争取物理屏熄灭后仍能在独立显示组的隐藏屏上继续跑（真·息屏尝试）。
-    android.os.PowerManager.WakeLock wake;
+    VirtualDisplayPower displayPower;
     ImageReader reader;
     int W = 1440, H = 3168, DPI = 560;
     volatile int displayId = -1;
@@ -258,17 +256,23 @@ final class VDriveWorker implements VDrive.Worker {
         workerThread = new HandlerThread("vdrive-work");
         workerThread.start();
         work = new Handler(workerThread.getLooper());
-        work.postDelayed(new Runnable() { public void run() { watchdog(); work.postDelayed(this, 10_000); } }, 10_000);
+        displayPower = new VirtualDisplayPower(ctx);
+        work.postDelayed(new Runnable() { public void run() {
+            watchdog();
+            work.postDelayed(this, orphanAt > 0 ? 2000 : 10000);
+        } }, 2000);
 
     }
 
     public int displayId() { return displayId; }
+    public String powerState() { return displayPower == null ? "idle" : displayPower.state; }
 
     public void keepAlive() {
         if (!retired) work.post(() -> {
             long now = android.os.SystemClock.elapsedRealtime();
             for (Session session : sessions.values()) session.lastCmdAt = now;
             lastCmdAt = now;
+            syncWake();
         });
     }
 
@@ -325,6 +329,7 @@ final class VDriveWorker implements VDrive.Worker {
                 }
             }
             tickIdleDisplay(now);
+            syncWake();
             if (EXIT_MS > 0 && sessions.isEmpty() && now - lastCmdAt > EXIT_MS) {
                 log("idle " + EXIT_MS + "ms with no sessions, exiting");
                 shutdown();
@@ -353,7 +358,6 @@ final class VDriveWorker implements VDrive.Worker {
             Integer escapedTask = taskOfPackage(x.pkg);
             if (escapedTask != null && displayOfTask(escapedTask) == Display.DEFAULT_DISPLAY) {
                 // The user can also open the parked app from the launcher, without our handover command.
-                restoreMainDisplayLayout(escapedTask);
                 releaseSessionFully(x, false);
                 return;
             }
@@ -415,24 +419,6 @@ final class VDriveWorker implements VDrive.Worker {
         }
     }
 
-    /** Completed screens are watched briefly while the user can open them from the launcher. */
-    void watchCompletedHandover(Session session) {
-        work.postDelayed(() -> {
-            if (retired || sessions.get(session.pkg) != session || session.orphanAt == 0) return;
-            if (SystemClock.elapsedRealtime() - session.orphanAt > ORPHAN_HOLD_MS) return;
-            android.os.PowerManager power = ctx.getSystemService(android.os.PowerManager.class);
-            if (power != null && power.isInteractive()) {
-                Integer task = taskOfPackage(session.pkg);
-                if (task != null && displayOfTask(task) == Display.DEFAULT_DISPLAY) {
-                    restoreMainDisplayLayout(task);
-                    releaseSessionFully(session, false);
-                    return;
-                }
-            }
-            watchCompletedHandover(session);
-        }, 1000);
-    }
-
     /** A display that was created but never got a session (create -> launch failed). */
     void tickIdleDisplay(long now) {
         if (vd == null || current != null) return;
@@ -448,26 +434,10 @@ final class VDriveWorker implements VDrive.Worker {
         }
     }
 
-    /** etax ③: 按活动虚拟屏数量开/关 wakelock。有屏就持有（CPU 不被 Doze 挂起），全关就释放。 */
+    /** The display owns its power lease; a completed screen releases it immediately. */
     void syncWake() {
-        try {
-            if (ctx == null) return;
-            boolean want = !frames.isEmpty() && orphanAt == 0 && !retired;
-            if (want) {
-                if (wake == null) {
-                    android.os.PowerManager pm = ctx.getSystemService(android.os.PowerManager.class);
-                    if (pm == null) return;
-                    wake = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "eta:vdrive");
-                    wake.setReferenceCounted(false);
-                }
-                if (!wake.isHeld()) { wake.acquire(); log("wakelock acquired"); }
-            } else if (wake != null && wake.isHeld()) {
-                wake.release();
-                log("wakelock released");
-            }
-        } catch (Throwable t) {
-            log("wake sync failed: " + t);
-        }
+        if (displayPower != null) displayPower.update(displayId,
+                !frames.isEmpty() && orphanAt == 0 && !retired);
     }
 
     void destroyIdleDisplay() {
@@ -1155,17 +1125,10 @@ final class VDriveWorker implements VDrive.Worker {
             }
         }, work);
         log("image listener registered " + W + "x" + H + " surface=" + (reader.getSurface() != null));
-        // TRUSTED is required for the accessibility service to see this display at all —
-        // without it text/click by node stop working. OWN_DISPLAY_GROUP is deliberately
-        // NOT set here: on this ROM it still lands in display group 0, which shares focus
-        // with the default display, so the hidden window becomes the IME client and the
-        // user's keyboard follows it off-screen.
-        // TRUSTED: accessibility can see the display. OWN_FOCUS + STEAL_TOP_FOCUS_DISABLED
-        // (the two Android 14+ flags the reference implementation sets): keep the hidden
-        // display from becoming the system's top-focus / IME client, so typing on the real
-        // screen is not interrupted while a task runs behind it.
+        // An isolated display group plus ALWAYS_UNLOCKED allows rendering while the physical
+        // screen is locked. OWN_FOCUS keeps its input focus independent of the user's screen.
         int flags = flag("PRIVATE") | flag("OWN_CONTENT_ONLY") | flag("SUPPORTS_TOUCH")
-                | flag("TRUSTED") | flag("OWN_DISPLAY_GROUP") | flag("OWN_FOCUS")
+                | flag("TRUSTED") | flag("OWN_DISPLAY_GROUP") | flag("ALWAYS_UNLOCKED") | flag("OWN_FOCUS")
                 | flag("STEAL_TOP_FOCUS_DISABLED") | flag("ROTATES_WITH_CONTENT")
                 | flag("DESTROY_CONTENT_ON_REMOVAL");
         long t = SystemClock.elapsedRealtime();
@@ -1225,7 +1188,9 @@ final class VDriveWorker implements VDrive.Worker {
      */
     void restoreMainFocus() {
         String front = homeFront;
-        if (front == null || front.isEmpty()) return;
+        if (front == null || front.isEmpty() || !VDrive.mainDisplayOn()) return;
+        // Independent display focus normally makes any main-screen intervention unnecessary.
+        if (front.equals(focusedComponent()) || "isolated_awake".equals(powerState())) return;
         try {
             exec("am start -n " + shellQuote(front) + " --activity-single-top");
             Thread.sleep(150);
@@ -1442,18 +1407,20 @@ final class VDriveWorker implements VDrive.Worker {
         String pkg = comp.contains("/") ? comp.substring(0, comp.indexOf('/')) : comp;
         Integer tid = null;
         for (int k = 0; k < 80 && tid == null; k++) {
-            Thread.sleep(100);
+            checkCanceled();
             tid = taskOfPackage(pkg);
+            if (tid == null) sleepCancellable(100);
         }
         if (tid == null) return fail("LAUNCH_FAILED", out.trim());
         return new JSONObject().put("ok", true).put("taskId", tid).put("via", via);
     }
 
     /** Wait until the task really sits on that display. */
-    boolean waitForTaskDisplay(int taskId, int did, int tries) throws InterruptedException {
+    boolean waitForTaskDisplay(int taskId, int did, int tries) throws Exception {
         for (int k = 0; k < tries; k++) {
+            checkCanceled();
             if (displayOfTask(taskId) == did) return true;
-            Thread.sleep(120);
+            sleepCancellable(120);
         }
         return displayOfTask(taskId) == did;
     }
@@ -1927,7 +1894,6 @@ final class VDriveWorker implements VDrive.Worker {
             Frame frame = frames.get(did);
             if (frame != null) frame.close();
             syncWake();
-            watchCompletedHandover(s);
             out.put("parked", true)
                     .put("hint", "任务已完成；可从桌面打开应用，后台屏幕最多保留 1 分钟");
         }
@@ -2089,7 +2055,7 @@ final class VDriveWorker implements VDrive.Worker {
             if (tasks != null) for (Object task : tasks) {
                 if (readInt(task.getClass(), task, "taskId") != taskId) continue;
                 if (TaskLayoutRestorer.restore(taskId, task)) {
-                    log("restored real-display fullscreen configuration for task " + taskId);
+                    log("queued real-display configuration restore for task " + taskId);
                     return true;
                 }
             }

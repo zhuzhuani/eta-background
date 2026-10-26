@@ -8,12 +8,13 @@ import java.util.*;
 
 /** Root transport. Mutable display/input/capture state lives in independent workers. */
 public final class VDrive {
-    static final String BUILD = "20261026-e28-recovery";
+    static final String BUILD = "20261026-e29-background";
     interface Worker {
         JSONObject processLine(String request);
         boolean closeSession();
         void keepAlive();
         int displayId();
+        default String powerState() { return "unknown"; }
     }
     interface WorkerFactory { Worker create(Context context) throws Exception; }
     static WorkerFactory factory = VDriveWorker::new;
@@ -116,7 +117,7 @@ public final class VDrive {
                 synchronized (workers) {
                     for (Map.Entry<String, Slot> e : workers.entrySet()) {
                         sessions.put(new JSONObject().put("sessionId", e.getKey()).put("package", e.getValue().pkg)
-                                .put("closing", e.getValue().closing));
+                                .put("closing", e.getValue().closing).put("displayPower", e.getValue().worker.powerState()));
                     }
                 }
                 return new JSONObject().put("ok", true).put("pong", true).put("build", BUILD)
@@ -186,7 +187,13 @@ public final class VDrive {
                 }
                 if (slot.closing && !cmd.equals("cancel")) return error("SESSION_CLOSED", "屏幕正在释放");
             }
-            if (!id.equals("legacy-mcp") && cmd.equals("launch")) req.put("forceHidden", true);
+            if (!id.equals("legacy-mcp")) {
+                if (cmd.equals("launch")) req.put("forceHidden", true);
+                if (cmd.equals("handover")) return error("BACKGROUND_ONLY", "后台任务不会自动切换到主屏，请从桌面打开目标应用");
+                if (cmd.equals("finish") && (req.optString("mode").equals("handover") || req.optString("mode").equals("background"))) {
+                    req.put("mode", "notify");
+                }
+            }
             return slot.worker.processLine(req.toString());
         } catch (Exception e) { return error("ENGINE_ERROR", e.getClass().getSimpleName() + ": " + e.getMessage()); }
     }
@@ -205,6 +212,11 @@ public final class VDrive {
     }
 
     static int obsPort() { return 8738; }
+    static boolean mainDisplayOn() {
+        if (context == null) return false;
+        android.view.Display main = context.getSystemService(android.hardware.display.DisplayManager.class).getDisplay(0);
+        return main != null && main.getState() == android.view.Display.STATE_ON;
+    }
     static String plain(String value) { return value.replace("\n", " ").replace("\r", " "); }
     static void log(String value) { System.err.println("[vdrive] " + value); }
     private static JSONObject ok() { try { return new JSONObject().put("ok", true); } catch (Exception e) { throw new IllegalStateException(e); } }

@@ -11,11 +11,13 @@ public class VDriveSessionsTest {
     private final List<String> ids = new ArrayList<>();
     private VDrive.WorkerFactory original;
     private static class FakeWorker implements VDrive.Worker {
+        JSONObject lastRequest;
         volatile boolean acknowledgeClose = true;
         final CountDownLatch entered = new CountDownLatch(1), finish = new CountDownLatch(1);
         public JSONObject processLine(String request) {
             try {
             JSONObject json = new JSONObject(request);
+            lastRequest = json;
             if (json.optString("cmd").equals("hold")) {
                 entered.countDown();
                 try { finish.await(3, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
@@ -86,5 +88,16 @@ public class VDriveSessionsTest {
         String id = UUID.randomUUID().toString(); ids.add(id);
         assertEquals("APP_BUSY", VDrive.processLine(new JSONObject().put("cmd", "launch")
                 .put("sessionId", id).put("component", "app.shared").toString()).getString("code"));
+    }
+
+    @Test public void backgroundFinishCannotBringAnAppOntoTheMainScreen() throws Exception {
+        String id = open("app.background");
+        for (String mode : new String[]{"handover", "background"}) {
+            assertTrue(VDrive.processLine(new JSONObject().put("cmd", "finish").put("sessionId", id)
+                    .put("mode", mode).toString()).getBoolean("ok"));
+            assertEquals("notify", made.get(id).lastRequest.getString("mode"));
+        }
+        assertEquals("BACKGROUND_ONLY", send(id, "handover").getString("code"));
+        assertEquals("finish", made.get(id).lastRequest.getString("cmd"));
     }
 }
