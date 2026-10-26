@@ -126,7 +126,7 @@ private fun appendThought(current: String, delta: String): String {
 private fun AgentOverlayState.appendStreamingText(event: AgentEvent.AssistantBlockDelta): AgentOverlayState {
     val nextPreview = (detailText + event.delta)
         .trimStart()
-        .take(MaxStreamingPreviewChars)
+        .takeLast(MaxStreamingPreviewChars)
     return copy(
         phase = AgentOverlayPhase.RUNNING,
         round = event.round,

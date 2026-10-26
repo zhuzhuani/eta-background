@@ -27,8 +27,12 @@ internal class AgentRunController {
     val isPaused: Boolean
         get() = paused
 
-    fun cancel() {
+    @Volatile var cancellationReason: String = "已停止"
+        private set
+
+    fun cancel(reason: String = "已停止") {
         lock.withLock {
+            if (!cancelled) cancellationReason = reason
             cancelled = true
             acceptingSteering = false
             steeringMessages.clear()
@@ -138,7 +142,10 @@ internal class AgentRunController {
     private class CancellableResource(private val cancelBlock: () -> Unit) {
         private val cancelled = AtomicBoolean(false)
 
-        fun cancel() {
+        @Volatile var cancellationReason: String = "已停止"
+        private set
+
+    fun cancel(reason: String = "已停止") {
             if (cancelled.compareAndSet(false, true)) cancelBlock()
         }
     }

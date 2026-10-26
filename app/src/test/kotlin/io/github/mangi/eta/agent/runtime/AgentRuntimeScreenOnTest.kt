@@ -21,6 +21,30 @@ import org.robolectric.annotation.Config
 @Config(sdk = [36], application = Application::class)
 class AgentRuntimeScreenOnTest {
     @Test
+    fun backgroundCapsuleSwitchesAndControlsOnlySelectedTaskWithoutKeepingScreenOn() {
+        val serviceController = Robolectric.buildService(AgentRuntimeService::class.java).create()
+        try {
+            val service = serviceController.get()
+            val first = service.registerRun("background-one", ownsGui = false)
+            val second = service.registerRun("background-two", ownsGui = false)
+            service.invoke("publishExecutionState")
+            assertEquals(2, service.field<MutableState<List<io.github.mangi.eta.agent.overlay.OverlayTaskItem>>>("taskItems").value.size)
+            service.invokeForRun("selectOverlayTask", first.runId)
+            service.invokeForRun("requestPause", first.runId)
+            assertTrue(first.session.controller.isPaused)
+            assertFalse(second.session.controller.isPaused)
+            assertEquals(AgentOverlayPhase.PAUSED, service.field<MutableState<AgentOverlayState>>("state").value.phase)
+            assertEquals(AgentOverlayPhase.RUNNING, service.field<MutableState<AgentOverlayState>>("ambientState").value.phase)
+            service.invoke("requestResume")
+            assertFalse(first.session.controller.isPaused)
+            service.invoke("updateKeepScreenOn")
+            assertFalse(AgentRuntimeService.keepScreenOn.value)
+        } finally {
+            serviceController.destroy()
+        }
+    }
+
+    @Test
     fun pauseResumeAndCancellationUpdateBothAppAndGuiWindowState() {
         val serviceController = Robolectric.buildService(AgentRuntimeService::class.java).create()
         try {

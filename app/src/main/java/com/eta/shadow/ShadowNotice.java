@@ -35,30 +35,32 @@ public final class ShadowNotice {
     private static final long STREAM_STALE_MS = 5000L;
     private static final String STOPPED = "已停止";
 
-    // Eta 自己的通道是 IMPORTANCE_LOW，状态栏不显示图标；收尾通知用独立的 DEFAULT 静音通道。
+    // 完成通知独立于运行通知；每条任务使用独立 tag 和会话跳转。
     private static final String CHANNEL = "eta_shadow_done";
     private static final int DONE_ID = 0x4D5A;
 
-    private static final StringBuilder PENDING = new StringBuilder();
-    private static final LinkedList<String> HISTORY = new LinkedList<>();
+    private final StringBuilder PENDING = new StringBuilder();
+    private final LinkedList<String> HISTORY = new LinkedList<>();
 
-    private static volatile boolean active = false;
-    private static volatile boolean sawStep = false;
-    private static volatile String lastLine = "";
-    private static volatile long lastKick = 0L;
-    private static volatile long lastAppend = 0L;
-    private static volatile String step = "";
-    private static volatile long stepAt = 0L;
+    private volatile boolean active = false;
+    private volatile boolean sawStep = false;
+    private volatile String lastLine = "";
+    private volatile long lastKick = 0L;
+    private volatile long lastAppend = 0L;
+    private volatile String step = "";
+    private volatile long stepAt = 0L;
 
     private static final char[] BREAKS = {'。', '！', '？', '；', '\n', '.', '!', '?', ';'};
 
-    private ShadowNotice() {}
+    private final String runId;
+    private final String conversationId;
+    public ShadowNotice(String runId, String conversationId) { this.runId = runId; this.conversationId = conversationId; }
 
     // ------------------------------------------------------------- lifecycle
 
     /** 每次对话任务开始时调用（AgentRuntimeService 的运行线程）。 */
-    public static void onRunStarted() {
-        synchronized (ShadowNotice.class) {
+    public void onRunStarted() {
+        synchronized (this) {
             PENDING.setLength(0);
             HISTORY.clear();
         }
@@ -76,11 +78,11 @@ public final class ShadowNotice {
      * @param ok    任务是否成功
      * @param error 失败原因（成功时为 null）
      */
-    public static void onRunFinished(Context ctx, boolean ok, String error) {
+    public void onRunFinished(Context ctx, boolean ok, String error) {
         List<String> lines;
         boolean didSomething;
-        synchronized (ShadowNotice.class) {
-            if (!ok && PENDING.length() > 0) {
+        synchronized (this) {
+            if (PENDING.length() > 0) {
                 // 出错时把半句也带上，用户能看到停在了哪里
                 String tailText = clean(PENDING.toString());
                 if (!tailText.isEmpty()) pushLine(clip(tailText));
@@ -109,13 +111,13 @@ public final class ShadowNotice {
     // ---------------------------------------------------------------- stream
 
     /** 回答正文的流式增量（AgentLoop 中 TEXT 块）。 */
-    public static void append(String chunk) {
+    public void append(String chunk) {
         if (!active || chunk == null || chunk.isEmpty()) return;
         long now = SystemClock.elapsedRealtime();
         lastAppend = now;
 
         boolean updated = false;
-        synchronized (ShadowNotice.class) {
+        synchronized (this) {
             PENDING.append(chunk);
             int cut = lastBreak(PENDING);
             if (cut >= 0) {
@@ -136,14 +138,11 @@ public final class ShadowNotice {
             }
         }
 
-        if (updated && now - lastKick >= FLUSH_MIN_GAP) {
-            lastKick = now;
-            kick();
-        }
+        // AgentRuntimeService refreshes the selected task through one shared throttle.
     }
 
-    /** 调用方需持有 ShadowNotice.class 锁。 */
-    private static void pushLine(String line) {
+    /** 调用方需持有本实例的锁。 */
+    private void pushLine(String line) {
         if (line.isEmpty()) return;
         // 流式重试会从头重放回答：已经显示过的句子直接丢弃，并清掉半句缓冲。
         for (String seen : HISTORY) {
@@ -158,7 +157,7 @@ public final class ShadowNotice {
         while (HISTORY.size() > MAX_HISTORY) HISTORY.removeFirst();
     }
 
-    private static int lastBreak(StringBuilder sb) {
+    private int lastBreak(StringBuilder sb) {
         for (int i = sb.length() - 1; i >= 0; i--) {
             char c = sb.charAt(i);
             for (char b : BREAKS) {
@@ -169,7 +168,7 @@ public final class ShadowNotice {
     }
 
     /** A: 把模型回答里的常见 markdown 去干净，通知栏里更像人话。 */
-    private static String clean(String s) {
+    private String clean(String s) {
         if (s == null) return "";
         String t = s;
         t = t.replaceAll("\\[([^\\]]*)\\]\\([^)]*\\)", "$1");   // 链接 [文字](url) -> 文字
@@ -184,7 +183,7 @@ public final class ShadowNotice {
     }
 
     /** 保留句尾，从自然断点开始截，避免截在词中间。 */
-    private static String clip(String s) {
+    private String clip(String s) {
         if (s.length() <= MAX_LINE) return s;
         int start = s.length() - (MAX_LINE - 1);
         for (int i = start; i < s.length(); i++) {
@@ -201,7 +200,7 @@ public final class ShadowNotice {
     // --------------------------------------------------------------- display
 
     /** 前台通知正文：刚执行的工具步骤优先，否则显示最新一句。 */
-    public static String decorate(Object original) {
+    public String decorate(Object original) {
         String base = original == null ? "" : original.toString();
         // S4: 这是上游构建前台通知时调的热路径，出任何异常都退回原文，绝不往上游抛。
         try {
@@ -218,11 +217,11 @@ public final class ShadowNotice {
     }
 
     /** 前台通知的多行展开视图（每句一行）。 */
-    public static void applyStyle(Notification.Builder builder) {
+    public void applyStyle(Notification.Builder builder) {
         if (builder == null || !active) return;
         try {
             List<String> lines;
-            synchronized (ShadowNotice.class) {
+            synchronized (this) {
                 if (HISTORY.size() < 2) return;
                 lines = new ArrayList<>(HISTORY);
             }
@@ -235,7 +234,7 @@ public final class ShadowNotice {
 
     // ------------------------------------------------------------ completion
 
-    private static void post(Context ctx, String status, List<String> lines) {
+    private void post(Context ctx, String status, List<String> lines) {
         if (ctx == null || lines.isEmpty()) return;
         try {
             NotificationManager nm = ctx.getSystemService(NotificationManager.class);
@@ -280,10 +279,12 @@ public final class ShadowNotice {
             Intent open = new Intent();
             open.setComponent(new ComponentName(ctx.getPackageName(), "io.github.mangi.eta.ui.MainActivity"));
             open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-            b.setContentIntent(PendingIntent.getActivity(ctx, 1, open,
+            open.setAction(io.github.mangi.eta.ui.MainActivity.ACTION_OPEN_CONVERSATION_ID);
+            open.putExtra(io.github.mangi.eta.ui.MainActivity.EXTRA_CONVERSATION_ID, conversationId);
+            b.setContentIntent(PendingIntent.getActivity(ctx, runId.hashCode(), open,
                     PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
 
-            nm.notify(DONE_ID, b.build());
+            nm.notify(runId, DONE_ID, b.build());
         } catch (Throwable t) {
             android.util.Log.w(TAG, "completion notice failed: " + t);
         }
@@ -296,7 +297,7 @@ public final class ShadowNotice {
      * 直接请服务用自己的 NotificationManager 刷新；不再用 startService——
      * App 退到后台后后台启动服务会被系统拦，导致回桌面后流式不再更新。
      */
-    private static void kick() {
+    private void kick() {
         try {
             io.github.mangi.eta.agent.runtime.AgentExecutionService.pokeStreaming();
         } catch (Throwable ignored) {
@@ -324,7 +325,7 @@ public final class ShadowNotice {
     }
 
     /** 工具步骤提示（ShadowTools 在执行 screen_* 前调用）。 */
-    public static void setStep(String s) {
+    public void setStep(String s) {
         step = s == null ? "" : s;
         stepAt = SystemClock.elapsedRealtime();
         lastAppend = stepAt;

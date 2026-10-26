@@ -241,6 +241,7 @@ internal class AgentRuntimeRunExecutor(
             val routingExecutor = RoutingToolExecutor(
                 local = executor,
                 mcp = McpToolExecutor(mcpSnapshot),
+                shadow = BackgroundScreenTools(request.runId, runController),
             )
             toolExecutor = routingExecutor
             toolsBinding = runController.register(routingExecutor::close)
@@ -328,7 +329,7 @@ internal class AgentRuntimeRunExecutor(
             cancelled = runController.isCancelled || throwable is AgentRunCancelledException
             val modelFailure = throwable as? AgentModelExecutionException
             val message = if (cancelled) {
-                "已停止"
+                runController.cancellationReason
             } else {
                 throwable.message ?: throwable.javaClass.simpleName
             }

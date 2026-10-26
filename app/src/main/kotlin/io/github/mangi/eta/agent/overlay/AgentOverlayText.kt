@@ -55,6 +55,15 @@ internal fun toolDisplayName(resources: Resources, name: String): String {
 
 @StringRes
 internal fun toolDisplayNameResource(name: String): Int? = when (name) {
+    "screen_open" -> R.string.tool_launch_app
+    "screen_dump", "screen_list", "screen_diag", "screen_shot", "screen_state" -> R.string.tool_observe_screen
+    "screen_click", "screen_tap" -> R.string.tool_tap
+    "screen_press" -> R.string.tool_long_press
+    "screen_swipe", "screen_drag" -> R.string.tool_swipe
+    "screen_scroll" -> R.string.tool_scroll
+    "screen_text" -> R.string.tool_input_text
+    "screen_wait" -> R.string.tool_wait
+    "screen_finish" -> R.string.overlay_result_ready
     "observe_screen" -> R.string.tool_observe_screen
     "release_gui" -> R.string.tool_release_gui
     "tap" -> R.string.tool_tap

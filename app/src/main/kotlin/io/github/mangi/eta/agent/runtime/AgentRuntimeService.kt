@@ -105,8 +105,16 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     private var resultCardParams: WindowManager.LayoutParams? = null
     private var resultCardBack: Pair<OnBackInvokedDispatcher, OnBackInvokedCallback>? = null
 
-    /** 窗口只投影当前手机控制者；各运行的状态保留在自己的记录中。 */
+    /** 窗口投影所选任务；各运行的流式状态保留在自己的记录中。 */
     private val state = mutableStateOf(AgentOverlayState.Initial)
+    private val taskItems = mutableStateOf(emptyList<io.github.mangi.eta.agent.overlay.OverlayTaskItem>())
+    private val ambientState = mutableStateOf(AgentOverlayState.Initial)
+    private val screenReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_SCREEN_OFF) removeAmbientWindows()
+            else publishExecutionState()
+        }
+    }
     private val capsuleExpanded = mutableStateOf(false)
     /** Agent 手势穿过胶囊时为 true：窗口不可触摸，胶囊淡出让路。 */
     private val capsuleYielded = mutableStateOf(false)
@@ -141,6 +149,9 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        registerReceiver(screenReceiver, android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON); addAction(Intent.ACTION_SCREEN_OFF)
+        }, Context.RECEIVER_NOT_EXPORTED)
         AgentOverlayClearance.attach(clearanceHost)
         serviceScope.launch { guiControl.state.collect(::applyGuiControlState) }
     }
@@ -168,6 +179,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
 
     override fun onDestroy() {
         destroyed = true
+        runCatching { unregisterReceiver(screenReceiver) }
         setKeepScreenOn(false)
         runs.all().forEach { run ->
             run.releaseIncoming()
@@ -424,6 +436,10 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                 "Agent runtime keep-alive start failed: type=${throwable.safeLogType()}"
             }
         }
+        // Persist the entry before preparation so a newly opened UI can discover it immediately.
+        if (request.handoff?.let(AssistantRunRecovery::payload) != null) {
+            AgentRunCheckpointStore.start(this, request)
+        }
         publishExecutionState()
         return run
     }
@@ -460,7 +476,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         // etax: 任务开始/结束的通知栏钩子。3.3.4 把执行重构到这里，ok/error 从 outcome.result 取；
         // try/finally 保证成功、出错、提前返回都发出收尾通知。
         val shadowChat = run.request.operation == AgentRuntimeWire.OP_CHAT
-        if (shadowChat) com.eta.shadow.ShadowNotice.onRunStarted()
+        if (shadowChat) run.notice.onRunStarted()
         var shadowResult: AgentRuntimeWire.RunResult? = null
         try {
             val outcome = AgentRuntimeRunExecutor(
@@ -490,7 +506,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         } finally {
             // etax: 成功 / 出错 / 停止都走这里，明确发出收尾通知
             if (shadowChat) {
-                com.eta.shadow.ShadowNotice.onRunFinished(
+                run.notice.onRunFinished(
                     this,
                     shadowResult?.ok == true,
                     shadowResult?.error ?: if (shadowResult == null) "运行异常中断" else null,
@@ -503,6 +519,9 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         run: RuntimeRunRegistry.Run,
         event: AgentEvent,
     ) {
+        if (event is AgentEvent.AssistantBlockDelta && event.kind == AgentEvent.AssistantBlockKind.TEXT) {
+            run.notice.append(event.delta)
+        }
         if (event is AgentEvent.GuiControlChanged) {
             run.guiStatus = event.status
             if (event.status == GuiControlStatus.Acquired) lastGuiOwnerRunId = run.runId
@@ -521,7 +540,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             }
             runCatching {
                 run.overlayState = run.overlayState.applyEvent(event)
-                if (displayedRun === run && ownsGui && !run.session.isTerminal) {
+                if (displayedRun === run && !run.session.isTerminal) {
                     state.value = run.overlayState
                     ensureOverlayVisible()
                 }
@@ -547,6 +566,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                     "Agent runtime archive persistence failed: type=${throwable.safeLogType()}"
                 )
             }
+        AssistantRunRecovery.changed()
     }
 
     private fun postTerminalOverlay(
@@ -557,6 +577,10 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         mainHandler.post {
             if (destroyed) return@post
             run.completedContext = completedContext
+            if (runs.all().any { !it.session.isTerminal }) {
+                publishExecutionState()
+                return@post
+            }
             val guiState = guiControl.state.value
             if (lastGuiOwnerRunId != run.runId || guiState.userPaused ||
                 (guiState.ownerRunId != null && guiState.ownerRunId != run.runId)) return@post
@@ -823,18 +847,25 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     }
 
     private fun requestPause(runId: String?) {
-        if (runId != null) guiControl.pauseForUser(runId)
+        val run = runId?.let(runs::get) ?: return
+        if (guiControl.state.value.ownerRunId == runId) guiControl.pauseForUser(runId)
+        else run.session.controller.pause()
+        run.overlayState = run.overlayState.copy(phase = AgentOverlayPhase.PAUSED, status = AgentOverlayStatus.Paused)
+        publishExecutionState()
     }
 
     private fun requestResume() {
-        guiControl.resumeForUser()
+        val run = displayedRun?.takeIf { runs.contains(it) }
+        if (run == null || run.session.controller.isCancelled || guiControl.state.value.ownerRunId == run.runId) guiControl.resumeForUser()
+        else run.session.controller.resume()
+        run?.let { it.overlayState = it.overlayState.copy(phase = AgentOverlayPhase.RUNNING, status = AgentOverlayStatus.Continuing) }
+        publishExecutionState()
     }
 
     private fun requestSupplement(runId: String?, text: String) {
         val supplementText = text.trim()
         if (supplementText.isBlank()) return
         val run = displayedRun?.takeIf { it.runId == runId } ?: return
-        if (guiControl.state.value.userPaused && guiControl.state.value.ownerRunId == null) return
         setCapsuleInputMode(focusable = false)
         runs.get(run.runId)?.let { active ->
             val event = active.supplement(supplementText)
@@ -885,7 +916,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     private fun applyGuiControlState(guiState: GuiControlCoordinator.State) {
         if (destroyed) return
         val owner = guiState.ownerRunId?.let(runs::get)
-        if (owner != null && displayedRun !== owner) {
+        if (owner != null && (displayedRun == null || displayedRun?.let(runs::contains) != true)) {
             bindDisplayedRun(owner)
             AgentHapticFeedback.perform(this, AgentHapticFeedback.Type.RUN_STARTED)
         }
@@ -910,7 +941,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                 state.value = owner.overlayState
                 ensureOverlayVisible()
             }
-            else -> removeAmbientWindows()
+            else -> if (runs.all().isEmpty()) removeAmbientWindows()
         }
         updateKeepScreenOn()
         publishExecutionState()
@@ -925,13 +956,38 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     }
 
     private fun publishExecutionState() {
-        val guiState = guiControl.state.value
-        val owner = guiState.ownerRunId?.let(runs::get)
+        if (destroyed) return
+        val active = runs.all().filterNot { it.session.isTerminal }
+        taskItems.value = active.map { run ->
+            io.github.mangi.eta.agent.overlay.OverlayTaskItem(run.runId, run.request.prompt.take(38))
+        }
+        val selected = displayedRun?.takeIf { it in active } ?: active.lastOrNull()
+        if (selected != null) {
+            if (displayedRun !== selected) bindDisplayedRun(selected)
+            state.value = selected.overlayState
+            ambientState.value = state.value.copy(phase = if (active.any { !it.session.controller.isPaused })
+                AgentOverlayPhase.RUNNING else AgentOverlayPhase.PAUSED)
+            if (getSystemService(android.os.PowerManager::class.java).isInteractive) ensureOverlayVisible()
+        } else if (displayedRun?.hasExecutedForegroundTool != true && !guiControl.state.value.userPaused) {
+            displayedRun = null
+            removeAmbientWindows()
+        }
         AgentExecutionService.updateRunStatus(
-            this,
-            if (guiState.userPaused) AgentOverlayStatus.Paused else owner?.overlayState?.status,
-            activeRunCount = runs.snapshots().size,
+            this, selected?.overlayState?.status,
+            activeRunCount = active.size,
+            preview = selected?.overlayState?.let { if (it.status == AgentOverlayStatus.GeneratingAnswer)
+                it.detailText.takeLast(80) else it.thought.takeLast(80) }.orEmpty(),
+            conversationId = selected?.conversationId,
         )
+    }
+
+    private fun selectOverlayTask(id: String) {
+        val run = runs.get(id) ?: return
+        val expanded = capsuleExpanded.value
+        bindDisplayedRun(run)
+        capsuleExpanded.value = expanded
+        publishExecutionState()
+        if (expanded) setCapsuleWindowHeight(CAPSULE_CONTROLS_HEIGHT_DP)
     }
 
     private fun setKeepScreenOn(enabled: Boolean) {
@@ -940,7 +996,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     }
 
     private fun showOverlay() {
-        if (capsuleView != null) return
+        if (capsuleView != null || !getSystemService(android.os.PowerManager::class.java).isInteractive) return
         // TYPE_ACCESSIBILITY_OVERLAY 免 SYSTEM_ALERT_WINDOW 权限；仅回退态（无障碍未启用）才需检查
         if (AgentAccessibilityService.current() == null && !Settings.canDrawOverlays(this)) return
         val wm = overlayContext().getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return
@@ -948,7 +1004,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
 
         // ── 氛围光窗口：全屏触摸穿透，彩虹光圈，截图时被 takeScreenshotOfWindow 过滤 ─
         val glow = createOverlayComposeView {
-            AgentOverlayGlow(state = state.value, corners = screenCornerRadii())
+            AgentOverlayGlow(state = ambientState.value, corners = screenCornerRadii())
         }
         val glowLp = glowLayoutParams()
         runCatching { wm.addView(glow, glowLp) }.onFailure { throwable ->
@@ -973,6 +1029,10 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                 onStop = { requestStop(controlRunId) },
                 onSupplementModeChange = ::setCapsuleInputMode,
                 onSupplement = { requestSupplement(controlRunId, it) },
+                tasks = taskItems.value,
+                selectedTaskId = controlRunId,
+                onSelectTask = ::selectOverlayTask,
+                onOpenConversation = { openEtaFromResult(displayedRun) },
             )
         }
         val capsuleLp = capsuleLayoutParams()
@@ -1378,7 +1438,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         private const val RESULT_OPEN_REQUEST_CODE = 1108
         private const val CAPSULE_WINDOW_WIDTH_DP = 272
         private const val CAPSULE_COLLAPSED_HEIGHT_DP = 68
-        private const val CAPSULE_CONTROLS_HEIGHT_DP = 124
+        private const val CAPSULE_CONTROLS_HEIGHT_DP = 280
         private const val CAPSULE_SUPPLEMENT_HEIGHT_DP = 260
         /** 注入点击只是一个点，目标控件常贴着胶囊边缘，判定范围向外多留一点。 */
         private const val CAPSULE_CLEARANCE_SLOP_DP = 8

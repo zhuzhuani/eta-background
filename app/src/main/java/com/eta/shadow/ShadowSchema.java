@@ -25,7 +25,7 @@ public final class ShadowSchema {
     public static void append(JSONArray tools) {
         android.content.Context ctx = ShadowSettings.app();
         boolean engine = ctx != null && ShadowSettings.engineReady(ctx);
-        android.util.Log.i("EtaShadow", "schema append engine=" + engine + " n=" + tools.length());
+        if (ctx != null) android.util.Log.i("EtaShadow", "schema append engine=" + engine + " n=" + tools.length());
         if (engine) {
             removeReplaced(tools);
         }
@@ -39,9 +39,8 @@ public final class ShadowSchema {
         } catch (Throwable ignored) { }
         try {
             tools.put(tool("screen_open",
-                    "打开应用并操作它。**它会自动判断该用哪条路径**："
-                    + "① 目标就是用户此刻正在看的应用 → 直接在用户屏幕上操作，不建虚拟屏；"
-                    + "② 否则 → 移到后台虚拟屏操作，完全不占用用户当前屏幕。"
+                    "在本任务独占的后台虚拟屏打开应用。同一应用被其他任务占用时等待释放。"
+                    + "不同应用可在最多三个虚拟屏上并行；需要第四个屏时停止最早的任务。"
                     + "所以凡是涉及界面的操作都走这个工具，不要用 terminal 执行 am/input/screencap。"
                     + "只传包名即可（如 com.tencent.mm）。操作结束后用 screen_finish 收尾。",
                     props3("component", "string", "包名或 package/activity，例如 com.tencent.mm",

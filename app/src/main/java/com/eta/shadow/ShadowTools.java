@@ -22,10 +22,14 @@ public final class ShadowTools {
     static final int ENGINE_PORT = 8733;
     static final int OBSERVER_PORT = 8738;
 
-    private static volatile String mode;
-    private static volatile int display = -1;
+    private volatile String mode;
+    private final String sessionId;
+    private volatile boolean closed;
+    private volatile boolean parked;
+    public ShadowTools(String sessionId) { this.sessionId = sessionId; }
+    private volatile int display = -1;
 
-    public static String sessionInfo() {
+    public String sessionInfo() {
         return "{\"mode\":" + (mode == null ? "null" : "\"" + mode + "\"")
                 + ",\"display\":" + display + "}";
     }
@@ -37,7 +41,7 @@ public final class ShadowTools {
      * Returns the tool result text when the call is ours, otherwise null
      * (the Kotlin side wraps it into ToolResult, no reflection needed).
      */
-    public static String intercept(String name, String argumentsJson) {
+    public String intercept(String name, String argumentsJson) {
         // S1: 影子入口全程异常隔离——这里出任何未捕获的异常都不许冒回上游宿主。
         try {
             return interceptInner(name, argumentsJson);
@@ -50,7 +54,7 @@ public final class ShadowTools {
         }
     }
 
-    private static String interceptInner(String name, String argumentsJson) {
+    private String interceptInner(String name, String argumentsJson) {
         if ("terminal".equals(name)) {
             return guardTerminal(argumentsJson);
         }
@@ -73,7 +77,7 @@ public final class ShadowTools {
             android.util.Log.w("EtaShadow", "observer down, refusing " + name);
             return ShadowSettings.observerFixHint();
         }
-        com.eta.shadow.ShadowNotice.setStep(label(name));
+        if (closed) return "{\"ok\":false,\"code\":\"SESSION_CLOSED\"}";
         String text;
         try {
             JSONObject args = argumentsOf(argumentsJson);
@@ -103,7 +107,7 @@ public final class ShadowTools {
      * handful of shell commands that manipulate the UI and point at screen_* instead;
      * everything else (files, logs, package info) still passes through.
      */
-    private static String guardTerminal(String argumentsJson) {
+    private String guardTerminal(String argumentsJson) {
         try {
             JSONObject args = argumentsOf(argumentsJson);
             for (java.util.Iterator<String> it = args.keys(); it.hasNext(); ) {
@@ -117,8 +121,7 @@ public final class ShadowTools {
                 if (hit != null) {
                     return "请改用 screen_* 工具做界面操作（检测到 shell 命令 `"
                             + hit.trim() + "`）。"
-                            + "screen_open 会自动判断：目标应用就是用户当前在看的，就在用户屏幕上操作；"
-                            + "否则移到后台虚拟屏操作，不打扰用户。";
+                            + "screen_open 会把目标应用绑定到本任务的后台虚拟屏，同一应用被占用时等待。";
                 }
             }
         } catch (Throwable ignored) {
@@ -143,20 +146,20 @@ public final class ShadowTools {
                     .put("package", pkg)          // which app this notification is about
                     .put("toDisplay", 0)
                     .put("keepFront", false);     // bring the app forward, not the launcher
-            String r = send(ENGINE_PORT, q.toString(), 8000);
+            String r = new ShadowTools("handover").send(ENGINE_PORT, q.toString(), 8000);
             android.util.Log.i("EtaShadow", "handover " + pkg + " -> " + r);
             // Only clear the bridge handle when the engine really moved something.
             JSONObject ro = new JSONObject(r);
             JSONObject h = ro.optJSONObject("handover");
             boolean moved = ro.optBoolean("ok", false) && h != null && h.optBoolean("moved", false);
-            if (moved && mode != null) { mode = null; display = -1; }
+
         } catch (Throwable t) {
             android.util.Log.w("EtaShadow", "handoverToMain failed: " + t);
         }
     }
 
     /** Tools that cannot work without the root engine. */
-    private static boolean needsEngine(String n) {
+    private boolean needsEngine(String n) {
         switch (n) {
             case "screen_open": case "screen_finish": case "screen_shot":
             case "screen_tap": case "screen_swipe": case "screen_press": case "screen_drag":
@@ -166,7 +169,7 @@ public final class ShadowTools {
     }
 
     /** Tools that only need the accessibility observer. */
-    private static boolean needsObserver(String n) {
+    private boolean needsObserver(String n) {
         switch (n) {
             case "screen_text": case "screen_click": case "screen_wait":
             case "screen_scroll": case "screen_list": case "screen_dump": case "screen_diag":
@@ -175,7 +178,7 @@ public final class ShadowTools {
         }
     }
 
-    private static String label(String name) {
+    private String label(String name) {
         switch (name) {
             case "screen_open": return "正在打开应用";
             case "screen_tap": return "正在点击";
@@ -196,7 +199,7 @@ public final class ShadowTools {
         }
     }
 
-    private static JSONObject argumentsOf(String json) {
+    private JSONObject argumentsOf(String json) {
         try {
             if (json != null && json.trim().startsWith("{")) return new JSONObject(json);
         } catch (Throwable ignored) { }
@@ -205,7 +208,7 @@ public final class ShadowTools {
 
     // ---------------------------------------------------------------- tools
 
-    private static String run(String name, JSONObject a) throws Exception {
+    private String run(String name, JSONObject a) throws Exception {
         switch (name) {
             case "screen_open": return open(a);
             case "screen_state": return state();
@@ -227,7 +230,7 @@ public final class ShadowTools {
     }
 
     /** ④: 用默认显示屏的真实 width/height/densityDpi 补全 launch 请求（显式指定的不覆盖）。 */
-    private static void fillDeviceMetrics(JSONObject req, JSONObject a) {
+    private void fillDeviceMetrics(JSONObject req, JSONObject a) {
         try {
             if (a.has("width") && a.has("height") && a.has("density")) return;
             android.content.Context ctx = ShadowSettings.app();
@@ -245,7 +248,7 @@ public final class ShadowTools {
         }
     }
 
-    private static String open(JSONObject a) throws Exception {
+    private String open(JSONObject a) throws Exception {
         String component = a.optString("component", "").trim();
         if (component.isEmpty()) component = a.optString("package", "").trim();
         if (component.isEmpty()) component = a.optString("app_name", "").trim();
@@ -271,6 +274,7 @@ public final class ShadowTools {
         if ("hidden".equals(launched.optString("mode")) && disp <= 0) {
             return launched.put("error", "engine reported hidden but no display id").toString();
         }
+        parked = false;
         mode = launched.optString("mode", "hidden");
         display = disp < 0 ? 0 : disp;
         if ("hidden".equals(mode)) {
@@ -289,7 +293,7 @@ public final class ShadowTools {
                         : "app is on the main screen").toString();
     }
 
-    private static String state() throws Exception {
+    private String state() throws Exception {
         JSONObject o = new JSONObject();
         o.put("session", new JSONObject()
                 .put("mode", mode == null ? JSONObject.NULL : mode).put("display", display));
@@ -309,12 +313,13 @@ public final class ShadowTools {
         return o.toString();
     }
 
-    private static String finish(JSONObject a) throws Exception {
+    private String finish(JSONObject a) throws Exception {
         String out = doFinish(a);
         try {
             // Only a close-out the engine accepted clears the handle: keeping it after a
             // failure is what lets the caller retry instead of losing the display.
             if (new JSONObject(out).optBoolean("ok", false)) {
+                parked = "notify".equals(a.optString("mode", "notify"));
                 mode = null;
                 display = -1;
             }
@@ -322,7 +327,7 @@ public final class ShadowTools {
         return out;
     }
 
-    private static String doFinish(JSONObject a) throws Exception {
+    private String doFinish(JSONObject a) throws Exception {
         JSONObject out = new JSONObject();
         boolean notified = false;
         String notifyError = null;
@@ -361,12 +366,12 @@ public final class ShadowTools {
         return out.toString();
     }
 
-    private static void requireSession() {
+    private void requireSession() {
         if (mode == null || display < 0) throw new IllegalStateException("NO_SESSION: call screen_open first");
     }
 
     /** #1：引擎掉线或收尾后清掉本地会话句柄（旧虚拟屏已随引擎消失）。 */
-    static void resetSession() {
+    void resetSession() {
         mode = null;
         display = -1;
     }
@@ -391,7 +396,7 @@ public final class ShadowTools {
             {"to_display", "toDisplay"}
     };
 
-    private static void normalizeArgs(JSONObject q) {
+    private void normalizeArgs(JSONObject q) {
         if (q == null) return;
         for (String[] p : ARG_ALIASES) {
             if (!q.has(p[0])) continue;
@@ -401,7 +406,7 @@ public final class ShadowTools {
         }
     }
 
-    private static String eng(String cmd, JSONObject a) throws Exception {
+    private String eng(String cmd, JSONObject a) throws Exception {
         requireSession();
         JSONObject q = new JSONObject(a.toString());
         q.put("cmd", cmd);
@@ -417,11 +422,11 @@ public final class ShadowTools {
         return engine(q.toString());
     }
 
-    private static String obs(String cmd, JSONObject a) throws Exception {
+    private String obs(String cmd, JSONObject a) throws Exception {
         // Read-only inspection works without an open session: display stays -1 and
         // the observer falls back to the main screen.
         boolean readOnly = "list".equals(cmd) || "dump".equals(cmd) || "diag".equals(cmd);
-        if (!readOnly) requireSession();
+        requireSession();
         int callTimeout = 25000;
         if ("wait".equals(cmd) || "idle".equals(cmd)) {
             long want = a.optLong("timeout_ms", 8000L);
@@ -434,28 +439,50 @@ public final class ShadowTools {
         return observer(q.toString(), callTimeout);
     }
 
-    // ---------------------------------------------------------------- transport
-
-    private static String engine(String json) throws Exception {
-        return send(ENGINE_PORT, json, 25000);
+    /** Called outside registry locks. The engine acknowledges cleanup before the lease is released. */
+    public boolean closeSession(boolean keepFinished) {
+        closed = true;
+        try {
+            send(ENGINE_PORT, new JSONObject().put("cmd", "cancel").put("sessionId", sessionId).toString(), 3000);
+            JSONObject reply = new JSONObject(send(ENGINE_PORT,
+                    new JSONObject().put("cmd", "release_session").put("sessionId", sessionId)
+                            .put("keep", keepFinished && parked).toString(), 35000));
+            return reply.optBoolean("ok", false);
+        } catch (Exception e) {
+            android.util.Log.w("EtaShadow", "screen cleanup not acknowledged: " + e.getClass().getSimpleName());
+            return false;
+        }
     }
 
-    private static String observer(String json) throws Exception {
+    public void keepAlive() {
+        if (closed) return;
+        try { send(ENGINE_PORT, new JSONObject().put("cmd", "keepalive").put("sessionId", sessionId).toString(), 2000); }
+        catch (Exception ignored) { }
+    }
+
+    // ---------------------------------------------------------------- transport
+
+    private String engine(String json) throws Exception {
+        JSONObject request = new JSONObject(json).put("sessionId", sessionId);
+        return send(ENGINE_PORT, request.toString(), 25000);
+    }
+
+    private String observer(String json) throws Exception {
         return observer(json, 25000);
     }
 
-    private static String observer(String json, int timeoutMs) throws Exception {
+    private String observer(String json, int timeoutMs) throws Exception {
         // Only a refused connection means "observer down". A read timeout means the
         // command may already have run, so it must not be retried anywhere else
         // (the old build re-sent it to a legacy port that nothing binds).
         try {
-            return send(OBSERVER_PORT, json, timeoutMs);
+            return send(OBSERVER_PORT, new JSONObject(json).put("sessionId", sessionId).toString(), timeoutMs);
         } catch (java.net.ConnectException e) {
             throw new IllegalStateException("OBSERVER_DOWN: accessibility observer not reachable");
         }
     }
 
-    private static String send(int port, String json, int timeoutMs) throws Exception {
+    private String send(int port, String json, int timeoutMs) throws Exception {
         try (Socket s = new Socket()) {
             s.connect(new InetSocketAddress("127.0.0.1", port), 2000);
             s.setSoTimeout(timeoutMs);

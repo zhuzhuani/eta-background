@@ -215,6 +215,18 @@ public final class Boot {
 
     private static JSONObject handle(JSONObject req) throws Exception {
         if (service == null) return new JSONObject().put("ok", false).put("code", "SERVICE_NOT_READY");
+        if (req.has("sessionId") && !"notify".equals(req.optString("cmd")) && !"ping".equals(req.optString("cmd"))) {
+            try (Socket engine = new Socket()) {
+                engine.connect(new java.net.InetSocketAddress("127.0.0.1", 8733), 1000);
+                engine.setSoTimeout(2000);
+                java.io.PrintStream out = new java.io.PrintStream(engine.getOutputStream(), true, "UTF-8");
+                out.println(new JSONObject().put("cmd", "validate").put("sessionId", req.optString("sessionId"))
+                        .put("displayId", req.optInt("displayId", -1)));
+                String response = new java.io.BufferedReader(new java.io.InputStreamReader(engine.getInputStream(), "UTF-8")).readLine();
+                if (response == null || !new JSONObject(response.replaceFirst("^RESULT:", "")).optBoolean("ok"))
+                    return new JSONObject().put("ok", false).put("code", "STALE_SCREEN");
+            } catch (Exception e) { return new JSONObject().put("ok", false).put("code", "SESSION_UNAVAILABLE"); }
+        }
         switch (req.optString("cmd")) {
             case "ping": return new JSONObject().put("ok", true).put("pong", true);
             case "dump": return dump(req);
@@ -726,14 +738,14 @@ public final class Boot {
                 ? component.substring(0, component.indexOf('/')) : component;
         if (!target.isEmpty()) open.putExtra("eta_shadow_handover", target);
         open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        android.app.PendingIntent pi = android.app.PendingIntent.getActivity(service, 2, open,
+        android.app.PendingIntent pi = android.app.PendingIntent.getActivity(service, req.optString("sessionId", target).hashCode(), open,
                 android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
         android.app.Notification n = new android.app.Notification.Builder(service, "eta-bg")
                 .setSmallIcon(android.R.drawable.stat_notify_more)
                 .setContentTitle(title).setContentText(text)
                 .setStyle(new android.app.Notification.BigTextStyle().bigText(text))
                 .setAutoCancel(true).setContentIntent(pi).build();
-        nm.notify("eta-bg", 2, n);
+        nm.notify("eta-bg:" + req.optString("sessionId", target), 2, n);
         return new JSONObject().put("ok", true);
     }
 }

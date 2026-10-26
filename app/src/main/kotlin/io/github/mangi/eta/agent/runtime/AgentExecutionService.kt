@@ -35,7 +35,9 @@ internal class AgentExecutionService : Service() {
         leases.attachOwner(owner)
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL, getString(R.string.execution_channel), NotificationManager.IMPORTANCE_LOW),
+            NotificationChannel(CHANNEL, getString(R.string.execution_channel), NotificationManager.IMPORTANCE_DEFAULT).apply {
+                setSound(null, null); enableVibration(false); setShowBadge(false)
+            },
         )
         ensureForeground()
     }
@@ -96,7 +98,12 @@ internal class AgentExecutionService : Service() {
     private fun notification(): Notification {
         val status = runStatus
         val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
+            this, 0, Intent(this, MainActivity::class.java).apply {
+                selectedConversationId?.let {
+                    action = MainActivity.ACTION_OPEN_CONVERSATION_ID
+                    putExtra(MainActivity.EXTRA_CONVERSATION_ID, it)
+                }
+            },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val stop = PendingIntent.getService(
@@ -108,12 +115,12 @@ internal class AgentExecutionService : Service() {
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.execution_title))
             // etax: 运行中显示最新一句流式输出（包住 3.3.4 新提的 executionText）
-            .setContentText(com.eta.shadow.ShadowNotice.decorate(executionText(this, status, taskCount)))
+            .setContentText(executionText(this, status, taskCount) + streamPreview.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty())
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .addAction(Notification.Action.Builder(null, getString(R.string.execution_stop), stop).build())
-        com.eta.shadow.ShadowNotice.applyStyle(builder) // etax: 多行展开；下方 Live Update 样式会覆盖它
+        builder.setVisibility(Notification.VISIBILITY_PRIVATE)
         // 只有 Agent run 在跑时才申请提升为 Live Update；终端会话、Linux 启动等长驻任务不属于"正在进行、需要持续关注"的活动。
         if (status != null && Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1) {
             builder
@@ -134,13 +141,16 @@ internal class AgentExecutionService : Service() {
     }
 
     companion object {
-        private const val CHANNEL = "eta_execution"
+        private const val CHANNEL = "eta_execution_tasks_v2"
         private const val NOTIFICATION_ID = 1107
         private const val ACTION_STOP = "io.github.mangi.eta.action.STOP_USER_EXECUTION"
         private val leases = ExecutionLeaseRegistry()
         private val ownerSequence = AtomicLong()
         private val mainHandler = Handler(Looper.getMainLooper())
         @Volatile private var instance: AgentExecutionService? = null
+        private var streamPreview = ""
+        private var selectedConversationId: String? = null
+        private var refreshPending = false
         private var runStatus: AgentOverlayStatus? = null
         private var activeRunCount = 0
         private var publishedStatusText: String? = null
@@ -149,15 +159,23 @@ internal class AgentExecutionService : Service() {
          * Agent run 的当前状态，供通知与状态栏胶囊展示；null 表示没有 Agent run 在跑。
          * 只在显示文字变化时刷新通知，避免流式事件把通知更新频率推到系统限流。
          */
-        fun updateRunStatus(context: Context, status: AgentOverlayStatus?, activeRunCount: Int) {
+        fun updateRunStatus(context: Context, status: AgentOverlayStatus?, activeRunCount: Int, preview: String = "", conversationId: String? = null) {
             mainHandler.post {
                 runStatus = status
+                streamPreview = preview
+                selectedConversationId = conversationId
                 this.activeRunCount = activeRunCount
                 val count = if (activeRunCount > 0) activeRunCount else leases.count()
-                val text = executionText(context, status, count)
+                val text = executionText(context, status, count) + preview + conversationId.orEmpty()
                 if (text == publishedStatusText) return@post
                 publishedStatusText = text
-                instance?.takeIf { it.foregroundActive }?.refreshNotification()
+                if (!refreshPending) {
+                    refreshPending = true
+                    mainHandler.postDelayed({
+                        refreshPending = false
+                        instance?.takeIf { it.foregroundActive }?.refreshNotification()
+                    }, 500)
+                }
             }
         }
 

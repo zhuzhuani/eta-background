@@ -244,7 +244,7 @@ final class McpEndpoint {
         }
     }
 
-    private static String handle(String body) {
+    private static synchronized String handle(String body) {
         JSONObject req;
         try {
             req = new JSONObject(body);

@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <resources>
+    <string name="overlay_task_count">%1$d tasks · %2$s</string>
+    <string name="overlay_open_conversation">Open conversation</string>
     <string name="conversation_stop_and_delete">Stop task and delete</string>
     <string name="conversation_stop_and_delete_message">The task in this conversation will stop first. The conversation will be deleted after its results are saved.</string>
     <string name="conversation_delete_save_failed">Could not save or confirm the task results. The conversation has not been deleted.</string>

@@ -120,7 +120,7 @@ internal class EtaAssistantOverlayService : Service(), LifecycleOwner, SavedStat
             },
         )
     }
-    private val conversationKey = "eta_assistant_${UUID.randomUUID()}"
+    private var conversationKey = "eta_assistant_${UUID.randomUUID()}"
     private var conversationHistory = emptyList<AgentModelClient.ConversationMessage>()
 
     private var windowManager: WindowManager? = null
@@ -222,7 +222,9 @@ internal class EtaAssistantOverlayService : Service(), LifecycleOwner, SavedStat
         }
         dismissalJob?.cancel()
         dismissalJob = null
-        detachCurrentRun()   // ⑤: 重新唤起助手时，旧任务脱钩继续后台跑，不取消
+        detachCurrentRun()   // 独立唤醒不替换仍在后台执行的会话
+        conversationKey = "eta_assistant_${UUID.randomUUID()}"
+        conversationHistory = emptyList()
         if (entryScreenContext?.id != screenContextId) {
             EtaAssistantScreenContexts.release(entryScreenContext?.id)
             entryScreenContext = EtaAssistantScreenContexts.find(screenContextId)
@@ -813,7 +815,7 @@ internal class EtaAssistantOverlayService : Service(), LifecycleOwner, SavedStat
     }
 
     private fun openConversation() {
-        if (handoffInProgress || activeRunId != null || uiState.messages.isEmpty()) return
+        if (handoffInProgress || uiState.messages.isEmpty()) return
         handoffInProgress = true
         AndroidAgentLogger.info("Eta assistant handoff requested")
         updateSoftInput(visible = false)

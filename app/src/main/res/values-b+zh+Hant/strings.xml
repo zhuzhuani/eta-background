@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <resources>
+    <string name="overlay_task_count">%1$d 個任務 · %2$s</string>
+    <string name="overlay_open_conversation">開啟聊天記錄</string>
   <string name="conversation_stop_and_delete">停止任務並刪除</string>
   <string name="conversation_stop_and_delete_message">此對話的任務將先停止，結果儲存後刪除對話。</string>
   <string name="conversation_delete_save_failed">無法儲存或確認任務結果，對話尚未刪除。</string>

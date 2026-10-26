@@ -21,6 +21,12 @@ class AgentExecutionServiceTest {
         try {
             val service = controller.get()
             assertNotNull(shadowOf(service).lastForegroundNotification)
+            val notification = shadowOf(service).lastForegroundNotification
+            assertNotNull(notification.smallIcon)
+            val channel = service.getSystemService(android.app.NotificationManager::class.java)
+                .getNotificationChannel(notification.channelId)
+            assertEquals(android.app.NotificationManager.IMPORTANCE_DEFAULT, channel.importance)
+            assertEquals(null, channel.sound)
             assertEquals(
                 if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
                 else ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE,
