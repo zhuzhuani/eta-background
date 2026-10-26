@@ -145,6 +145,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
 
     override fun onCreate() {
         super.onCreate()
+        notificationOwner = this
         savedStateRegistryController.performRestore(null)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
@@ -179,6 +180,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
 
     override fun onDestroy() {
         destroyed = true
+        if (notificationOwner === this) notificationOwner = null
         runCatching { unregisterReceiver(screenReceiver) }
         setKeepScreenOn(false)
         runs.all().forEach { run ->
@@ -862,6 +864,23 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         publishExecutionState()
     }
 
+    private fun handleNotificationAction(action: String, runId: String) {
+        val run = runs.get(runId)?.takeUnless { it.session.isTerminal } ?: return
+        when (action) {
+            AgentExecutionService.ACTION_NEXT_TASK -> {
+                val active = runs.all().filterNot { it.session.isTerminal }
+                val next = active.getOrNull((active.indexOf(run) + 1) % active.size) ?: return
+                selectOverlayTask(next.runId)
+            }
+            AgentExecutionService.ACTION_PAUSE_RUN -> requestPause(runId)
+            AgentExecutionService.ACTION_RESUME_RUN -> {
+                bindDisplayedRun(run)
+                requestResume()
+            }
+            AgentExecutionService.ACTION_STOP_RUN -> requestStop(runId)
+        }
+    }
+
     private fun requestSupplement(runId: String?, text: String) {
         val supplementText = text.trim()
         if (supplementText.isBlank()) return
@@ -978,6 +997,9 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             preview = selected?.overlayState?.let { if (it.status == AgentOverlayStatus.GeneratingAnswer)
                 it.detailText.takeLast(80) else it.thought.takeLast(80) }.orEmpty(),
             conversationId = selected?.conversationId,
+            runId = selected?.runId,
+            taskTitle = selected?.request?.prompt.orEmpty(),
+            paused = selected?.session?.controller?.isPaused == true,
         )
     }
 
@@ -993,27 +1015,41 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     private fun setKeepScreenOn(enabled: Boolean) {
         keepScreenOnState.value = enabled
         capsuleView?.keepScreenOn = enabled
+        glowView?.keepScreenOn = enabled
     }
 
     private fun showOverlay() {
-        if (capsuleView != null || !getSystemService(android.os.PowerManager::class.java).isInteractive) return
+        if (!getSystemService(android.os.PowerManager::class.java).isInteractive) return
         // TYPE_ACCESSIBILITY_OVERLAY 免 SYSTEM_ALERT_WINDOW 权限；仅回退态（无障碍未启用）才需检查
         if (AgentAccessibilityService.current() == null && !Settings.canDrawOverlays(this)) return
         val wm = overlayContext().getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return
         windowManager = wm
 
         // ── 氛围光窗口：全屏触摸穿透，彩虹光圈，截图时被 takeScreenshotOfWindow 过滤 ─
-        val glow = createOverlayComposeView {
-            AgentOverlayGlow(state = ambientState.value, corners = screenCornerRadii())
-        }
-        val glowLp = glowLayoutParams()
-        runCatching { wm.addView(glow, glowLp) }.onFailure { throwable ->
-            AndroidAgentLogger.warnThrottled("runtime_glow_add_view_failed") {
-                "Agent runtime glow addView failed: type=${throwable.safeLogType()}"
+        if (glowView == null) {
+            val glow = createOverlayComposeView {
+                AgentOverlayGlow(state = ambientState.value, corners = screenCornerRadii())
+            }
+            val glowLp = glowLayoutParams()
+            glow.keepScreenOn = keepScreenOn.value
+            runCatching { wm.addView(glow, glowLp) }.onFailure { throwable ->
+                AndroidAgentLogger.warnThrottled("runtime_glow_add_view_failed") {
+                    "Agent runtime glow addView failed: type=${throwable.safeLogType()}"
+                }
+            }.onSuccess {
+                glowView = glow
+                glowParams = glowLp
             }
         }
-        glowView = glow
-        glowParams = glowLp
+
+        // System Live Updates own the task surface. The edge glow remains an independent window.
+        if (AgentExecutionService.usesSystemTaskSurface()) {
+            capsuleView?.let { runCatching { wm.removeView(it) } }
+            capsuleView = null
+            capsuleParams = null
+            return
+        }
+        if (capsuleView != null) return
 
         // ── 状态胶囊窗口：状态栏下方居中，收起时一句状态，点击展开控制 ─────
         val capsule = createOverlayComposeView {
@@ -1355,6 +1391,11 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     private fun enterFinalState(finalState: AgentOverlayState) {
         state.value = finalState
 
+        if (AgentExecutionService.usesSystemTaskSurface()) {
+            dismissAndStop()
+            return
+        }
+
         if (displayedRun?.hasExecutedForegroundTool == true) {
             // 撤掉胶囊和边缘光，改显半屏结果卡片，不自动关闭，用户手动关闭
             capsuleExpanded.value = false
@@ -1427,6 +1468,15 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         )
 
     companion object {
+        @Volatile private var notificationOwner: AgentRuntimeService? = null
+
+        internal fun dispatchNotificationAction(action: String, runId: String) {
+            val owner = notificationOwner ?: return
+            owner.mainHandler.post {
+                if (!owner.destroyed) owner.handleNotificationAction(action, runId)
+            }
+        }
+
         // 只投影到 App 与 GUI 浮层的现有窗口，窗口不可见时由系统恢复息屏。
         private val keepScreenOnState = MutableStateFlow(false)
         val keepScreenOn = keepScreenOnState.asStateFlow()

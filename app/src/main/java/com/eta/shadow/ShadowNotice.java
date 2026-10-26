@@ -1,10 +1,6 @@
 package com.eta.shadow;
 
 import android.app.Notification;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-import android.app.PendingIntent;
-import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.os.SystemClock;
@@ -14,19 +10,12 @@ import java.util.LinkedList;
 import java.util.List;
 
 /**
- * 功能一：通知栏流式输出。
- *
- * 运行中把回答按句切成短行喂给 Eta 自己的前台通知；运行结束时由
- * AgentRuntimeService 显式调用 {@link #onRunFinished}，按成功 / 出错发一条收尾通知。
- *
- * 与旧版（逆向注入版）的区别：
- *  - 不再有常驻看门狗线程，也不再每 3 秒查询一次通知列表；收尾完全由显式钩子驱动，
- *    所以出错、终端会话仍在跑等情况下也能准确收尾。
- *  - 收尾通知设置了锁屏公开版本：锁屏选「隐藏敏感内容」时只显示「任务完成 / 任务出错」。
- *  - 用户主动停止的任务不再发收尾通知。
+ * Per-run streaming summary. Completion is handed to the shared execution notification,
+ * which replaces its ongoing card after all foreground leases have been released.
+ * Explicit user cancellation does not post a completion card.
  */
 public final class ShadowNotice {
-    private static final String TAG = "EtaShadow";
+    private static final String TAG = "ShadowNotice";
     private static final int MAX_LINE = 80;
     private static final int MAX_HISTORY = 6;
     private static final int FLUSH_MIN_GAP = 1200;
@@ -35,9 +24,6 @@ public final class ShadowNotice {
     private static final long STREAM_STALE_MS = 5000L;
     private static final String STOPPED = "已停止";
 
-    // 完成通知独立于运行通知；每条任务使用独立 tag 和会话跳转。
-    private static final String CHANNEL = "eta_shadow_done";
-    private static final int DONE_ID = 0x4D5A;
 
     private final StringBuilder PENDING = new StringBuilder();
     private final LinkedList<String> HISTORY = new LinkedList<>();
@@ -236,58 +222,8 @@ public final class ShadowNotice {
 
     private void post(Context ctx, String status, List<String> lines) {
         if (ctx == null || lines.isEmpty()) return;
-        try {
-            NotificationManager nm = ctx.getSystemService(NotificationManager.class);
-            if (nm == null) return;
-            if (!nm.areNotificationsEnabled()) {
-                android.util.Log.w(TAG, "notifications disabled, completion notice dropped");
-                return;
-            }
-            if (nm.getNotificationChannel(CHANNEL) == null) {
-                NotificationChannel ch = new NotificationChannel(
-                        CHANNEL, "任务完成", NotificationManager.IMPORTANCE_DEFAULT);
-                ch.setSound(null, null);
-                ch.enableVibration(false);
-                ch.setShowBadge(true);
-                nm.createNotificationChannel(ch);
-            }
-
-            String title = "Eta 助手 · " + status;
-            int icon = ctx.getApplicationInfo().icon;
-            if (icon == 0) icon = android.R.drawable.ic_dialog_info;
-
-            Notification.InboxStyle style = new Notification.InboxStyle();
-            for (String line : lines) style.addLine(line);
-
-            // 锁屏「隐藏敏感内容」时显示这个版本：只有状态，没有回答正文
-            Notification publicVersion = new Notification.Builder(ctx, CHANNEL)
-                    .setSmallIcon(icon)
-                    .setContentTitle(title)
-                    .setContentText("任务" + status)
-                    .build();
-
-            Notification.Builder b = new Notification.Builder(ctx, CHANNEL)
-                    .setSmallIcon(icon)
-                    .setContentTitle(title)
-                    .setContentText(lines.get(lines.size() - 1))
-                    .setStyle(style)
-                    .setVisibility(Notification.VISIBILITY_PRIVATE)
-                    .setPublicVersion(publicVersion)
-                    .setAutoCancel(false)   // 保留到用户手动划掉（与原版一致）
-                    .setOnlyAlertOnce(true);
-
-            Intent open = new Intent();
-            open.setComponent(new ComponentName(ctx.getPackageName(), "io.github.mangi.eta.ui.MainActivity"));
-            open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-            open.setAction(io.github.mangi.eta.ui.MainActivity.ACTION_OPEN_CONVERSATION_ID);
-            open.putExtra(io.github.mangi.eta.ui.MainActivity.EXTRA_CONVERSATION_ID, conversationId);
-            b.setContentIntent(PendingIntent.getActivity(ctx, runId.hashCode(), open,
-                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
-
-            nm.notify(runId, DONE_ID, b.build());
-        } catch (Throwable t) {
-            android.util.Log.w(TAG, "completion notice failed: " + t);
-        }
+        io.github.mangi.eta.agent.runtime.AgentExecutionService.publishRunCompletion(
+                ctx, runId, conversationId, status, android.text.TextUtils.join("\n", lines));
     }
 
     // ----------------------------------------------------------------- utils

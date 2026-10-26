@@ -62,9 +62,21 @@ git cherry-pick <本分支的两个 etax 提交>
 - `BackgroundScreenTools` 为每次运行绑定独立工具实例，`ScreenLeaseRegistry` 保留最多三个屏幕名额。同一应用等待当前所有者释放；不同应用并行。第四个不同应用需要屏时取消最早取得名额的任务，直到引擎确认旧屏清理后才分配新名额。
 - `VDrive` 负责本地传输及有限容量的会话表，`VDriveWorker` 保留原引擎的 Android 操作实现。每个 worker 有独立 Handler、显示对象、输入状态、截图目录和清理状态。请求携带不可复用的 `sessionId`，已释放会话拒绝迟到请求。
 - 活跃任务每 30 秒续期；App 进程消失后引擎回收过期会话。正常 `screen_finish(mode=notify)` 可继续停留最多五分钟，后续任务优先回收这些已完成的屏。
-- 主屏显示一个任务胶囊，展开选择任务、查看流式进度及打开聊天；暂停与停止作用于选中任务。通知按活动任务聚合，支持系统允许的 promoted ongoing 显示。新频道为静音 DEFAULT 频道；系统通知权限和 ColorOS 状态栏/流体云设置仍由系统管理。
+- 主屏通过系统实时通知（旧 Android 使用 App 胶囊）查看流式进度及打开聊天；暂停与停止作用于选中任务。通知按活动任务聚合，支持系统允许的 promoted ongoing 显示。新频道为静音 DEFAULT 频道；系统通知权限和 ColorOS 状态栏/流体云设置仍由系统管理。
 - 边缘流光复用官方组件，亮屏绘制、息屏移除窗口；后台展示不申请保持屏幕常亮。
 
 引擎协议增加 `sessionId`、`keepalive`、`validate`、`release_session`。无会话标识的 MCP 请求继续使用独立的兼容会话。`release_session` 的成功响应代表清理已确认，不能以网络超时推断已释放。设备动作可能已经发生，重连只恢复记录，不自动重放操作。
 
 相关回归测试：`ScreenLeaseRegistryTest`、`AssistantRunRecoveryTest`，以及 Runtime 会话、恢复、通知和浮层测试。虚拟屏输入焦点、后台运行及 ColorOS 流体云表现需要在真实 Root 设备验证。
+
+### 系统流体云与窗口恢复（2026102602）
+
+- Android 16 QPR1 及以上只使用系统实时通知呈现任务，不再叠加 App 自绘胶囊或完成浮窗；边缘流光独立保留。旧 Android 版本继续使用原胶囊。
+- 运行通知仍为同一个 ID `1107`。卡片内容跳转所选任务的聊天；多任务时提供切换、暂停/继续、停止当前任务。每个操作绑定不可复用的 run ID，迟到操作不影响后续任务。
+- 流式更新同时刷新前台服务持有的通知快照，避免该快照一直停留在启动时的通用文案。单元测试确认只有一个通知记录；ColorOS 是否额外呈现普通通知须由真机复测，不能仅凭截图断言已消除系统层重复。
+- `screen_finish` 只负责屏幕收尾，不再额外发布一条打开目标 App 的通知。最后完成的结果在前台服务释放后替换同 ID 的运行通知；已完成状态不继续申请系统实时活动。
+- 点击/长按系统胶囊如何展开由 ColorOS 决定；点击其卡片进入聊天。系统可将同一实时通知同时呈现在状态栏及下拉区域，不能通过删除通知来保留其流体云。
+- 应用显式移回主屏，或用户从桌面重新打开已停留在虚拟屏的应用时，清除该任务的窗口边界、应用边界、dp 尺寸和密度覆盖，恢复主屏全屏配置。使用 Root WindowContainerTransaction，不改手机全局分辨率、不强制停止第三方应用。ROM 不支持接口时记录失败并尝试清除像素边界；兼容缩放是否消失须由真机验证。
+- 新增 `AgentSystemNotificationTest`，覆盖单一通知、聊天跳转不串任务，以及完成通知与前台服务退出的先后顺序。
+
+系统接口参考：[Android Live Updates](https://developer.android.com/develop/ui/views/notifications/live-update)；[ColorOS 流体云操作](https://www.coloros.com/article/A00000075/)。

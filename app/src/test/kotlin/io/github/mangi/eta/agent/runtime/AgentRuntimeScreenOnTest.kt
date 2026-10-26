@@ -21,6 +21,44 @@ import org.robolectric.annotation.Config
 @Config(sdk = [36], application = Application::class)
 class AgentRuntimeScreenOnTest {
     @Test
+    @Config(sdk = [37])
+    fun systemTaskSurfaceKeepsOnlyTheGlowAndNotificationControlsTargetTheirOriginalRun() {
+        org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(false)
+        val serviceController = Robolectric.buildService(AgentRuntimeService::class.java).create()
+        try {
+            val service = serviceController.get()
+            val first = service.registerRun("native-one", ownsGui = false)
+            val second = service.registerRun("native-two", ownsGui = false)
+            service.invoke("publishExecutionState")
+            // Existing windows are represented without starting an infinite Compose animation
+            // on Robolectric's virtual frame clock. Verify the runtime removes only the capsule.
+            val glow = ComposeView(service)
+            service.setField("glowView", glow)
+            service.setField("capsuleView", ComposeView(service))
+            org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(true)
+            service.invoke("publishExecutionState")
+            org.junit.Assert.assertNull(service.field<ComposeView?>("capsuleView"))
+            service.invoke("publishExecutionState")
+            org.junit.Assert.assertSame(glow, service.field<ComposeView?>("glowView"))
+            org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(false)
+            AgentRuntimeService.dispatchNotificationAction(AgentExecutionService.ACTION_PAUSE_RUN, first.runId)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(first.session.controller.isPaused)
+            assertFalse(second.session.controller.isPaused)
+            AgentRuntimeService.dispatchNotificationAction(AgentExecutionService.ACTION_NEXT_TASK, first.runId)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(second.runId, service.field<RuntimeRunRegistry.Run>("displayedRun").runId)
+            first.session.complete(AgentRuntimeWire.RunResult(first.runId, true, "完成"))
+            AgentRuntimeService.dispatchNotificationAction(AgentExecutionService.ACTION_STOP_RUN, first.runId)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse(second.session.controller.isCancelled)
+        } finally {
+            serviceController.destroy()
+            org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(false)
+        }
+    }
+
+    @Test
     fun backgroundCapsuleSwitchesAndControlsOnlySelectedTaskWithoutKeepingScreenOn() {
         val serviceController = Robolectric.buildService(AgentRuntimeService::class.java).create()
         try {

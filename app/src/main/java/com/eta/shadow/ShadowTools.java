@@ -329,26 +329,9 @@ public final class ShadowTools {
 
     private String doFinish(JSONObject a) throws Exception {
         JSONObject out = new JSONObject();
-        boolean notified = false;
-        String notifyError = null;
-        for (int i = 0; i < 2 && !notified; i++) {
-            try {
-                if (i > 0) Thread.sleep(250);
-                JSONObject n = new JSONObject().put("cmd", "notify")
-                        .put("title", a.optString("title", "任务完成"))
-                        .put("text", a.optString("text", ""))
-                        .put("open", a.optString("open", ""));
-                notified = new JSONObject(observer(n.toString())).optBoolean("ok", false);
-                if (!notified) notifyError = "observer returned ok=false";
-            } catch (Throwable e) {
-                notifyError = String.valueOf(e);
-            }
-        }
-        out.put("notified", notified);
-        if (notifyError != null) out.put("notifyError", notifyError);
-        // D3: the close-out decision lives in the engine now (notify / handover /
-        // destroy), so the built-in bridge and the MCP endpoint cannot drift apart.
-        // A failed notification must never block the close-out.
+        // Runtime owns the one notification and its chat destination. Tool completion only
+        // parks/hands over the screen; it must not post a second app-launch notification.
+        out.put("notificationManagedByRuntime", true);
         String mode = a.optString("mode", "notify");
         boolean finOk = false;
         try {
@@ -361,7 +344,7 @@ public final class ShadowTools {
         } catch (Throwable e) {
             out.put("finishError", String.valueOf(e));
         }
-        // ok describes the close-out, notified describes the notification: keep them apart
+        // ok describes the screen close-out; the runtime publishes the final task result.
         out.put("ok", finOk);
         return out.toString();
     }

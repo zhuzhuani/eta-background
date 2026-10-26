@@ -85,12 +85,12 @@ public final class ShadowSchema {
             tools.put(tool("screen_shot", "把当前屏幕截图保存到文件。",
                     props3("path", "string", "保存路径", "scale", "number", "缩放比例"), ""));
             tools.put(tool("screen_diag", "当前屏幕的诊断快照（包名、节点数、最近文本）。", new JSONObject(), ""));
-            tools.put(tool("screen_finish", "结束后台操作并发通知。"
+            tools.put(tool("screen_finish", "结束后台操作，由统一运行通知展示完成结果。"
                     + "应用会留在后台虚拟屏里继续待命，用户的屏幕完全不动，"
-                    + "由用户点通知决定什么时候切过去。虚拟屏在闲置 5 分钟后自动回收。",
+                    + "用户点系统通知进入聊天记录；自行打开目标应用时恢复主屏窗口。虚拟屏在闲置 5 分钟后自动回收。",
                     props3("title", "string", "通知标题",
                             "text", "string", "通知内容（点通知打开目标应用）",
-                            "open", "string", "点通知要打开的应用包名（留空则打开助手）")
+                            "open", "string", "结果涉及的应用包名（兼容旧参数；通知统一打开聊天）")
                             .put("mode", props("mode", "string",
                                     "收尾方式：notify（默认，留在后台虚拟屏并发通知）、"
                                     + "handover（移回主屏并释放虚拟屏）、"

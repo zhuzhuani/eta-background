@@ -3,6 +3,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.Rect;
 import android.graphics.BitmapFactory;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
@@ -340,6 +341,16 @@ final class VDriveWorker implements VDrive.Worker {
         if (!x.protectedPkg.isEmpty()) protectApp(x.protectedPkg, true);
         boolean alive = taskOnDisplay(x.displayId);
 
+        if (!alive) {
+            Integer escapedTask = taskOfPackage(x.pkg);
+            if (escapedTask != null && displayOfTask(escapedTask) == Display.DEFAULT_DISPLAY) {
+                // The user can also open the parked app from the launcher, without our handover command.
+                restoreMainDisplayLayout(escapedTask);
+                releaseSessionFully(x, false);
+                return;
+            }
+        }
+
         if (x.orphanAt > 0) {
             long idle = now - x.orphanAt;
             if (!alive && idle > ORPHAN_EMPTY_MS) {
@@ -460,6 +471,7 @@ final class VDriveWorker implements VDrive.Worker {
                 Integer tid = x.taskId > 0 ? Integer.valueOf(x.taskId) : findRootTaskSafe(x.displayId);
                 if (tid != null && tid > 0) {
                     moveTask(tid, homeDisplay);
+                    if (homeDisplay == Display.DEFAULT_DISPLAY) restoreMainDisplayLayout(tid);
                     log("returned task " + tid + " to display " + homeDisplay);
                     Thread.sleep(120);
                 }
@@ -1918,6 +1930,7 @@ final class VDriveWorker implements VDrive.Worker {
             return fail("HANDOVER_FAILED", "task " + taskId + " stayed on display "
                     + displayOfTask(taskId) + " (wanted " + to + "); the hidden display was kept");
         }
+        boolean layoutRestored = to != Display.DEFAULT_DISPLAY || restoreMainDisplayLayout(taskId);
         if (sess != null) {
             sess.taskId = -1;
             sess.orphanAt = SystemClock.elapsedRealtime();
@@ -1939,6 +1952,7 @@ final class VDriveWorker implements VDrive.Worker {
         if (keepFront && !previousFront.isEmpty()) restoreHome(previousFront);
         return new JSONObject().put("ok", true).put("moved", true)
                 .put("taskId", taskId).put("toDisplay", to)
+                .put("layoutRestored", layoutRestored)
                 .put("moveMs", SystemClock.elapsedRealtime() - t);
     }
 
@@ -2026,6 +2040,27 @@ final class VDriveWorker implements VDrive.Worker {
             } catch (Throwable ignored) { }
         }
         exec("am display move-stack " + taskId + " " + display);
+    }
+
+    boolean restoreMainDisplayLayout(int taskId) {
+        try {
+            if (displayOfTask(taskId) != Display.DEFAULT_DISPLAY || atmGetService == null || atmAllRootTasks == null) return false;
+            Object atm = atmGetService.invoke(null);
+            List<?> tasks = (List<?>) atmAllRootTasks.invoke(atm);
+            if (tasks != null) for (Object task : tasks) {
+                if (readInt(task.getClass(), task, "taskId") != taskId) continue;
+                if (TaskLayoutRestorer.restore(readField(task, "token"))) {
+                    log("restored real-display fullscreen configuration for task " + taskId);
+                    return true;
+                }
+            }
+            // Older ROMs may lack WindowContainerTransaction; still remove stale pixel bounds.
+            Method resize = reflect(Class.forName("android.app.IActivityTaskManager"), "resizeTask", int.class, Rect.class, int.class);
+            if (resize != null) resize.invoke(atm, taskId, null, 0);
+        } catch (Throwable error) {
+            log("main display layout restore failed: " + error.getClass().getSimpleName());
+        }
+        return false;
     }
 
     /** taskId whose base activity belongs to pkg, or null. */

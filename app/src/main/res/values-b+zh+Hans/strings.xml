@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <resources>
+    <string name="execution_next_task">切换任务</string>
+    <string name="execution_chip_tasks">%1$d 个任务</string>
+    <string name="overlay_stop_task">停止当前任务</string>
     <string name="overlay_task_count">%1$d 个任务 · %2$s</string>
     <string name="overlay_open_conversation">打开聊天记录</string>
   <string name="conversation_stop_and_delete">停止任务并删除</string>
