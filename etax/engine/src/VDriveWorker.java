@@ -54,7 +54,7 @@ final class VDriveWorker implements VDrive.Worker {
     Handler work;
     DisplayManager dm;
     VirtualDisplay vd;
-    ImageReader reader;
+    volatile ImageReader reader;
     int W = 1440, H = 3168, DPI = 560;
     volatile int displayId = -1;
 
@@ -72,16 +72,10 @@ final class VDriveWorker implements VDrive.Worker {
      */
     final class Frame {
         Image image;         // newest native buffer; copy pixels only when a screenshot is requested
-        byte[] data;
-        int len;
-        int stridePx;
-        int w, h;
         Bitmap bmp;          // reused bitmap for this display only
         void close() {
             if (image != null) { image.close(); image = null; }
             if (bmp != null) { bmp.recycle(); bmp = null; }
-            data = null;
-            len = 0;
         }
     }
 
@@ -221,6 +215,18 @@ final class VDriveWorker implements VDrive.Worker {
 
     private HandlerThread workerThread;
     private volatile boolean retired;
+    private volatile Runnable releaseListener = () -> { };
+    private final java.util.concurrent.atomic.AtomicBoolean reconcilePending = new java.util.concurrent.atomic.AtomicBoolean();
+    private boolean hadDisplay;
+    private static final int ACTIVE = 0, PARKED = 1, CLAIMED = 2, RETIRED = 3;
+    private final java.util.concurrent.atomic.AtomicInteger disposition = new java.util.concurrent.atomic.AtomicInteger(ACTIVE);
+    private final Runnable patrol = new Runnable() {
+        public void run() {
+            if (retired) return;
+            watchdog();
+            if (!retired) work.postDelayed(this, orphanAt > 0 ? 2000 : 10000);
+        }
+    };
     private final java.util.concurrent.CountDownLatch released = new java.util.concurrent.CountDownLatch(1);
     private final java.util.concurrent.atomic.AtomicBoolean releaseRequested = new java.util.concurrent.atomic.AtomicBoolean();
 
@@ -255,14 +261,25 @@ final class VDriveWorker implements VDrive.Worker {
         workerThread = new HandlerThread("vdrive-work");
         workerThread.start();
         work = new Handler(workerThread.getLooper());
-        work.postDelayed(new Runnable() { public void run() {
-            watchdog();
-            work.postDelayed(this, orphanAt > 0 ? 2000 : 10000);
-        } }, 2000);
+        work.postDelayed(patrol, 2000);
 
     }
 
     public int displayId() { return displayId; }
+    public boolean isParked() { return disposition.get() == PARKED && !retired && orphanAt > 0 && displayId > 0; }
+    public boolean claimParked() { return disposition.compareAndSet(PARKED, CLAIMED); }
+    public boolean isCapturing() { return !retired && reader != null; }
+    public void setReleaseListener(Runnable listener) {
+        releaseListener = listener;
+        if (released.getCount() == 0) listener.run();
+    }
+    public void reconcileForeground() {
+        if (!isParked() || !reconcilePending.compareAndSet(false, true)) return;
+        if (!work.post(() -> {
+            try { if (isParked()) watchdog(); }
+            finally { reconcilePending.set(false); }
+        })) reconcilePending.set(false);
+    }
 
     public void keepAlive() {
         if (!retired) work.post(() -> {
@@ -273,6 +290,7 @@ final class VDriveWorker implements VDrive.Worker {
     }
 
     public boolean closeSession() {
+        disposition.set(RETIRED);
         retired = true;
         long command = runningCmd;
         if (command > 0) CANCELED.add(command);
@@ -280,8 +298,10 @@ final class VDriveWorker implements VDrive.Worker {
             work.post(() -> {
                 try {
                     shutdown();
+                    work.removeCallbacks(patrol);
                     workerThread.quitSafely();
                     released.countDown();
+                    try { releaseListener.run(); } catch (Throwable callbackError) { log("release callback: " + callbackError); }
                 } catch (Throwable error) {
                     log("cleanup incomplete: " + error);
                     releaseRequested.set(false);
@@ -325,6 +345,7 @@ final class VDriveWorker implements VDrive.Worker {
                 }
             }
             tickIdleDisplay(now);
+            if (hadDisplay && sessions.isEmpty() && vd == null) { closeSession(); return; }
             if (EXIT_MS > 0 && sessions.isEmpty() && now - lastCmdAt > EXIT_MS) {
                 log("idle " + EXIT_MS + "ms with no sessions, exiting");
                 shutdown();
@@ -340,78 +361,50 @@ final class VDriveWorker implements VDrive.Worker {
      * longer move the "attached session" pointer or reset another session's idle clock.
      */
     void tickSession(Session x, long now) {
-        if (x.vd == null) {
-            // half-dead record: release it through the one path that clears every field
-            log("dropping session without display: " + x.pkg);
-            releaseSessionFully(x, false);
+        if (disposition.get() == CLAIMED) return; // A new owner is about to resume this exact display.
+        if (x.vd == null) { retireFromPatrol(x); return; }
+        // One consistent ActivityTaskManager snapshot, instead of several queries and pidof forks per tick.
+        List<?> tasks;
+        try {
+            if (atmGetService == null || atmAllRootTasks == null) return;
+            tasks = (List<?>) atmAllRootTasks.invoke(atmGetService.invoke(null));
+            if (tasks == null) return; // Unknown placement must never be treated as an empty screen.
+        } catch (Throwable unavailable) { return; }
+        boolean occupied = false;
+        int movedTo = -1;
+        for (Object task : tasks) {
+            int at = readInt(task.getClass(), task, "displayId");
+            int id = readInt(task.getClass(), task, "taskId");
+            if (at == x.displayId && id > 0) occupied = true;
+            if (id == x.taskId) movedTo = at;
+        }
+        if (!occupied && movedTo >= 0 && movedTo != x.displayId) {
+            // The actual tracked task left; its old display can go without touching its new window.
+            retireFromPatrol(x);
             return;
         }
-        if (!x.protectedPkg.isEmpty()) protectApp(x.protectedPkg, true);
-        boolean alive = taskOnDisplay(x.displayId);
-
-        if (!alive) {
-            Integer escapedTask = taskOfPackage(x.pkg);
-            if (escapedTask != null && displayOfTask(escapedTask) == Display.DEFAULT_DISPLAY) {
-                // The user can also open the parked app from the launcher, without our handover command.
-                releaseSessionFully(x, false);
-                return;
-            }
-        }
-
         if (x.orphanAt > 0) {
-            long idle = now - x.orphanAt;
-            if (!alive && idle > ORPHAN_EMPTY_MS) {
-                // ColorOS sometimes yanks an am-started task back to display 0 a few
-                // seconds after parking. That is a drift, not a death: pull it home
-                // instead of destroying the user's parked app.
-                Integer tid = taskOfPackage(x.pkg);
-                if (tid != null && tid > 0 && x.displayId > 0) {
-                    int at = displayOfTask(tid);
-                    if (at == 0 || (homeDisplay > 0 && at == homeDisplay)) {
-                        // The user (or the completion notification) brought the app to the
-                        // real screen. That is a hand-over, not a drift: drop the hidden
-                        // display and never drag the task back — doing that yanks the user
-                        // out of the app a few seconds after they opened it.
-                        log("parked " + x.pkg + " is on the main screen; releasing display "
-                                + x.displayId);
-                        releaseSessionFully(x, false);
-                        return;
-                    }
-                    if (at >= 0 && at != x.displayId) {
-                        log("parked " + x.pkg + " drifted to display " + at + ", moving back");
-                        try {
-                            moveTask(tid, x.displayId);
-                            Thread.sleep(300);
-                            if (waitForTaskDisplay(tid, x.displayId, 30)) return;
-                        } catch (Throwable t) {
-                            log("pull back failed: " + t);
-                        }
-                    }
-                }
-                log("orphan display empty, releasing " + x.pkg);
-                releaseSessionFully(x, false);
-            } else if (alive && idle > ORPHAN_HOLD_MS) {
-                log("orphan hold expired, releasing " + x.pkg);
-                releaseSessionFully(x, false);
-            }
+            long age = now - x.orphanAt;
+            if ((!occupied && age > ORPHAN_EMPTY_MS) || age > ORPHAN_HOLD_MS) retireFromPatrol(x);
             return;
         }
-        if (!alive) {
+        if (!occupied) {
             if (x.emptySince == 0) {
                 x.emptySince = now;
-                if (x == current) emptySince = now;   // save() must not overwrite it later
-            } else if (now - x.emptySince >= EMPTY_MS) {
-                log("empty display " + x.displayId + " of " + x.pkg + " for " + EMPTY_MS + "ms, releasing");
-                releaseSessionFully(x, false);
-            }
+                if (x == current) emptySince = now;
+            } else if (now - x.emptySince >= EMPTY_MS) retireFromPatrol(x);
             return;
         }
         x.emptySince = 0;
         if (x == current) emptySince = 0;
-        if (now - x.lastCmdAt > IDLE_MS) {
-            log("idle session " + x.pkg + " on display " + x.displayId + ", releasing");
-            releaseSessionFully(x, false);
-        }
+        if (now - x.lastCmdAt > IDLE_MS) retireFromPatrol(x);
+    }
+
+    private void retireFromPatrol(Session session) {
+        int expected = disposition.get();
+        if (expected == CLAIMED || expected == RETIRED || !disposition.compareAndSet(expected, RETIRED)) return;
+        try { releaseSessionFully(session, false); }
+        finally { closeSession(); }
     }
 
     /** A display that was created but never got a session (create -> launch failed). */
@@ -437,7 +430,7 @@ final class VDriveWorker implements VDrive.Worker {
         if (displayId >= 0) {
             Frame fr = frames.remove(displayId);
             if (fr != null && fr.bmp != null) fr.bmp.recycle();
-            if (fr != null) { fr.bmp = null; fr.data = null; }
+            if (fr != null) fr.bmp = null;
         }
         resetGlobals();
     }
@@ -464,16 +457,9 @@ final class VDriveWorker implements VDrive.Worker {
                 log("return task failed: " + t);
             }
         }
-        Frame frame = frames.get(x.displayId);
-        if (frame != null) frame.close();
-        try { if (x.reader != null) x.reader.close(); } catch (Throwable ignored) { }
+        stopCapture(x);
         if (x.vd != null) x.vd.release();
         int gone = x.displayId;
-        if (gone >= 0) {
-            Frame fr = frames.remove(gone);
-            if (fr != null && fr.bmp != null) fr.bmp.recycle();
-            if (fr != null) { fr.bmp = null; fr.data = null; }
-        }
         x.reader = null;
         x.vd = null;
         x.displayId = -1;
@@ -619,6 +605,7 @@ final class VDriveWorker implements VDrive.Worker {
                 if (closed) res.put("closing", true);
             } catch (Throwable ignored) { }
             holder[0] = res;
+            if (res.optBoolean("released") && sessions.isEmpty() && vd == null) closeSession();
             latch.countDown();
         });
         boolean done = false;
@@ -1040,6 +1027,56 @@ final class VDriveWorker implements VDrive.Worker {
         return 560;
     }
 
+    private Frame createCapture() {
+        final Frame fr = new Frame();
+        final ImageReader capture = ImageReader.newInstance(W, H, PixelFormat.RGBA_8888, 3);
+        reader = capture;
+        capture.setOnImageAvailableListener(r -> {
+            if (reader != r || orphanAt > 0 || retired) return;
+            Image img = null;
+            try {
+                img = r.acquireLatestImage();
+                if (img == null) return;
+                if (fr.image != null) fr.image.close();
+                fr.image = img;
+                img = null;
+                frameOk++;
+            } catch (Throwable t) {
+                if (frameErr++ < 3) log("frame error: " + t);
+            } finally { if (img != null) img.close(); }
+        }, work);
+        return fr;
+    }
+
+    /** Keep only the task container during the short completed-task handoff window. */
+    private void stopCapture(Session session) {
+        Frame frame = frames.remove(session.displayId);
+        if (frame != null) frame.close();
+        ImageReader capture = session.reader;
+        if (capture == null) return;
+        try { capture.setOnImageAvailableListener(null, null); } catch (Throwable ignored) { }
+        try { if (session.vd != null) session.vd.setSurface(null); } catch (Throwable t) { log("detach capture surface: " + t); }
+        try { capture.close(); } catch (Throwable ignored) { }
+        session.reader = null;
+        if (session == current) reader = null;
+    }
+
+    private void resumeCapture(Session session) {
+        load(session);
+        if (session.reader != null) return;
+        Frame frame = createCapture();
+        try {
+            session.vd.setSurface(reader.getSurface());
+            session.reader = reader;
+            frames.put(session.displayId, frame);
+        } catch (Throwable error) {
+            frame.close();
+            reader.close();
+            reader = null;
+            throw error;
+        }
+    }
+
     JSONObject create(JSONObject req) throws Exception {
         // Multi-session: a live session on another display must not block creating a
         // new one. Park it (save state) and detach instead of refusing.
@@ -1084,26 +1121,7 @@ final class VDriveWorker implements VDrive.Worker {
         H = req.has("height") && req.optInt("height", 0) > 0 ? req.optInt("height") : main[1];
         DPI = req.has("density") && req.optInt("density", 0) > 0
                 ? req.optInt("density") : mainDensity();
-        final Frame fr = new Frame();
-        // One retained image plus two free slots lets acquireLatestImage discard stale buffers.
-        reader = ImageReader.newInstance(W, H, PixelFormat.RGBA_8888, 3);
-        reader.setOnImageAvailableListener(r -> {
-            Image img = null;
-            try {
-                img = r.acquireLatestImage();
-                if (img == null) return;
-                if (orphanAt > 0 || retired) return;
-                if (fr.image != null) fr.image.close();
-                fr.image = img;
-                img = null; // Owned by this frame until the next image or release.
-                frameOk++;
-            } catch (Throwable t) {
-                if (frameErr++ < 3) log("frame error: " + t);
-            } finally {
-                if (img != null) img.close();
-            }
-        }, work);
-        log("image listener registered " + W + "x" + H + " surface=" + (reader.getSurface() != null));
+        final Frame fr = createCapture();
         // Isolate focus from the user's display. Screen-off execution is disabled.
         int flags = flag("PRIVATE") | flag("OWN_CONTENT_ONLY") | flag("SUPPORTS_TOUCH")
                 | flag("TRUSTED") | flag("OWN_DISPLAY_GROUP") | flag("OWN_FOCUS")
@@ -1113,6 +1131,7 @@ final class VDriveWorker implements VDrive.Worker {
         vd = dm.createVirtualDisplay("eta-bg", W, H, DPI, reader.getSurface(), flags, null, work);
         log("virtual display flags = 0x" + Integer.toHexString(flags));
         displayId = vd.getDisplay().getDisplayId();
+        hadDisplay = true;
         frames.put(displayId, fr);   // keyed by the display id, which only exists now
         return new JSONObject().put("ok", true).put("displayId", displayId)
                 .put("createMs", SystemClock.elapsedRealtime() - t)
@@ -1131,6 +1150,7 @@ final class VDriveWorker implements VDrive.Worker {
      * caller's existing window, so they only happen when explicitly allowed.
      */
     JSONObject launch(JSONObject req) throws Exception {
+        disposition.set(ACTIVE);
         String comp = req.getString("component");
         boolean allowForceStop = req.optBoolean("allowForceStop", false);
         String pkg = comp.contains("/") ? comp.substring(0, comp.indexOf('/')) : comp;
@@ -1145,7 +1165,8 @@ final class VDriveWorker implements VDrive.Worker {
 
         Session existing = sessions.get(pkg);
         if (existing != null && existing.vd != null && existing.displayId >= 0) {
-            existing.orphanAt = 0;   // reopening a parked app puts it back in use
+            existing.orphanAt = 0;
+            resumeCapture(existing);
             return reuseSession(existing, comp);
         }
         if (existing != null) {
@@ -1186,6 +1207,7 @@ final class VDriveWorker implements VDrive.Worker {
         if (tid != null && displayOfTask(tid) == sess.displayId) {
             log("reusing session " + pkg + " on display " + sess.displayId);
             load(sess);
+            launchedTaskId = tid;
             sess.lastCmdAt = SystemClock.elapsedRealtime();
             save();
             protectApp(pkg, true);
@@ -1735,24 +1757,12 @@ final class VDriveWorker implements VDrive.Worker {
         float scale = clampScale((float) req.optDouble("scale", 0.5));
         int quality = req.optInt("quality", 80);
 
-        if (fr.image != null) {
-            Image.Plane plane = fr.image.getPlanes()[0];
-            ByteBuffer buffer = plane.getBuffer().duplicate();
-            int needed = buffer.remaining();
-            if (fr.data == null || fr.data.length < needed) fr.data = new byte[needed];
-            buffer.get(fr.data, 0, needed);
-            fr.len = needed;
-            fr.stridePx = plane.getRowStride() / plane.getPixelStride();
-            fr.w = fr.image.getWidth();
-            fr.h = fr.image.getHeight();
-        }
-        byte[] data = fr.data;
-        int len = fr.len;
-        int stridePx = fr.stridePx;
-        int fw = fr.w, fh = fr.h;
-        if (data == null || len == 0 || fw <= 0 || fh <= 0) {
-            return fail("NO_FRAME", "display " + sdid + " has not produced a frame yet; retry in ~100ms");
-        }
+        if (fr.image == null) return fail("NO_FRAME", "display has not produced a frame yet; retry in ~100ms");
+        Image.Plane plane = fr.image.getPlanes()[0];
+        int fw = fr.image.getWidth(), fh = fr.image.getHeight();
+        int stridePx = plane.getRowStride() / 4;
+        ByteBuffer pixels = CapturePixels.prepare(plane.getBuffer(), fw, fh,
+                plane.getRowStride(), plane.getPixelStride());
         long t = SystemClock.elapsedRealtime();
         Bitmap bmp = fr.bmp;
         if (bmp == null || bmp.getWidth() != stridePx || bmp.getHeight() != fh) {
@@ -1761,7 +1771,7 @@ final class VDriveWorker implements VDrive.Worker {
             fr.bmp = bmp;
             if (old != null) old.recycle();     // the cached frame is replaced, not leaked
         }
-        bmp.copyPixelsFromBuffer(ByteBuffer.wrap(data, 0, len));
+        bmp.copyPixelsFromBuffer(pixels);
         Bitmap work = bmp;
         if (stridePx != fw) work = Bitmap.createBitmap(bmp, 0, 0, fw, fh);
         int scaledW = Math.max(1, Math.round(fw * scale));
@@ -1868,8 +1878,10 @@ final class VDriveWorker implements VDrive.Worker {
             s.orphanAt = SystemClock.elapsedRealtime();
             if (s == current) orphanAt = s.orphanAt;
             save();
-            Frame frame = frames.get(did);
-            if (frame != null) frame.close();
+            stopCapture(s);
+            disposition.set(PARKED);
+            work.removeCallbacks(patrol);
+            work.postDelayed(patrol, 500);
             out.put("parked", true)
                     .put("hint", "任务已完成；可从桌面打开应用，后台屏幕最多保留 1 分钟");
         }
@@ -2241,6 +2253,14 @@ final class VDriveWorker implements VDrive.Worker {
             releaseSessionFully(x, false);
         }
         destroyIdleDisplay();
+        // Only this worker's private temporary directory; never follow symlinks or touch custom output paths.
+        java.nio.file.Path directory = java.nio.file.Paths.get(SHOT_DIR);
+        try (java.util.stream.Stream<java.nio.file.Path> paths = java.nio.file.Files.walk(directory)) {
+            paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> {
+                try { java.nio.file.Files.deleteIfExists(path); } catch (Exception ignored) { }
+            });
+        } catch (java.nio.file.NoSuchFileException ignored) {
+        } catch (Exception error) { log("temporary capture cleanup: " + error.getClass().getSimpleName()); }
     }
 
     /**

@@ -8,17 +8,23 @@ import java.util.*;
 
 /** Root transport. Mutable display/input/capture state lives in independent workers. */
 public final class VDrive {
-    static final String BUILD = "20261027-e30-stable";
+    static final String BUILD = "20261027-e31-lifecycle";
     interface Worker {
         JSONObject processLine(String request);
         boolean closeSession();
         void keepAlive();
         int displayId();
+        default boolean isParked() { return false; }
+        default boolean claimParked() { return isParked(); }
+        default boolean isCapturing() { return false; }
+        default void reconcileForeground() { }
+        default void setReleaseListener(Runnable listener) { }
     }
     interface WorkerFactory { Worker create(Context context) throws Exception; }
     static WorkerFactory factory = VDriveWorker::new;
     private static Context context;
-    private static long now() { return System.nanoTime() / 1000000L; }
+    static java.util.function.LongSupplier clock = () -> System.nanoTime() / 1000000L;
+    private static long now() { return clock.getAsLong(); }
     private static final Map<String, Slot> workers = new LinkedHashMap<>();
     private static final int LIMIT = 2;
     private static final Set<String> retired = new LinkedHashSet<>();
@@ -31,6 +37,7 @@ public final class VDrive {
         final Worker worker;
         final String pkg;
         boolean closing, parked;
+        int inFlight;
         volatile long touched = now();
         Slot(Worker worker, String pkg) { this.worker = worker; this.pkg = pkg; }
     }
@@ -60,15 +67,7 @@ public final class VDrive {
         Thread reaper = new Thread(() -> {
             while (true) {
                 try { Thread.sleep(10000); } catch (InterruptedException e) { return; }
-                List<String> expired = new ArrayList<>();
-                synchronized (workers) {
-                    long now = now();
-                    for (Map.Entry<String, Slot> entry : workers.entrySet()) {
-                        Slot slot = entry.getValue();
-                        if (slot.closing || now - slot.touched > (slot.parked ? 60000 : 300000)) expired.add(entry.getKey());
-                    }
-                }
-                for (String id : expired) release(id);
+                reapExpired();
             }
         }, "vdrive-expiry");
         reaper.setDaemon(true);
@@ -116,7 +115,8 @@ public final class VDrive {
                 synchronized (workers) {
                     for (Map.Entry<String, Slot> e : workers.entrySet()) {
                         sessions.put(new JSONObject().put("sessionId", e.getKey()).put("package", e.getValue().pkg)
-                                .put("closing", e.getValue().closing));
+                                .put("closing", e.getValue().closing).put("parked", e.getValue().parked)
+                                .put("capturing", e.getValue().worker.isCapturing()));
                     }
                 }
                 return new JSONObject().put("ok", true).put("pong", true).put("build", BUILD)
@@ -133,15 +133,28 @@ public final class VDrive {
                 if (req.optBoolean("keep", false)) {
                     synchronized (workers) {
                         Slot parked = workers.get(id);
+                        if (parked == null) { retire(id); return ok(); }
+                        if (parked.closing || parked.inFlight != 0) return error("CLEANUP_PENDING", "屏幕仍在收尾");
+                        if (!parked.worker.isParked()) return error("NOT_PARKED", "屏幕尚未完成收尾");
                         retire(id);
-                        if (parked != null) {
+                        if (!parked.parked) {
                             parked.parked = true;
-                            parked.touched = now();
+                            parked.touched = now(); // Idempotent retries must not extend retention.
                         }
                     }
                     return ok();
                 }
                 return release(id);
+            }
+            if (cmd.equals("foreground_hint")) {
+                Worker target = null;
+                synchronized (workers) {
+                    Slot candidate = workers.get(id);
+                    if (candidate != null && candidate.parked && !candidate.closing) target = candidate.worker;
+                }
+                // A hint is never proof: the worker checks actual task/display placement.
+                if (target != null) target.reconcileForeground();
+                return ok();
             }
             if (cmd.equals("launch")) {
                 String pkg = req.optString("component").split("/")[0];
@@ -150,8 +163,22 @@ public final class VDrive {
                     if (retired.contains(id)) return error("SESSION_CLOSED", "任务已结束");
                     Slot old = workers.get(id);
                     if (id.equals("legacy-mcp") && old != null && !old.pkg.equals(pkg)) reclaim = id;
-                    for (Map.Entry<String, Slot> entry : workers.entrySet()) {
-                        if (entry.getValue().parked && (entry.getValue().pkg.equals(pkg) || workers.size() >= LIMIT)) {
+                    String adopt = null;
+                    if (old == null) for (Map.Entry<String, Slot> entry : workers.entrySet()) {
+                        Slot candidate = entry.getValue();
+                        if (candidate.pkg.equals(pkg) && candidate.parked && !candidate.closing
+                                && candidate.inFlight == 0 && retired.contains(entry.getKey()) && candidate.worker.claimParked()) {
+                            adopt = entry.getKey(); break;
+                        }
+                    }
+                    if (adopt != null) {
+                        Slot candidate = workers.remove(adopt);
+                        candidate.parked = false;
+                        candidate.touched = now();
+                        workers.put(id, candidate);
+                    } else for (Map.Entry<String, Slot> entry : workers.entrySet()) {
+                        if (entry.getValue().parked && entry.getValue().inFlight == 0
+                                && (entry.getValue().pkg.equals(pkg) || workers.size() >= LIMIT)) {
                             reclaim = entry.getKey(); break;
                         }
                     }
@@ -171,9 +198,13 @@ public final class VDrive {
                     for (Slot existing : workers.values()) {
                         if (existing.pkg.equals(pkg)) return error("APP_BUSY", "应用正被另一任务使用");
                     }
-                    if (workers.size() >= LIMIT) return error("SESSION_LIMIT", "等待旧屏幕清理完成");
-                    slot = new Slot(factory.create(context), pkg);
-                    workers.put(id, slot);
+                    if (workers.size() >= LIMIT) return error(
+                            workers.values().stream().anyMatch(value -> value.closing) ? "CLEANUP_PENDING" : "SESSION_LIMIT",
+                            "等待旧屏幕清理完成");
+                    Slot created = new Slot(factory.create(context), pkg);
+                    slot = created;
+                    workers.put(id, created);
+                    created.worker.setReleaseListener(() -> workerReleased(created));
                 }
                 if (slot == null) return error("NO_SESSION", "请先打开本任务的屏幕");
                 slot.touched = now();
@@ -191,8 +222,35 @@ public final class VDrive {
                     req.put("mode", "notify");
                 }
             }
-            return slot.worker.processLine(req.toString());
+            synchronized (workers) {
+                if ((!id.equals("legacy-mcp") && (workers.get(id) != slot || retired.contains(id))) || slot.closing) return error("SESSION_CLOSED", "屏幕已释放");
+                slot.inFlight++;
+            }
+            try { return slot.worker.processLine(req.toString()); }
+            finally { synchronized (workers) { slot.inFlight--; } }
         } catch (Exception e) { return error("ENGINE_ERROR", e.getClass().getSimpleName() + ": " + e.getMessage()); }
+    }
+
+    static void reapExpired() {
+        List<String> expired = new ArrayList<>();
+        synchronized (workers) {
+            long time = now();
+            for (Map.Entry<String, Slot> entry : workers.entrySet()) {
+                Slot slot = entry.getValue();
+                if (slot.closing || time - slot.touched > (slot.parked ? 60000 : 300000)) expired.add(entry.getKey());
+            }
+        }
+        for (String id : expired) release(id);
+    }
+
+    private static void workerReleased(Slot released) {
+        synchronized (workers) {
+            Iterator<Map.Entry<String, Slot>> entries = workers.entrySet().iterator();
+            while (entries.hasNext()) {
+                Map.Entry<String, Slot> entry = entries.next();
+                if (entry.getValue() == released) { retire(entry.getKey()); entries.remove(); }
+            }
+        }
     }
 
     private static JSONObject release(String id) {

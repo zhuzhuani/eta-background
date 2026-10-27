@@ -26,6 +26,8 @@ public final class ShadowTools {
     private final String sessionId;
     private volatile boolean closed;
     private volatile boolean parked;
+    private String openedPackage;
+    private static final ParkedScreenHints parkedHints = new ParkedScreenHints();
     public ShadowTools(String sessionId) { this.sessionId = sessionId; }
     private volatile int display = -1;
 
@@ -275,6 +277,8 @@ public final class ShadowTools {
             return launched.put("error", "engine reported hidden but no display id").toString();
         }
         parked = false;
+        openedPackage = component.split("/")[0];
+        parkedHints.forget(openedPackage);
         mode = launched.optString("mode", "hidden");
         display = disp < 0 ? 0 : disp;
         if ("hidden".equals(mode)) {
@@ -321,6 +325,7 @@ public final class ShadowTools {
             if (new JSONObject(out).optBoolean("ok", false)) {
                 JSONObject finish = new JSONObject(out).optJSONObject("finish");
                 parked = finish != null && finish.optBoolean("parked", false);
+                if (parked) parkedHints.remember(openedPackage, sessionId);
                 mode = null;
                 display = -1;
             }
@@ -449,6 +454,16 @@ public final class ShadowTools {
         if (closed) return;
         try { send(ENGINE_PORT, new JSONObject().put("cmd", "keepalive").put("sessionId", sessionId).toString(), 2000); }
         catch (Exception ignored) { }
+    }
+
+    /** Accessibility callbacks only enqueue a bounded hint; never wait for Root on the UI thread. */
+    public static void onWindowChanged(int displayId, String pkg) {
+        parkedHints.onWindow(displayId, pkg, id -> {
+            try {
+                new ShadowTools("foreground-hint").send(ENGINE_PORT,
+                        new JSONObject().put("cmd", "foreground_hint").put("sessionId", id).toString(), 1000);
+            } catch (Exception ignored) { } // The engine's own patrol remains the fallback.
+        });
     }
 
     /** Read-only, allowlisted export; never expose raw session IDs, package names or tool payloads. */

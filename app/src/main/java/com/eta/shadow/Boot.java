@@ -119,6 +119,10 @@ public final class Boot {
             }
             int d = (Integer) m.invoke(event);
             synchronized (lastEventByDisplay) { lastEventByDisplay.put(d, now); }
+            if (event.getEventType() == android.view.accessibility.AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                CharSequence pkg = event.getPackageName();
+                ShadowTools.onWindowChanged(d, pkg == null ? null : pkg.toString());
+            }
         } catch (Throwable t) {
             if (!displayIdWarned) {
                 displayIdWarned = true;

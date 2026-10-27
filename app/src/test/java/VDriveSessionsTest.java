@@ -10,27 +10,47 @@ public class VDriveSessionsTest {
     private final Map<String, FakeWorker> made = new LinkedHashMap<>();
     private final List<String> ids = new ArrayList<>();
     private VDrive.WorkerFactory original;
+    private java.util.function.LongSupplier originalClock;
     private static class FakeWorker implements VDrive.Worker {
         JSONObject lastRequest;
         volatile boolean acknowledgeClose = true;
+        boolean parked, capturing, movedToMain;
+        int closeCalls, reconcileCalls;
+        Runnable releaseListener = () -> { };
         final CountDownLatch entered = new CountDownLatch(1), finish = new CountDownLatch(1);
         public JSONObject processLine(String request) {
             try {
             JSONObject json = new JSONObject(request);
             lastRequest = json;
+            if (json.optString("cmd").equals("launch")) { parked = false; capturing = true; }
+            if (json.optString("cmd").equals("finish")) { parked = true; capturing = false; }
             if (json.optString("cmd").equals("hold")) {
                 entered.countDown();
                 try { finish.await(3, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             }
-            return new JSONObject().put("ok", true).put("displayId", 12);
+            return new JSONObject().put("ok", true).put("displayId", 12).put("parked", parked);
             } catch (org.json.JSONException e) { throw new AssertionError(e); }
         }
-        public boolean closeSession() { finish.countDown(); return acknowledgeClose; }
+        public boolean closeSession() {
+            closeCalls++;
+            finish.countDown();
+            if (acknowledgeClose) { capturing = false; releaseListener.run(); }
+            return acknowledgeClose;
+        }
+        public boolean isParked() { return parked; }
+        public boolean isCapturing() { return capturing; }
+        public boolean claimParked() { if (!parked) return false; parked = false; return true; }
+        public void setReleaseListener(Runnable listener) { releaseListener = listener; }
+        public void reconcileForeground() {
+            reconcileCalls++;
+            if (movedToMain) { capturing = false; releaseListener.run(); }
+        }
         public void keepAlive() { }
         public int displayId() { return 12; }
     }
     @Before public void setUp() {
         original = VDrive.factory;
+        originalClock = VDrive.clock;
         VDrive.factory = context -> {
             FakeWorker worker = new FakeWorker();
             made.put(ids.get(ids.size() - 1), worker);
@@ -41,6 +61,7 @@ public class VDriveSessionsTest {
         for (FakeWorker worker : made.values()) worker.acknowledgeClose = true;
         for (String id : ids) send(id, "release_session");
         VDrive.factory = original;
+        VDrive.clock = originalClock;
     }
     private String open(String app) throws Exception {
         String id = UUID.randomUUID().toString(); ids.add(id);
@@ -51,6 +72,92 @@ public class VDriveSessionsTest {
     private JSONObject send(String id, String cmd) throws Exception {
         return VDrive.processLine(new JSONObject().put("cmd", cmd).put("sessionId", id).toString());
     }
+    private JSONObject keep(String id) throws Exception {
+        return VDrive.processLine(new JSONObject().put("cmd", "release_session").put("sessionId", id).put("keep", true).toString());
+    }
+    private void park(String id) throws Exception {
+        assertTrue(send(id, "finish").getBoolean("ok"));
+        assertTrue(keep(id).getBoolean("ok"));
+    }
+    private int count() throws Exception { return VDrive.processLine("{\"cmd\":\"status\"}").getInt("count"); }
+
+    @Test public void nextOwnerReusesParkedAppAndLateOldCleanupCannotCloseIt() throws Exception {
+        String old = open("app.same");
+        FakeWorker worker = made.get(old);
+        park(old);
+        assertFalse(worker.capturing);
+        String other = open("app.other");
+        String next = open("app.same");
+        assertEquals(2, made.size());
+        assertEquals(0, worker.closeCalls);
+        assertTrue(worker.capturing);
+        assertEquals(next, worker.lastRequest.getString("sessionId"));
+        assertTrue(send(old, "release_session").getBoolean("ok"));
+        assertTrue(keep(old).getBoolean("ok"));
+        assertEquals(0, worker.closeCalls);
+        assertEquals(2, count());
+        assertEquals("SESSION_CLOSED", send(old, "tap").getString("code"));
+        assertTrue(send(next, "tap").getBoolean("ok"));
+        assertTrue(send(other, "tap").getBoolean("ok"));
+        assertEquals(0, made.get(other).closeCalls);
+    }
+
+    @Test public void foregroundHintsOnlyReconcileCompletedSessionsAndCleanupReturnsCapacityImmediately() throws Exception {
+        String id = open("app.front");
+        FakeWorker worker = made.get(id);
+        send(id, "foreground_hint");
+        assertEquals(0, worker.reconcileCalls);
+        park(id);
+        send(id, "foreground_hint");
+        assertEquals(1, worker.reconcileCalls);
+        assertEquals(1, count()); // A hint alone is not evidence of a completed handoff.
+        worker.movedToMain = true;
+        send(id, "foreground_hint");
+        assertEquals(0, count()); // No 10-second reaper delay.
+        String next = open("app.front");
+        worker.releaseListener.run(); // Delayed callback from an old worker cannot remove its successor.
+        assertEquals(1, count());
+        assertTrue(send(next, "tap").getBoolean("ok"));
+    }
+
+    @Test public void repeatedParkingDoesNotExtendRetentionAndCannotUndoClosing() throws Exception {
+        java.util.concurrent.atomic.AtomicLong time = new java.util.concurrent.atomic.AtomicLong(1000000);
+        VDrive.clock = time::get;
+        String id = open("app.expiry");
+        park(id);
+        time.addAndGet(59000);
+        assertTrue(keep(id).getBoolean("ok"));
+        time.addAndGet(2000);
+        VDrive.reapExpired();
+        assertEquals(0, count());
+        String closing = open("app.closing");
+        FakeWorker worker = made.get(closing);
+        worker.acknowledgeClose = false;
+        assertEquals("CLEANUP_PENDING", send(closing, "release_session").getString("code"));
+        assertEquals("CLEANUP_PENDING", keep(closing).getString("code"));
+        assertEquals(1, count());
+    }
+
+    @Test public void unfinishedWorkCannotBeParkedOrReassigned() throws Exception {
+        String id = open("app.active");
+        assertEquals("NOT_PARKED", keep(id).getString("code"));
+        assertTrue(send(id, "tap").getBoolean("ok"));
+    }
+
+    @Test public void inFlightRequestMustFinishBeforeOwnershipCanBeReturned() throws Exception {
+        String id = open("app.busy");
+        assertTrue(send(id, "finish").getBoolean("ok"));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<JSONObject> held = executor.submit(() -> send(id, "hold"));
+            assertTrue(made.get(id).entered.await(1, TimeUnit.SECONDS));
+            assertEquals("CLEANUP_PENDING", keep(id).getString("code"));
+            made.get(id).finish.countDown();
+            assertTrue(held.get(1, TimeUnit.SECONDS).getBoolean("ok"));
+            assertTrue(keep(id).getBoolean("ok"));
+        } finally { executor.shutdownNow(); }
+    }
+
     @Test public void lateLaunchCannotResurrectReleasedSession() throws Exception {
         String id = UUID.randomUUID().toString(); ids.add(id);
         assertTrue(send(id, "release_session").getBoolean("ok"));
@@ -65,7 +172,7 @@ public class VDriveSessionsTest {
         assertEquals("SESSION_CLOSED", send(first, "tap").getString("code"));
         String fourth = UUID.randomUUID().toString(); ids.add(fourth);
         JSONObject request = new JSONObject().put("cmd", "launch").put("sessionId", fourth).put("component", "app.four");
-        assertEquals("SESSION_LIMIT", VDrive.processLine(request.toString()).getString("code"));
+        assertEquals("CLEANUP_PENDING", VDrive.processLine(request.toString()).getString("code"));
         made.get(first).acknowledgeClose = true;
         assertTrue(send(first, "release_session").getBoolean("ok"));
         assertTrue(VDrive.processLine(request.toString()).getBoolean("ok"));
