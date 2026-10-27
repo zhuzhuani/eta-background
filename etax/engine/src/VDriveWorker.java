@@ -38,7 +38,7 @@ import java.util.List;
  *  - frame buffer + bitmap reused instead of reallocated per capture
  *  - virtual display auto-released when orphaned (after handover) or idle
  */
-final class VDriveWorker implements VDrive.Worker {
+class VDriveWorker implements VDrive.Worker {
     final long T0 = SystemClock.elapsedRealtime();
     /** Build stamp: lets status() prove which dex is actually running. */
     final String BUILD = VDrive.BUILD;
@@ -72,6 +72,8 @@ final class VDriveWorker implements VDrive.Worker {
     final class Frame {
         Image image;         // newest native buffer; copy pixels only when a screenshot is requested
         Bitmap bmp;          // reused bitmap for this display only
+        DisplayGeometry geometry;
+        long receivedAt;
         void close() {
             if (image != null) { image.close(); image = null; }
             if (bmp != null) { bmp.recycle(); bmp = null; }
@@ -79,6 +81,25 @@ final class VDriveWorker implements VDrive.Worker {
     }
 
     final java.util.HashMap<Integer, Frame> frames = new java.util.HashMap<>();
+    JSONObject lastScreenshot;
+    DisplayGeometry lastDisplayGeometry;
+    final DisplayManager.DisplayListener geometryListener = new DisplayManager.DisplayListener() {
+        public void onDisplayAdded(int did) { }
+        public void onDisplayRemoved(int did) { if (did == displayId) lastScreenshot = null; }
+        public void onDisplayChanged(int did) {
+            if (did != displayId || reader == null || orphanAt > 0) return;
+            try {
+                DisplayGeometry next = geometry(did);
+                if (lastDisplayGeometry != null && next.matches(lastDisplayGeometry.json())) return;
+                lastDisplayGeometry = next;
+                lastScreenshot = null;
+                Frame frame = frames.get(did);
+                if (frame != null) frame.close();
+                Image pending = reader.acquireLatestImage();
+                if (pending != null) pending.close();
+            } catch (Throwable unavailable) { log("geometry update: " + unavailable.getClass().getSimpleName()); }
+        }
+    };
 
     Object inputManager;
     Method inject;
@@ -136,6 +157,7 @@ final class VDriveWorker implements VDrive.Worker {
         int taskId = -1;
         long orphanAt = 0;
         long emptySince = 0;
+        long handoffAt = 0;
         long createdAt = SystemClock.elapsedRealtime();
         long lastCmdAt = SystemClock.elapsedRealtime();
         String protectedPkg = "";
@@ -260,6 +282,7 @@ final class VDriveWorker implements VDrive.Worker {
         workerThread = new HandlerThread("vdrive-work");
         workerThread.start();
         work = new Handler(workerThread.getLooper());
+        dm.registerDisplayListener(geometryListener, work);
         work.postDelayed(patrol, 2000);
 
     }
@@ -378,6 +401,9 @@ final class VDriveWorker implements VDrive.Worker {
             if (id == x.taskId) movedTo = at;
         }
         if (!occupied && movedTo >= 0 && movedTo != x.displayId) {
+            // ATM placement can precede WindowManager's new input window. Keep the empty
+            // old display through that transition, without resizing or restarting the App.
+            if (x.handoffAt > 0 && now - x.handoffAt < 5_000 && !foregroundWindowReady(x.pkg, movedTo)) return;
             // The actual tracked task left; its old display can go without touching its new window.
             retireFromPatrol(x);
             return;
@@ -767,6 +793,12 @@ final class VDriveWorker implements VDrive.Worker {
             detach();
         }
         try {
+            if (isPointerCommand(cmd0)) {
+                JSONObject invalid = preparePointerCoordinates(req);
+                if (invalid != null) return invalid;
+                // Once an action starts it may take effect even if its response fails.
+                lastScreenshot = null;
+            }
             JSONObject out = dispatch(cmd0, req);
             save();
             return out;
@@ -882,9 +914,13 @@ final class VDriveWorker implements VDrive.Worker {
 
     /** Send one JSON command to the accessibility observer. */
     JSONObject proxyA11y(JSONObject req) {
+        return proxyA11y(req, 20_000);
+    }
+
+    JSONObject proxyA11y(JSONObject req, int timeoutMs) {
         try (java.net.Socket sock = new java.net.Socket()) {
-            sock.connect(new java.net.InetSocketAddress("127.0.0.1", obsPort()), 2000);
-            sock.setSoTimeout(20000);
+            sock.connect(new java.net.InetSocketAddress("127.0.0.1", obsPort()), Math.min(2000, timeoutMs));
+            sock.setSoTimeout(timeoutMs);
             java.io.PrintStream w = new java.io.PrintStream(sock.getOutputStream(), true, "UTF-8");
             w.println(req.toString());
             java.io.BufferedReader r = new java.io.BufferedReader(
@@ -1039,6 +1075,8 @@ final class VDriveWorker implements VDrive.Worker {
                 if (img == null) return;
                 if (fr.image != null) fr.image.close();
                 fr.image = img;
+                fr.geometry = geometry(displayId);
+                fr.receivedAt = SystemClock.elapsedRealtime();
                 img = null;
                 frameOk++;
             } catch (Throwable t) {
@@ -1119,6 +1157,10 @@ final class VDriveWorker implements VDrive.Worker {
         int[] main = mainSize();
         W = req.has("width") && req.optInt("width", 0) > 0 ? req.optInt("width") : main[0];
         H = req.has("height") && req.optInt("height", 0) > 0 ? req.optInt("height") : main[1];
+        int[] oriented = DisplayGeometry.orient(W, H, req.optString("orientation", "auto"),
+                requestedOrientation(req.optString("component")));
+        W = oriented[0]; H = oriented[1];
+        lastScreenshot = null;
         DPI = req.has("density") && req.optInt("density", 0) > 0
                 ? req.optInt("density") : mainDensity();
         final Frame fr = createCapture();
@@ -1131,6 +1173,15 @@ final class VDriveWorker implements VDrive.Worker {
         vd = dm.createVirtualDisplay("eta-bg", W, H, DPI, reader.getSurface(), flags, null, work);
         log("virtual display flags = 0x" + Integer.toHexString(flags));
         displayId = vd.getDisplay().getDisplayId();
+        lastDisplayGeometry = geometry(displayId);
+        // Some ROMs inherit an orientation-ignore policy on secondary displays.
+        try {
+            Class<?> global = Class.forName("android.view.WindowManagerGlobal");
+            Object wm = global.getMethod("getWindowManagerService").invoke(null);
+            Method allow = wm.getClass().getMethod("setIgnoreOrientationRequest", int.class, boolean.class);
+            allow.setAccessible(true);
+            allow.invoke(wm, displayId, false);
+        } catch (Throwable ignored) { } // Framework orientation remains the fallback.
         hadDisplay = true;
         frames.put(displayId, fr);   // keyed by the display id, which only exists now
         return new JSONObject().put("ok", true).put("displayId", displayId)
@@ -1284,7 +1335,8 @@ final class VDriveWorker implements VDrive.Worker {
         if (vd == null) {
             JSONObject created = create(new JSONObject()
                     .put("width", req.optInt("width", 0)).put("height", req.optInt("height", 0))
-                    .put("density", req.optInt("density", 0)));
+                    .put("density", req.optInt("density", 0)).put("component", comp)
+                    .put("orientation", req.optString("orientation", "auto")));
             if (!created.optBoolean("ok")) return created;
         }
         if (homeFront.isEmpty()) {
@@ -1366,6 +1418,7 @@ final class VDriveWorker implements VDrive.Worker {
 
         JSONObject o = new JSONObject().put("ok", true).put("mode", "hidden")
                 .put("via", via).put("taskId", tid).put("displayId", did)
+                .put("geometry", geometry(did).json())
                 .put("ms", SystemClock.elapsedRealtime() - t);
         if (adopted) o.put("adopted", true);
         if (beforeDisplay >= 0) {
@@ -1441,13 +1494,16 @@ final class VDriveWorker implements VDrive.Worker {
         // target there and the user's keyboard disappears mid-typing.
         JSONObject a = proxyA11y(new JSONObject().put("cmd", "tapnode")
                 .put("displayId", did).put("x", (int) x).put("y", (int) y)
-                .put("holdMs", hold));
+                .put("expectedGeometry", req.optJSONObject("expectedGeometry"))
+                .put("holdMs", 0)); // A short injected hold is still a tap, not ACTION_LONG_CLICK.
         if (a != null && a.optBoolean("ok")) {
             return new JSONObject().put("ok", true).put("via", "a11y")
                     .put("changed", a.optBoolean("changed", false))
                     .put("target", a.optString("target", ""))
                     .put("viewId", a.optString("viewId", ""));
         }
+        JSONObject stale = stalePointerFallback(req, a, did);
+        if (stale != null) return stale;
         injectTouch(did, x, y, x, y, hold, 0);
         return new JSONObject().put("ok", true).put("via", "inject");
     }
@@ -1462,12 +1518,15 @@ final class VDriveWorker implements VDrive.Worker {
         if (bad != null) return bad;
         JSONObject a = proxyA11y(new JSONObject().put("cmd", "tapnode")
                 .put("displayId", did).put("x", (int) x).put("y", (int) y)
+                .put("expectedGeometry", req.optJSONObject("expectedGeometry"))
                 .put("holdMs", hold));
         if (a != null && a.optBoolean("ok")) {
             return new JSONObject().put("ok", true).put("via", "a11y").put("holdMs", hold)
                     .put("changed", a.optBoolean("changed", false))
                     .put("target", a.optString("target", ""));
         }
+        JSONObject stale = stalePointerFallback(req, a, did);
+        if (stale != null) return stale;
         injectTouch(did, x, y, x, y, hold, 0);
         return new JSONObject().put("ok", true).put("via", "inject").put("holdMs", hold);
     }
@@ -1706,9 +1765,14 @@ final class VDriveWorker implements VDrive.Worker {
 
         String tmp = SHOT_DIR + "/.cap_main.png";
         long t = SystemClock.elapsedRealtime();
+        DisplayGeometry geometry = geometry(0);
         exec("screencap -p " + tmp);
         Bitmap b = BitmapFactory.decodeFile(tmp);
         if (b == null) return fail("CAPTURE_FAILED", "screencap produced no image");
+        if (!geometry.matches(geometry(0).json()) || b.getWidth() != geometry.width || b.getHeight() != geometry.height) {
+            b.recycle(); lastScreenshot = null;
+            return fail("FRAME_GEOMETRY_CHANGED", "display changed during capture; take a fresh screenshot");
+        }
         Bitmap out = b;
         if (scale < 0.99f) {
             out = Bitmap.createScaledBitmap(b, Math.max(1, Math.round(b.getWidth() * scale)),
@@ -1723,9 +1787,13 @@ final class VDriveWorker implements VDrive.Worker {
             b.recycle();
         }
         publishShot(new java.io.File(path));
+        lastScreenshot = new JSONObject().put("frameId", "0:" + SystemClock.elapsedRealtimeNanos()).put("displayId", 0)
+                .put("width", outW).put("height", outH).put("geometry", geometry.json());
         return new JSONObject().put("ok", true).put("path", path).put("display", "main")
                 .put("format", jpeg ? "jpeg" : "png")
                 .put("dims", outW + "x" + outH)
+                .put("geometry", geometry.json()).put("frameId", lastScreenshot.getString("frameId"))
+                .put("scaleToDisplayX", (double) geometry.width / outW).put("scaleToDisplayY", (double) geometry.height / outH)
                 .put("convertMs", SystemClock.elapsedRealtime() - t)
                 .put("read_with", readHint(path));
     }
@@ -1758,6 +1826,11 @@ final class VDriveWorker implements VDrive.Worker {
         int quality = req.optInt("quality", 80);
 
         if (fr.image == null) return fail("NO_FRAME", "display has not produced a frame yet; retry in ~100ms");
+        DisplayGeometry geometry = geometry(sdid);
+        if (fr.geometry == null || !geometry.matches(fr.geometry.json())) {
+            fr.close(); lastScreenshot = null;
+            return fail("FRAME_GEOMETRY_CHANGED", "display rotated; wait for a new frame and observe again");
+        }
         Image.Plane plane = fr.image.getPlanes()[0];
         int fw = fr.image.getWidth(), fh = fr.image.getHeight();
         int stridePx = plane.getRowStride() / 4;
@@ -1774,8 +1847,16 @@ final class VDriveWorker implements VDrive.Worker {
         bmp.copyPixelsFromBuffer(pixels);
         Bitmap work = bmp;
         if (stridePx != fw) work = Bitmap.createBitmap(bmp, 0, 0, fw, fh);
-        int scaledW = Math.max(1, Math.round(fw * scale));
-        int scaledH = Math.max(1, Math.round(fh * scale));
+        Bitmap logical;
+        try { logical = geometry.logicalBitmap(work); }
+        catch (IllegalStateException mismatch) {
+            if (work != bmp) work.recycle();
+            return fail("CAPTURE_GEOMETRY_MISMATCH", "capture projection does not match the logical display; do not tap using this frame");
+        }
+        if (logical != work && work != bmp) work.recycle();
+        work = logical;
+        int scaledW = Math.max(1, Math.round(geometry.width * scale));
+        int scaledH = Math.max(1, Math.round(geometry.height * scale));
         Bitmap out = work;
         if (scale < 0.99f) out = Bitmap.createScaledBitmap(work, scaledW, scaledH, true);
         try (FileOutputStream fo = new FileOutputStream(path)) {
@@ -1786,11 +1867,19 @@ final class VDriveWorker implements VDrive.Worker {
             if (work != bmp) work.recycle();    // stride crop
         }
         publishShot(new java.io.File(path));
+        lastScreenshot = new JSONObject().put("frameId", sdid + ":" + fr.receivedAt + ":" + frameOk)
+                .put("displayId", sdid).put("width", scale < 0.99f ? scaledW : geometry.width)
+                .put("height", scale < 0.99f ? scaledH : geometry.height).put("geometry", geometry.json());
         return new JSONObject().put("ok", true).put("path", path)
                 .put("displayId", sdid)
                 .put("format", jpeg ? "jpeg" : "png")
                 .put("convertMs", SystemClock.elapsedRealtime() - t)
-                .put("dims", (scale < 0.99f ? scaledW : fw) + "x" + (scale < 0.99f ? scaledH : fh))
+                .put("dims", lastScreenshot.getInt("width") + "x" + lastScreenshot.getInt("height"))
+                .put("geometry", geometry.json()).put("frameId", lastScreenshot.getString("frameId"))
+                .put("scaleToDisplayX", (double) geometry.width / lastScreenshot.getInt("width"))
+                .put("scaleToDisplayY", (double) geometry.height / lastScreenshot.getInt("height"))
+                .put("frameAgeMs", SystemClock.elapsedRealtime() - fr.receivedAt)
+                .put("inputHint", "截图坐标请传 coordinate_space=screenshot 与本次 frame_id；节点 bounds 使用 display 坐标。旋转后重新观察。")
                 // ready-to-copy next call: models kept dropping the required path argument
                 .put("read_with", readHint(path));
     }
@@ -1906,9 +1995,16 @@ final class VDriveWorker implements VDrive.Worker {
             // does not prove that a login/child task has also left the old display.
             session.taskId = result.getInt("taskId");
             if (session == current) { launchedTaskId = session.taskId; save(); }
+            boolean ready = false;
+            long readyDeadline = SystemClock.elapsedRealtime() + 1200;
+            for (int attempt = 0; attempt < 8 && SystemClock.elapsedRealtime() < readyDeadline; attempt++) {
+                if (foregroundWindowReady(session.pkg, 0)) { ready = true; break; }
+                sleepCancellable(100);
+            }
             disposition.compareAndSet(CLAIMED, PARKED);
             tickSession(session, SystemClock.elapsedRealtime());
-            return result.put("released", session.vd == null);
+            return result.put("released", session.vd == null).put("windowReady", ready)
+                    .put("geometry", geometry(0).json());
         } finally {
             // A failed/expired RPC must not make the preserved screen permanently unclaimable.
             disposition.compareAndSet(CLAIMED, PARKED);
@@ -1951,6 +2047,7 @@ final class VDriveWorker implements VDrive.Worker {
                     + displayOfTask(taskId) + " (wanted " + to + "); the hidden display was kept");
         }
         if (sess != null) {
+            sess.handoffAt = SystemClock.elapsedRealtime();
             sess.taskId = -1;
             sess.orphanAt = SystemClock.elapsedRealtime();
             sess.homeFront = "";
@@ -1973,6 +2070,20 @@ final class VDriveWorker implements VDrive.Worker {
                 .put("taskId", taskId).put("toDisplay", to)
                 .put("layoutRestored", false)
                 .put("moveMs", SystemClock.elapsedRealtime() - t);
+    }
+
+    boolean foregroundWindowReady(String pkg, int did) {
+        JSONObject probe;
+        try { probe = proxyA11y(new JSONObject().put("cmd", "diag").put("displayId", did), 400); }
+        catch (Exception unavailable) { return false; }
+        if (probe == null || !probe.optBoolean("ok")) return false;
+        org.json.JSONArray windows = probe.optJSONArray("windows");
+        if (windows == null) return false;
+        for (int index = 0; index < windows.length(); index++) {
+            JSONObject window = windows.optJSONObject(index);
+            if (window != null && pkg.equals(window.optString("package")) && window.optBoolean("focused")) return true;
+        }
+        return false;
     }
 
     /** Bring the app the user was looking at back to the front, a few times if needed. */
@@ -2111,9 +2222,63 @@ final class VDriveWorker implements VDrive.Worker {
     }
 
     JSONObject checkPoint(int did, float x, float y) {
-        int[] sz = sizeOf(did);
-        if (x < 0 || y < 0 || x > sz[0] || y > sz[1])
-            return fail("COORD_OUT_OF_BOUNDS", (int) x + "," + (int) y + " vs " + sz[0] + "x" + sz[1]);
+        DisplayGeometry g = geometry(did);
+        if (!g.contains(x, y))
+            return fail("COORD_OUT_OF_BOUNDS", x + "," + y + " vs " + g.width + "x" + g.height);
+        return null;
+    }
+
+    DisplayGeometry geometry(int did) {
+        int[] size = sizeOf(did);
+        Display display = dm == null ? null : dm.getDisplay(did);
+        return new DisplayGeometry(size[0], size[1], display == null ? 0 : display.getRotation());
+    }
+
+    int requestedOrientation(String component) {
+        if (component == null || component.isEmpty()) return -1;
+        try {
+            ComponentName name = ComponentName.unflattenFromString(component);
+            if (name == null) {
+                Intent launch = ctx.getPackageManager().getLaunchIntentForPackage(component);
+                if (launch != null) name = launch.getComponent();
+            }
+            return name == null ? -1 : ctx.getPackageManager().getActivityInfo(name, 0).screenOrientation;
+        } catch (Exception unavailable) { return -1; }
+    }
+
+    boolean isPointerCommand(String cmd) {
+        return "tap".equals(cmd) || "press".equals(cmd) || "drag".equals(cmd) || "swipe".equals(cmd);
+    }
+
+    JSONObject stalePointerFallback(JSONObject req, JSONObject observed, int did) {
+        String code = observed == null ? "" : observed.optString("code");
+        if ("STALE_OBSERVATION".equals(code) || "GEOMETRY_CHANGED_DURING_OPERATION".equals(code)) return observed;
+        if (req.has("expectedGeometry") && !geometry(did).matches(req.optJSONObject("expectedGeometry")))
+            return fail("STALE_OBSERVATION", "display rotated before touch fallback; observe again");
+        return null;
+    }
+
+    JSONObject preparePointerCoordinates(JSONObject req) throws Exception {
+        int did = req.optInt("displayId", displayId);
+        DisplayGeometry g = geometry(did);
+        if (req.has("expectedGeometry") && !g.matches(req.optJSONObject("expectedGeometry")))
+            return fail("STALE_OBSERVATION", "display geometry changed; take a fresh screenshot or node tree before input");
+        req.put("expectedGeometry", g.json());
+        String space = req.optString("coordinateSpace", "display");
+        if (!"display".equals(space) && !"screenshot".equals(space)) return fail("BAD_ARGUMENT", "unknown coordinate space");
+        if (!"screenshot".equals(space)) return null;
+        if (lastScreenshot == null || lastScreenshot.optInt("displayId", -1) != did ||
+                !req.optString("frameId").equals(lastScreenshot.optString("frameId")) ||
+                !g.matches(lastScreenshot.optJSONObject("geometry")))
+            return fail("STALE_OBSERVATION", "screenshot frame_id is missing, consumed or outdated; observe again");
+        int width = lastScreenshot.getInt("width"), height = lastScreenshot.getInt("height");
+        for (String suffix : new String[]{"", "1", "2"}) {
+            String x = "x" + suffix, y = "y" + suffix;
+            if (!req.has(x) || !req.has(y)) continue;
+            double px = req.getDouble(x), py = req.getDouble(y);
+            if (!new DisplayGeometry(width, height, 0).contains(px, py)) return fail("COORD_OUT_OF_BOUNDS", "outside screenshot pixels");
+            req.put(x, px * g.width / width).put(y, py * g.height / height);
+        }
         return null;
     }
 
@@ -2276,6 +2441,7 @@ final class VDriveWorker implements VDrive.Worker {
     }
 
     void shutdown() {
+        if (dm != null) dm.unregisterDisplayListener(geometryListener);
         for (Session x : new java.util.ArrayList<>(sessions.values())) {
             releaseSessionFully(x, false);
         }

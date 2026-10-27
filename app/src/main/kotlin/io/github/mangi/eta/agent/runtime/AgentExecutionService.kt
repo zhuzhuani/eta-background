@@ -4,6 +4,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.RemoteInput
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -43,6 +44,7 @@ internal class AgentExecutionService : Service() {
     private var foregroundActive = false
     private var foregroundId = 0
     @Volatile private var startRejected = false
+    private val replyConnections = mutableMapOf<String, NotificationReplyConnection>()
 
     override fun onCreate() {
         super.onCreate()
@@ -91,7 +93,9 @@ internal class AgentExecutionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action in RUN_ACTIONS) {
+        if (intent?.action == ACTION_REPLY) {
+            receiveReply(intent)
+        } else if (intent?.action in RUN_ACTIONS) {
             intent?.getStringExtra(EXTRA_RUN_ID)?.let {
                 AgentRuntimeService.dispatchNotificationAction(intent.action.orEmpty(), it)
             }
@@ -106,9 +110,41 @@ internal class AgentExecutionService : Service() {
     override fun onDestroy() {
         val current = instance === this
         if (current) instance = null
+        replyConnections.values.toList().forEach { it.close() }
         stopQueue.close(leases.drainOwner(owner))
         if (current) cards.values.filterNot { it.completed }.map { it.runId }.forEach { removeCard(this, it) }
         super.onDestroy()
+    }
+
+    private fun receiveReply(intent: Intent) {
+        val runId = intent.getStringExtra(EXTRA_RUN_ID).orEmpty()
+        val conversationId = intent.getStringExtra(EXTRA_CONVERSATION_ID).orEmpty()
+        val text = RemoteInput.getResultsFromIntent(intent)?.getCharSequence(REPLY_TEXT)?.toString()?.trim().orEmpty()
+        if (runId.isBlank() || conversationId.isBlank() || text.isBlank() || runId in replyConnections || runId in repliedRuns) {
+            refreshNotification(); return
+        }
+        val original = cards[runId] ?: TaskNotificationState(runId, conversationId,
+            getString(R.string.background_continue_instruction), AgentOverlayStatus.ResultReady, completed = true)
+        if (!original.completed || original.conversationId != conversationId) { refreshNotification(); return }
+        cards[runId] = original
+        if (runId !in notificationIds) notificationIds[runId] = intent.getIntExtra(EXTRA_NOTIFICATION_ID, idFor(runId))
+        val leaseId = "notification-reply:$runId"
+        val connection = NotificationReplyConnection(this, runId, conversationId, text) { accepted ->
+            replyConnections.remove(runId)
+            if (accepted) {
+                repliedRuns.add(runId)
+                while (repliedRuns.size > 32) repliedRuns.remove(repliedRuns.first())
+                removeCard(this, runId)
+            } else {
+                completeTask(this, original.copy(status = AgentOverlayStatus.RunFailed,
+                    streamPreview = getString(R.string.background_reply_failed)))
+            }
+            release(leaseId)
+        }
+        replyConnections[runId] = connection
+        // A notification reply is a user gesture. Hold the existing FGS only until Runtime admits it.
+        leases.acquire(leaseId, allowBoundFallback = true, onStop = { mainHandler.post { connection.close() } })
+        connection.start()
     }
 
     private fun stopTasks(startFailed: Boolean = false) {
@@ -138,6 +174,10 @@ internal class AgentExecutionService : Service() {
         internal const val ACTION_PAUSE_RUN = "io.github.mangi.etax.action.PAUSE_RUN"
         internal const val ACTION_RESUME_RUN = "io.github.mangi.etax.action.RESUME_RUN"
         internal const val ACTION_STOP_RUN = "io.github.mangi.etax.action.STOP_RUN"
+        internal const val ACTION_REPLY = "io.github.mangi.etax.action.REPLY"
+        internal const val REPLY_TEXT = "eta_reply_text"
+        internal const val EXTRA_CONVERSATION_ID = "reply_conversation_id"
+        private const val EXTRA_NOTIFICATION_ID = "reply_notification_id"
         private const val EXTRA_RUN_ID = "run_id"
         private val RUN_ACTIONS = setOf(ACTION_NEXT_TASK, ACTION_PAUSE_RUN, ACTION_RESUME_RUN, ACTION_STOP_RUN)
         private val leases = ExecutionLeaseRegistry()
@@ -147,6 +187,7 @@ internal class AgentExecutionService : Service() {
         private val cards = linkedMapOf<String, TaskNotificationState>()
         private val notificationIds = mutableMapOf<String, Int>()
         private val posted = mutableMapOf<Int, TaskNotificationState>()
+        private val repliedRuns = linkedSetOf<String>()
         private var nextId = 0x45540000
         private var refreshPending = false
         private val refresh = Runnable {
@@ -196,7 +237,8 @@ internal class AgentExecutionService : Service() {
         /** Terminal events bypass streaming throttles and update the original task card immediately. */
         fun completeTask(context: Context, task: TaskNotificationState) = onMain {
             val previous = cards[task.runId]
-            if (previous?.completed == true && previous.status == task.status && previous.targetPackage == task.targetPackage) return@onMain
+            if (previous?.completed == true && previous.status == task.status && previous.targetPackage == task.targetPackage &&
+                previous.streamPreview == task.streamPreview) return@onMain
             cards[task.runId] = task.copy(completed = true, paused = false)
             idFor(task.runId)
             cards.values.filter { it.completed }.dropLast(3).map { it.runId }.forEach { removeCard(context, it) }
@@ -287,8 +329,17 @@ internal class AgentExecutionService : Service() {
                     if (task.paused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause))
                 builder.addAction(runAction(context, task.runId, ACTION_STOP_RUN, R.string.overlay_stop_task, R.drawable.ic_assistant_stop))
             } else if (completed && !task?.conversationId.isNullOrBlank()) {
+                val replyIntent = Intent(context, AgentExecutionService::class.java).setAction(ACTION_REPLY)
+                    .setData(Uri.Builder().scheme("eta-task").authority("reply").appendPath(task!!.runId).build())
+                    .putExtra(EXTRA_RUN_ID, task.runId).putExtra(EXTRA_CONVERSATION_ID, task.conversationId)
+                    .putExtra(EXTRA_NOTIFICATION_ID, id)
+                val reply = PendingIntent.getForegroundService(context, 0, replyIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE)
                 builder.addAction(Notification.Action.Builder(Icon.createWithResource(context, android.R.drawable.ic_menu_edit),
-                    context.getString(R.string.background_continue_instruction), conversationIntent(context, task?.conversationId, compose = true)).build())
+                    context.getString(R.string.background_continue_instruction), reply)
+                    .addRemoteInput(RemoteInput.Builder(REPLY_TEXT).setLabel(context.getString(R.string.background_continue_instruction)).build())
+                    .setSemanticAction(Notification.Action.SEMANTIC_ACTION_REPLY).setAllowGeneratedReplies(false)
+                    .setAuthenticationRequired(true).build())
                 builder.addAction(Notification.Action.Builder(Icon.createWithResource(context, R.drawable.ic_notification),
                     context.getString(R.string.overlay_open_conversation), conversationIntent(context, task?.conversationId)).build())
             } else if (task == null) {

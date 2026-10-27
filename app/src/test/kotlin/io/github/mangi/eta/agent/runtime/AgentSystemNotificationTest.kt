@@ -49,10 +49,19 @@ class AgentSystemNotificationTest {
             finished.notification.contentIntent.send()
             assertEquals(CompletedAppActivity::class.java.name, shadowOf(service.application).nextStartedActivity.component?.className)
             assertEquals(2, finished.notification.actions.size)
-            finished.notification.actions[0].actionIntent.send()
-            val continuation = shadowOf(service.application).nextStartedActivity
-            assertEquals("chat-app-click", continuation.getStringExtra(MainActivity.EXTRA_CONVERSATION_ID))
-            assertTrue(continuation.getBooleanExtra(MainActivity.EXTRA_COMPOSE_REPLY, false))
+            val reply = finished.notification.actions[0]
+            assertEquals(Notification.Action.SEMANTIC_ACTION_REPLY, reply.semanticAction)
+            assertEquals(AgentExecutionService.REPLY_TEXT, reply.remoteInputs.single().resultKey)
+            assertFalse(reply.actionIntent.isImmutable)
+            val input = android.content.Intent()
+            android.app.RemoteInput.addResultsToIntent(reply.remoteInputs, input,
+                android.os.Bundle().apply { putCharSequence(AgentExecutionService.REPLY_TEXT, "继续收菜") })
+            reply.actionIntent.send(service, 0, input)
+            assertNull("通知回复不能打开 Activity", shadowOf(service.application).nextStartedActivity)
+            val continuation = shadowOf(reply.actionIntent).savedIntent
+            assertEquals(AgentExecutionService::class.java.name, continuation.component?.className)
+            assertEquals(AgentExecutionService.ACTION_REPLY, continuation.action)
+            assertEquals("chat-app-click", continuation.getStringExtra(AgentExecutionService.EXTRA_CONVERSATION_ID))
             finished.notification.actions[1].actionIntent.send()
             assertEquals("chat-app-click", shadowOf(service.application).nextStartedActivity
                 .getStringExtra(MainActivity.EXTRA_CONVERSATION_ID))

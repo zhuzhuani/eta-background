@@ -422,6 +422,19 @@ internal class AgentAppState(
                 val entries = rawCheckpoints.map { it.runId to it.handoff } +
                     rawCompletedRuns.map { it.result.runId.ifBlank { it.handoff.id } to it.handoff }
                 entries.distinctBy { it.first }.forEach { (runId, handoff) ->
+                    if (handoff.source == AgentRuntimeWire.AGENT_UI_HANDOFF_SOURCE) {
+                        val payload = AgentUiHandoffPayload.from(handoff.payload)
+                        val supplement = payload.promptSupplement
+                        val existing = conversationsById[payload.conversationId]
+                        if (supplement != null && existing != null &&
+                            !AgentRuntimeHistoryReducer.wasApplied(existing, runId)) {
+                            val id = payload.promptMessageId(runId)
+                            if (existing.messages.none { it.id == id }) {
+                                updateConversation(payload.conversationId, existing.copy(messages = existing.messages +
+                                    UserMessageUi(id = id, content = supplement.text)))
+                            }
+                        }
+                    }
                     val external = AssistantRunRecovery.payload(handoff) ?: return@forEach
                     val id = archiveConversationId(handoff.source, external.conversationKey)
                     val existing = conversationsById[id] ?: emptyChatState(defaultThinkingEnabled)

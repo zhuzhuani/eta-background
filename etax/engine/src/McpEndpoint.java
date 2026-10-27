@@ -38,6 +38,8 @@ final class McpEndpoint {
 
     /** Alias table: public JSON schema uses snake_case, the engine/observer read camelCase. */
     private static final String[][] ARG_ALIASES = {
+            {"coordinate_space", "coordinateSpace"},
+            {"frame_id", "frameId"},
             {"view_id", "viewId"},
             {"hold_ms", "holdMs"},
             {"duration_ms", "durationMs"},

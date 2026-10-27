@@ -231,6 +231,35 @@ public final class Boot {
                     return new JSONObject().put("ok", false).put("code", "STALE_SCREEN");
             } catch (Exception e) { return new JSONObject().put("ok", false).put("code", "SESSION_UNAVAILABLE"); }
         }
+        int did = req.optInt("displayId", 0);
+        JSONObject geometry = displayGeometry(did);
+        JSONObject expected = req.optJSONObject("expectedGeometry");
+        if (expected != null && (!expected.optString("width").equals(geometry.optString("width")) ||
+                !expected.optString("height").equals(geometry.optString("height")) ||
+                !expected.optString("rotation").equals(geometry.optString("rotation"))))
+            return new JSONObject().put("ok", false).put("code", "STALE_OBSERVATION")
+                    .put("error", "显示方向或尺寸已改变，请重新观察后操作").put("geometry", geometry);
+        JSONObject result = dispatch(req);
+        JSONObject after = displayGeometry(did);
+        if (!geometry.toString().equals(after.toString())) return new JSONObject().put("ok", false)
+                .put("code", "GEOMETRY_CHANGED_DURING_OPERATION").put("geometry", after)
+                .put("error", "操作期间显示方向改变；先重新观察，不要盲目重放可能已经生效的动作");
+        return result.put("geometry", after);
+    }
+
+    private static JSONObject displayGeometry(int did) throws Exception {
+        android.hardware.display.DisplayManager manager = service.getSystemService(android.hardware.display.DisplayManager.class);
+        android.view.Display display = manager.getDisplay(did < 0 ? 0 : did);
+        JSONObject result = new JSONObject().put("coordinateSpace", "display");
+        if (display != null) {
+            android.graphics.Point size = new android.graphics.Point();
+            display.getRealSize(size);
+            result.put("width", size.x).put("height", size.y).put("rotation", display.getRotation());
+        }
+        return result;
+    }
+
+    private static JSONObject dispatch(JSONObject req) throws Exception {
         switch (req.optString("cmd")) {
             case "ping": return new JSONObject().put("ok", true).put("pong", true);
             case "dump": return dump(req);
@@ -250,7 +279,7 @@ public final class Boot {
     private static List<AccessibilityWindowInfo> windowsOf(int did) {
         SparseArray<List<AccessibilityWindowInfo>> all = service.getWindowsOnAllDisplays();
         if (all == null) return null;
-        int idx = did < 0 ? (all.size() > 0 ? 0 : -1) : all.indexOfKey(did);
+        int idx = all.indexOfKey(did < 0 ? 0 : did);
         return idx < 0 ? null : all.valueAt(idx);
     }
 
@@ -258,6 +287,7 @@ public final class Boot {
         List<AccessibilityNodeInfo> out = new ArrayList<>();
         if (list == null) return out;
         for (AccessibilityWindowInfo w : list) {
+            if (out.size() >= limit) break;
             AccessibilityNodeInfo root = w.getRoot();
             if (root == null) continue;
             ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>();
@@ -266,7 +296,7 @@ public final class Boot {
                 AccessibilityNodeInfo n = q.poll();
                 if (n == null) continue;
                 out.add(n);
-                for (int i = 0; i < n.getChildCount(); i++) {
+                for (int i = 0; i < n.getChildCount() && out.size() + q.size() < limit; i++) {
                     AccessibilityNodeInfo ch = n.getChild(i);
                     if (ch != null) q.add(ch);
                 }
@@ -289,6 +319,7 @@ public final class Boot {
         JSONArray nodes = new JSONArray();
         int count = 0;
         for (AccessibilityNodeInfo n : flatten(list, limit)) {
+            if (!n.isVisibleToUser()) continue;
             Rect r = new Rect();
             n.getBoundsInScreen(r);
             if (r.isEmpty()) continue;
@@ -425,32 +456,35 @@ public final class Boot {
         int x = req.optInt("x", -1), y = req.optInt("y", -1);
         long hold = req.optLong("holdMs", 0);
         if (x < 0 || y < 0) return new JSONObject().put("ok", false).put("code", "BAD_ARGUMENT");
-        AccessibilityNodeInfo hit = null;
         AccessibilityNodeInfo clickable = null;
+        long smallestArea = Long.MAX_VALUE;
         for (AccessibilityNodeInfo n : flatten(windowsOf(did), 800)) {
+            if (!n.isVisibleToUser() || !n.isEnabled()) continue;
             Rect r = new Rect();
             n.getBoundsInScreen(r);
             if (!r.contains(x, y)) continue;
-            if (hit == null) hit = n;
-            if (n.isClickable() || (hold > 0 && n.isLongClickable())) {
+            // A game's SurfaceView/container cannot represent a coordinate-specific button.
+            String cls = String.valueOf(n.getClassName());
+            if (cls.contains("SurfaceView") || cls.contains("TextureView") || cls.contains("UnityPlayer")) continue;
+            boolean actionable = hold > 0 ? n.isLongClickable() : n.isClickable();
+            long area = (long) r.width() * r.height();
+            if (actionable && (!textOf(n).isEmpty() || n.getViewIdResourceName() != null) && area < smallestArea) {
                 clickable = n;
-                break;
+                smallestArea = area;
             }
         }
-        if (hit == null) return new JSONObject().put("ok", false).put("code", "NO_NODE");
-        AccessibilityNodeInfo target = nearestClickable(clickable == null ? hit : clickable);
+        AccessibilityNodeInfo target = clickable;
         if (target == null) return new JSONObject().put("ok", false).put("code", "NO_NODE");
         String before = signature(did);
-        int evBefore = eventCount;
+        long evBefore = lastEventFor(did);
         boolean ok = target.performAction(hold > 0
                 ? AccessibilityNodeInfo.ACTION_LONG_CLICK
                 : AccessibilityNodeInfo.ACTION_CLICK);
-        if (!ok && hold > 0) ok = target.performAction(AccessibilityNodeInfo.ACTION_CLICK);
         boolean changed = false;
         long deadline = SystemClock.elapsedRealtime() + 250;
         while (SystemClock.elapsedRealtime() < deadline) {
             Thread.sleep(20);
-            if (eventCount != evBefore || !signature(did).equals(before)) { changed = true; break; }
+            if (lastEventFor(did) != evBefore || !signature(did).equals(before)) { changed = true; break; }
         }
         if (changed && target.isEditable()) {
             // Clicking a text field makes that app request the IME. On this ROM the hidden
@@ -488,6 +522,7 @@ public final class Boot {
         int index = req.optInt("index", -1);
         List<AccessibilityNodeInfo> hits = new ArrayList<>();
         for (AccessibilityNodeInfo n : flatten(windowsOf(did), 500)) {
+            if (!n.isVisibleToUser() || !n.isEnabled()) continue;
             boolean ok;
             if (!viewId.isEmpty()) {
                 String v = n.getViewIdResourceName();
@@ -649,6 +684,7 @@ public final class Boot {
         AccessibilityNodeInfo best = null;
         long bestArea = 0;
         for (AccessibilityNodeInfo n : flatten(windowsOf(did), 500)) {
+            if (!n.isVisibleToUser()) continue;
             if (!n.isScrollable() || !n.isEnabled()) continue;
             Rect r = new Rect();
             n.getBoundsInScreen(r);
@@ -676,6 +712,7 @@ public final class Boot {
         int tol = req.optInt("tolerance", 40);
         List<Object[]> items = new ArrayList<>();
         for (AccessibilityNodeInfo n : flatten(windowsOf(did), 500)) {
+            if (!n.isVisibleToUser()) continue;
             String t = textOf(n).trim();
             if (t.isEmpty()) continue;
             Rect r = new Rect();
@@ -704,7 +741,8 @@ public final class Boot {
             cur.put(new JSONObject().put("t", it[2]));
         }
         if (cur != null && cur.length() > 0 && rows.length() < maxRows) rows.put(cur);
-        return new JSONObject().put("ok", true).put("rows", rows).put("rowCount", rows.length());
+        return new JSONObject().put("ok", true).put("rows", rows).put("rowCount", rows.length())
+                .put("hint", rows.length() == 0 ? "没有可读文字节点不代表画面为空；游戏和画布请改用 screen_shot" : "");
     }
 
     private static JSONObject diag(JSONObject req) throws Exception {
@@ -720,7 +758,20 @@ public final class Boot {
             if (!t.isEmpty() && texts.size() < 20) texts.add(t.length() > 40 ? t.substring(0, 40) : t);
             if (pkg.isEmpty() && n.getPackageName() != null) pkg = n.getPackageName().toString();
         }
+        JSONArray windows = new JSONArray();
+        List<AccessibilityWindowInfo> visible = windowsOf(did);
+        if (visible != null) for (AccessibilityWindowInfo window : visible) {
+            AccessibilityNodeInfo root = window.getRoot();
+            Rect bounds = new Rect(); window.getBoundsInScreen(bounds);
+            windows.put(new JSONObject().put("id", window.getId()).put("focused", window.isFocused())
+                    .put("active", window.isActive()).put("type", window.getType())
+                    .put("package", root == null ? "" : String.valueOf(root.getPackageName()))
+                    .put("bounds", new JSONArray().put(bounds.left).put(bounds.top).put(bounds.right).put(bounds.bottom)));
+        }
         return new JSONObject().put("ok", true).put("displayId", did).put("package", pkg)
+                .put("windows", windows).put("windowCount", windows.length())
+                .put("visualOnly", texts.isEmpty() && edit == 0 && click == 0)
+                .put("hint", texts.isEmpty() ? "此页面未暴露可读文字节点；游戏/画布界面请使用 screen_shot 与截图坐标操作" : "节点 bounds 使用显示屏原始像素")
                 .put("nodeCount", all.size()).put("editables", edit).put("clickables", click)
                 .put("texts", new JSONArray(texts)).put("eventCount", eventCount)
                 .put("sinceLastEventMs", SystemClock.elapsedRealtime() - lastEventAt);

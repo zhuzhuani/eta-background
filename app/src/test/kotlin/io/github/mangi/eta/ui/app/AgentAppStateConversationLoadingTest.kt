@@ -52,6 +52,23 @@ class AgentAppStateConversationLoadingTest {
     }
 
     @Test
+    fun notificationReplyPromptIsVisibleFromCheckpointBeforeAResultExists() {
+        seed("first" to conversation("first"))
+        val payload = io.github.mangi.eta.agent.runtime.AgentUiHandoffPayload("first",
+            promptSupplement = io.github.mangi.eta.agent.runtime.AgentUiHandoffPayload.Supplement(1, "收左边的菜", 1))
+        val request = AgentRuntimeWire.RunRequest("inline-running", "收左边的菜",
+            AgentModelClient.ModelConfig(baseUrl = "https://example.invalid", apiKey = "test", model = "test", systemPrompt = ""),
+            emptyList(), emptyList(), handoff = AgentRuntimeWire.EntryHandoff("inline-running",
+                AgentRuntimeWire.AGENT_UI_HANDOFF_SOURCE, payload.toJson()))
+        assertTrue(io.github.mangi.eta.agent.runtime.AgentRunCheckpointStore.start(context, request))
+        val state = AgentAppState(context, scope)
+        awaitCondition { state.homeState.messages.filterIsInstance<UserMessageUi>().any { it.content == "收左边的菜" } }
+        state.refreshRuntimeResults()
+        awaitCondition { !state.isLoadingEarlierMessages }
+        assertEquals(1, state.homeState.messages.filterIsInstance<UserMessageUi>().count { it.content == "收左边的菜" })
+    }
+
+    @Test
     fun notificationContinuationImportsTheAssistantArchiveBeforeSelectingItsChat() {
         seed("first" to conversation("first"))
         val source = AgentRuntimeWire.ETA_VOICE_HANDOFF_SOURCE

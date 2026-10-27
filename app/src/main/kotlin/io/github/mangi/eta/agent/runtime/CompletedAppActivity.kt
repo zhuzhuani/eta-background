@@ -17,6 +17,9 @@ import org.json.JSONObject
 internal class CompletedAppActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // This transparent bridge must never own the App's touch region or keyboard focus.
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
         val runId = intent.getStringExtra(EXTRA_RUN_ID).orEmpty()
         val pkg = intent.getStringExtra(EXTRA_PACKAGE).orEmpty()
         if (runId.isBlank() || pkg.isBlank()) { finish(); return }

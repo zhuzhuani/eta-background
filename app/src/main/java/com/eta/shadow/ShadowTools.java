@@ -33,6 +33,7 @@ public final class ShadowTools {
     public ShadowTools(String sessionId) { this(sessionId, null); }
     ShadowTools(String sessionId, LineTransport transport) { this.sessionId = sessionId; this.transport = transport; }
     private volatile int display = -1;
+    private JSONObject observedGeometry;
 
     public String sessionInfo() {
         return "{\"mode\":" + (mode == null ? "null" : "\"" + mode + "\"")
@@ -265,6 +266,7 @@ public final class ShadowTools {
                     + "（可用 search_apps 或之前对话里的包名）\"}";
         }
         JSONObject req = new JSONObject().put("cmd", "launch").put("component", component);
+        req.put("orientation", a.optString("orientation", "auto"));
         if (a.has("allowForceStop")) req.put("allowForceStop", a.optBoolean("allowForceStop", false));
         for (String k : new String[]{"width", "height", "density"}) {
             if (a.has(k)) req.put(k, a.optInt(k, 0));
@@ -284,6 +286,7 @@ public final class ShadowTools {
         parkedHints.forget(openedPackage);
         mode = launched.optString("mode", "hidden");
         display = disp < 0 ? 0 : disp;
+        observedGeometry = null;
         if ("hidden".equals(mode)) {
             for (int i = 0; i < 30; i++) {
                 try {
@@ -368,6 +371,7 @@ public final class ShadowTools {
     void resetSession() {
         mode = null;
         display = -1;
+        observedGeometry = null;
     }
 
     /**
@@ -387,7 +391,8 @@ public final class ShadowTools {
             {"allow_force_stop", "allowForceStop"},
             {"wait_frame_ms", "waitFrameMs"},
             {"keep_front", "keepFront"},
-            {"to_display", "toDisplay"}
+            {"to_display", "toDisplay"},
+            {"coordinate_space", "coordinateSpace"}, {"frame_id", "frameId"}
     };
 
     private void normalizeArgs(JSONObject q) {
@@ -413,7 +418,12 @@ public final class ShadowTools {
             q.put("displayId", 0);
             q.put("allowMain", true);
         }
-        return engine(q.toString());
+        if (observedGeometry != null && ("tap".equals(cmd) || "press".equals(cmd) || "drag".equals(cmd) || "swipe".equals(cmd)))
+            q.put("expectedGeometry", observedGeometry);
+        String response = engine(q.toString());
+        JSONObject result = new JSONObject(response);
+        if ("shot".equals(cmd) && result.optBoolean("ok")) observedGeometry = result.optJSONObject("geometry");
+        return response;
     }
 
     private String obs(String cmd, JSONObject a) throws Exception {
@@ -430,7 +440,11 @@ public final class ShadowTools {
         q.put("cmd", cmd);
         q.put("displayId", display);
         normalizeArgs(q);
-        return observer(q.toString(), callTimeout);
+        if (!readOnly && observedGeometry != null) q.put("expectedGeometry", observedGeometry);
+        String response = observer(q.toString(), callTimeout);
+        JSONObject result = new JSONObject(response);
+        if (readOnly && result.optBoolean("ok")) observedGeometry = result.optJSONObject("geometry");
+        return response;
     }
 
     /** Called outside registry locks. The engine acknowledges cleanup before the lease is released. */

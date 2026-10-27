@@ -66,6 +66,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.squircle.LocalSquircleEnabled
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.darkColorScheme
@@ -96,6 +97,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     @Volatile private var lastGuiOwnerRunId: String? = null
     private var displayedRun: RuntimeRunRegistry.Run? = null
     private val pendingStarts = linkedMapOf<String, () -> Unit>()
+    private val pendingNotificationReplies = mutableSetOf<String>()
 
     private var windowManager: WindowManager? = null
     private var glowView: ComposeView? = null
@@ -382,11 +384,38 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     private fun startRun(
         request: AgentRuntimeWire.RunRequest,
         replyTo: Messenger? = null,
-    ) {
-        val run = admitRun(request, replyTo) ?: return
+        persistEntry: Boolean = false,
+    ): Boolean {
+        val run = admitRun(request, replyTo) ?: return false
+        if (persistEntry && request.handoff?.source == AgentRuntimeWire.AGENT_UI_HANDOFF_SOURCE) {
+            run.entryPersistence = java.util.concurrent.CompletableFuture.runAsync({
+                check(AgentRunCheckpointStore.start(applicationContext, request))
+                AssistantRunRecovery.changed()
+            }, entryPersistenceIo)
+        }
         enqueueRun(run) {
             run.prepared(request)
             executePreparedRun(run)
+        }
+        return true
+    }
+
+    private fun prepareNotificationReply(sourceRunId: String, conversationId: String, text: String,
+        pending: () -> Boolean, complete: (Boolean) -> Unit) {
+        if (!pending() || destroyed || runs.all().any { it.conversationId == conversationId } ||
+            !pendingNotificationReplies.add(conversationId)) { complete(false); return }
+        serviceScope.launch {
+            try {
+                val request = withContext(Dispatchers.IO) {
+                    NotificationReplyRequest.load(applicationContext, sourceRunId, conversationId, text)
+                }
+                if (pending() && !destroyed && runs.all().none { it.conversationId == conversationId }) {
+                    complete(startRun(request, persistEntry = true))
+                } else complete(false)
+            } catch (failure: Exception) {
+                AndroidAgentLogger.warn("Notification reply admission failed: type=${failure.safeLogType()}")
+                complete(false)
+            } finally { pendingNotificationReplies.remove(conversationId) }
         }
     }
 
@@ -1573,6 +1602,12 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             Thread(runnable, "eta-entry-persistence").apply { isDaemon = true }
         }
         @Volatile private var notificationOwner: AgentRuntimeService? = null
+
+        internal fun submitNotificationReply(sourceRunId: String, conversationId: String, text: String,
+            pending: () -> Boolean, complete: (Boolean) -> Unit) {
+            val owner = notificationOwner ?: run { complete(false); return }
+            owner.prepareNotificationReply(sourceRunId, conversationId, text, pending, complete)
+        }
 
         internal fun dispatchNotificationAction(action: String, runId: String) {
             val owner = notificationOwner ?: return
