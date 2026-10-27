@@ -56,6 +56,34 @@ jobs:
           done
           echo "引擎已内嵌：build=$BUILD dex=$(sha256sum app/src/main/assets/vdrive.dex | cut -c1-16) ($(stat -c%s app/src/main/assets/vdrive.dex)B)"
 
+      - name: 后台任务回归与静态检查
+        run: |
+          ./gradlew --no-daemon --no-configuration-cache --max-workers=2 \
+            "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
+            :app:testDebugUnitTest \
+            --tests "io.github.mangi.eta.agent.runtime.*" \
+            --tests "io.github.mangi.eta.ui.app.AgentAppStateConversationLoadingTest" \
+            --tests "io.github.mangi.eta.ui.app.AgentRuntimeHistoryReducerTest" \
+            --tests "com.eta.shadow.*" \
+            --tests "VDrive*Test" --tests "DisplayGeometryTest" --tests "CapturePixelsTest" \
+            :app:lintDebug
+          python3 - <<'PY'
+          import pathlib, xml.etree.ElementTree as ET
+          totals = {key: 0 for key in ("tests", "failures", "errors", "skipped")}
+          for path in pathlib.Path("app/build/test-results/testDebugUnitTest").glob("TEST-*.xml"):
+              report = ET.parse(path).getroot()
+              for key in totals:
+                  totals[key] += int(report.attrib[key])
+          assert totals["tests"] > 0 and totals["failures"] == totals["errors"] == 0, totals
+          print("Regression results:", totals)
+          lint = ET.parse("app/build/reports/lint-results-debug.xml").getroot()
+          severities = {}
+          for issue in lint.findall("issue"):
+              severity = issue.attrib["severity"]
+              severities[severity] = severities.get(severity, 0) + 1
+          print("Lint results:", severities)
+          PY
+
       - name: 还原签名证书
         id: sign
         env:
