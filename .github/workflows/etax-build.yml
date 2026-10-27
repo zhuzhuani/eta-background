@@ -65,7 +65,10 @@ jobs:
             --tests "io.github.mangi.eta.ui.app.AgentAppStateConversationLoadingTest" \
             --tests "io.github.mangi.eta.ui.app.AgentRuntimeHistoryReducerTest" \
             --tests "com.eta.shadow.*" \
-            --tests "VDrive*Test" --tests "DisplayGeometryTest" --tests "CapturePixelsTest" \
+            --tests "VDrive*Test" --tests "DisplayGeometryTest" --tests "CapturePixelsTest"
+          # Keep CPU-heavy lint away from time-bounded Robolectric UI recovery tests.
+          ./gradlew --no-daemon --no-configuration-cache --max-workers=2 \
+            "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
             :app:lintDebug
           python3 - <<'PY'
           import pathlib, xml.etree.ElementTree as ET
@@ -83,6 +86,17 @@ jobs:
               severities[severity] = severities.get(severity, 0) + 1
           print("Lint results:", severities)
           PY
+
+      - name: 保存失败检查报告
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: validation-reports
+          path: |
+            app/build/test-results/testDebugUnitTest/*.xml
+            app/build/reports/lint-results-debug.*
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: 还原签名证书
         id: sign
