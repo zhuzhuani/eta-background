@@ -21,6 +21,7 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 
 import org.json.JSONObject;
+import com.eta.shadow.ScreenGeometry;
 
 import java.io.ByteArrayOutputStream;
 import java.io.FileOutputStream;
@@ -288,6 +289,7 @@ class VDriveWorker implements VDrive.Worker {
     }
 
     public int displayId() { return displayId; }
+    public JSONObject geometrySnapshot() throws Exception { return geometry(displayId).json(); }
     public boolean isParked() { return disposition.get() == PARKED && !retired && orphanAt > 0 && displayId > 0; }
     public boolean claimParked() { return disposition.compareAndSet(PARKED, CLAIMED); }
     public boolean isCapturing() { return !retired && reader != null; }
@@ -919,6 +921,11 @@ class VDriveWorker implements VDrive.Worker {
 
     JSONObject proxyA11y(JSONObject req, int timeoutMs) {
         try (java.net.Socket sock = new java.net.Socket()) {
+            int did = req.optInt("displayId", displayId);
+            JSONObject before = geometry(did < 0 ? 0 : did).json();
+            JSONObject invalid = ScreenGeometry.check(req.optJSONObject("expectedGeometry"), before);
+            if (invalid != null) return invalid;
+            req.put("engineGeometry", before);
             sock.connect(new java.net.InetSocketAddress("127.0.0.1", obsPort()), Math.min(2000, timeoutMs));
             sock.setSoTimeout(timeoutMs);
             java.io.PrintStream w = new java.io.PrintStream(sock.getOutputStream(), true, "UTF-8");
@@ -928,7 +935,12 @@ class VDriveWorker implements VDrive.Worker {
             String line = r.readLine();
             if (line == null) return null;
             if (line.startsWith("RESULT:")) line = line.substring(7);
-            return new JSONObject(line);
+            JSONObject result = new JSONObject(line);
+            JSONObject after = geometry(did < 0 ? 0 : did).json();
+            if (!ScreenGeometry.same(before, after)) return ScreenGeometry.reject(
+                    "GEOMETRY_CHANGED_DURING_OPERATION", "GEOMETRY_CHANGED_DURING_OPERATION", before, after)
+                    .put("operationMayHaveRun", true);
+            return result.put("geometry", after);
         } catch (Throwable t) {
             log("a11y proxy failed on " + obsPort() + ": " + t);
             obsPort = 0;   // port may have moved to the other build; re-probe next call
@@ -1264,6 +1276,7 @@ class VDriveWorker implements VDrive.Worker {
             protectApp(pkg, true);
             return new JSONObject().put("ok", true).put("mode", "hidden").put("reused", true)
                     .put("taskId", tid).put("displayId", sess.displayId)
+                    .put("geometry", geometry(sess.displayId).json())
                     .put("ms", SystemClock.elapsedRealtime() - t);
         }
         if (tid != null) {
@@ -1284,6 +1297,7 @@ class VDriveWorker implements VDrive.Worker {
             protectApp(pkg, true);
             return new JSONObject().put("ok", true).put("mode", "hidden").put("reused", true)
                     .put("moved", true).put("taskId", tid).put("displayId", sess.displayId)
+                    .put("geometry", geometry(sess.displayId).json())
                     .put("ms", SystemClock.elapsedRealtime() - t);
         }
         // no task at all: cold start onto the same display
@@ -1303,6 +1317,7 @@ class VDriveWorker implements VDrive.Worker {
         protectApp(pkg, true);
         return new JSONObject().put("ok", true).put("mode", "hidden").put("reused", true)
                 .put("relaunched", true).put("taskId", newTask).put("displayId", sess.displayId)
+                .put("geometry", geometry(sess.displayId).json())
                 .put("ms", SystemClock.elapsedRealtime() - t);
     }
 
@@ -1788,7 +1803,7 @@ class VDriveWorker implements VDrive.Worker {
         }
         publishShot(new java.io.File(path));
         lastScreenshot = new JSONObject().put("frameId", "0:" + SystemClock.elapsedRealtimeNanos()).put("displayId", 0)
-                .put("width", outW).put("height", outH).put("geometry", geometry.json());
+                .put("width", outW).put("height", outH).put("geometry", geometry.json()).put("capturedAt", t);
         return new JSONObject().put("ok", true).put("path", path).put("display", "main")
                 .put("format", jpeg ? "jpeg" : "png")
                 .put("dims", outW + "x" + outH)
@@ -1869,7 +1884,7 @@ class VDriveWorker implements VDrive.Worker {
         publishShot(new java.io.File(path));
         lastScreenshot = new JSONObject().put("frameId", sdid + ":" + fr.receivedAt + ":" + frameOk)
                 .put("displayId", sdid).put("width", scale < 0.99f ? scaledW : geometry.width)
-                .put("height", scale < 0.99f ? scaledH : geometry.height).put("geometry", geometry.json());
+                .put("height", scale < 0.99f ? scaledH : geometry.height).put("geometry", geometry.json()).put("capturedAt", fr.receivedAt);
         return new JSONObject().put("ok", true).put("path", path)
                 .put("displayId", sdid)
                 .put("format", jpeg ? "jpeg" : "png")
@@ -1879,6 +1894,7 @@ class VDriveWorker implements VDrive.Worker {
                 .put("scaleToDisplayX", (double) geometry.width / lastScreenshot.getInt("width"))
                 .put("scaleToDisplayY", (double) geometry.height / lastScreenshot.getInt("height"))
                 .put("frameAgeMs", SystemClock.elapsedRealtime() - fr.receivedAt)
+                .put("frameAgeChecked", false)
                 .put("inputHint", "截图坐标请传 coordinate_space=screenshot 与本次 frame_id；节点 bounds 使用 display 坐标。旋转后重新观察。")
                 // ready-to-copy next call: models kept dropping the required path argument
                 .put("read_with", readHint(path));
@@ -2229,9 +2245,11 @@ class VDriveWorker implements VDrive.Worker {
     }
 
     DisplayGeometry geometry(int did) {
-        int[] size = sizeOf(did);
         Display display = dm == null ? null : dm.getDisplay(did);
-        return new DisplayGeometry(size[0], size[1], display == null ? 0 : display.getRotation());
+        if (display == null) return new DisplayGeometry(0, 0, -1, did, 0);
+        android.graphics.Point size = new android.graphics.Point(); display.getRealSize(size);
+        android.util.DisplayMetrics metrics = new android.util.DisplayMetrics(); display.getRealMetrics(metrics);
+        return new DisplayGeometry(size.x, size.y, display.getRotation(), did, metrics.densityDpi);
     }
 
     int requestedOrientation(String component) {
@@ -2250,27 +2268,32 @@ class VDriveWorker implements VDrive.Worker {
         return "tap".equals(cmd) || "press".equals(cmd) || "drag".equals(cmd) || "swipe".equals(cmd);
     }
 
-    JSONObject stalePointerFallback(JSONObject req, JSONObject observed, int did) {
+    JSONObject stalePointerFallback(JSONObject req, JSONObject observed, int did) throws Exception {
         String code = observed == null ? "" : observed.optString("code");
-        if ("STALE_OBSERVATION".equals(code) || "GEOMETRY_CHANGED_DURING_OPERATION".equals(code)) return observed;
-        if (req.has("expectedGeometry") && !geometry(did).matches(req.optJSONObject("expectedGeometry")))
-            return fail("STALE_OBSERVATION", "display rotated before touch fallback; observe again");
-        return null;
+        if ("STALE_OBSERVATION".equals(code) || "GEOMETRY_CHANGED_DURING_OPERATION".equals(code)
+                || "GEOMETRY_UNAVAILABLE".equals(code) || "INVALID_OBSERVATION".equals(code)) return observed;
+        return ScreenGeometry.check(req.optJSONObject("expectedGeometry"), geometry(did).json());
     }
 
     JSONObject preparePointerCoordinates(JSONObject req) throws Exception {
         int did = req.optInt("displayId", displayId);
         DisplayGeometry g = geometry(did);
-        if (req.has("expectedGeometry") && !g.matches(req.optJSONObject("expectedGeometry")))
-            return fail("STALE_OBSERVATION", "display geometry changed; take a fresh screenshot or node tree before input");
+        JSONObject invalid = ScreenGeometry.check(req.optJSONObject("expectedGeometry"), g.json());
+        if (invalid != null) return invalid;
         req.put("expectedGeometry", g.json());
         String space = req.optString("coordinateSpace", "display");
         if (!"display".equals(space) && !"screenshot".equals(space)) return fail("BAD_ARGUMENT", "unknown coordinate space");
         if (!"screenshot".equals(space)) return null;
-        if (lastScreenshot == null || lastScreenshot.optInt("displayId", -1) != did ||
-                !req.optString("frameId").equals(lastScreenshot.optString("frameId")) ||
-                !g.matches(lastScreenshot.optJSONObject("geometry")))
-            return fail("STALE_OBSERVATION", "screenshot frame_id is missing, consumed or outdated; observe again");
+        String reason = lastScreenshot == null ? "NO_OBSERVATION" :
+                lastScreenshot.optInt("displayId", -1) != did ? "DISPLAY_MISMATCH" :
+                !g.matches(lastScreenshot.optJSONObject("geometry")) ? "GEOMETRY_MISMATCH" :
+                !req.optString("frameId").equals(lastScreenshot.optString("frameId")) ? "FRAME_ID_MISMATCH" : null;
+        if (reason != null) return ScreenGeometry.reject("STALE_OBSERVATION", reason,
+                lastScreenshot == null ? null : lastScreenshot.optJSONObject("geometry"), g.json())
+                .put("requestedFrameId", req.optString("frameId"))
+                .put("availableFrameId", lastScreenshot == null ? JSONObject.NULL : lastScreenshot.optString("frameId"))
+                .put("frameAgeMs", lastScreenshot == null ? JSONObject.NULL :
+                        SystemClock.elapsedRealtime() - lastScreenshot.optLong("capturedAt", SystemClock.elapsedRealtime()));
         int width = lastScreenshot.getInt("width"), height = lastScreenshot.getInt("height");
         for (String suffix : new String[]{"", "1", "2"}) {
             String x = "x" + suffix, y = "y" + suffix;

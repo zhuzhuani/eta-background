@@ -404,11 +404,13 @@ final class McpEndpoint {
     }
 
     private static String observer(String json) throws Exception {
+        JSONObject request = new JSONObject(json);
+        if (request.optInt("displayId", -1) > 0) request.put("sessionId", "legacy-mcp");
         try (Socket s = new Socket()) {
             s.connect(new InetSocketAddress("127.0.0.1", VDrive.obsPort()), 1500);
             s.setSoTimeout(20000);
             PrintStream w = new PrintStream(s.getOutputStream(), true, "UTF-8");
-            w.println(json);
+            w.println(request);
             BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
             String line = r.readLine();
             if (line == null) throw new IOException("observer closed connection");

@@ -103,7 +103,9 @@ internal class BackgroundScreenTools(
             val previous = synchronized(lock) { binding }
             if (previous != null && (previous.app != app || previous.closing.get())) {
                 phase(BackgroundScreenPhase.ReleasingScreen)
-                cleanup(previous, keepFinished = false)
+                // Switching Apps in one task uses the same park/reuse path as screen_finish.
+                // Root still counts parked screens against the two-display limit.
+                cleanup(previous, keepFinished = true)
                 val deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(2)
                 while (!previous.released.await(100, TimeUnit.MILLISECONDS)) {
                     controller.throwIfCancelled()
@@ -149,12 +151,18 @@ internal class BackgroundScreenTools(
         if (current == null) {
             // A terminal guard and health query need no GUI session, but node reads never target display 0 implicitly.
             return if (name == "terminal" || name == "screen_state") ShadowTools(runId).intercept(name, arguments)
-            else "后台屏幕尚未打开，请先调用 screen_open"
+            else """{"ok":false,"code":"NO_SESSION","reason":"NO_ACTIVE_BINDING","error":"当前任务没有可操作的屏幕；已完成页面可能仍被保留，请调用 screen_open 重新取得所有权。"}"""
         }
         if (current.closing.get()) return "屏幕正在回收，请先调用 screen_open 打开下一应用"
         if (name == "screen_finish") phase(BackgroundScreenPhase.RestoringDisplay)
         val observationGeneration = controller.resumeGeneration
         return current.tools.execute(name, arguments).also { result ->
+            val response = runCatching { JSONObject(result.orEmpty()) }.getOrNull()
+            if (response?.optString("code") in LOST_SESSION_CODES ||
+                (name == "screen_state" && response?.has("sessionValid") == true && !response.optBoolean("sessionValid"))) {
+                // Release this binding only, and never replay an input whose outcome is unknown.
+                cleanup(current, keepFinished = false)
+            }
             if (name in OBSERVATION_TOOLS && runCatching { JSONObject(result.orEmpty()).optBoolean("ok") }.getOrDefault(false)) {
                 observedGeneration = observationGeneration
             }
@@ -194,6 +202,7 @@ internal class BackgroundScreenTools(
     }
 
     companion object {
+        private val LOST_SESSION_CODES = setOf("NO_SESSION", "SESSION_CLOSED", "STALE_SCREEN")
         private val MUTATING_TOOLS = setOf("screen_tap", "screen_click", "screen_press", "screen_swipe", "screen_drag", "screen_scroll", "screen_text")
         private val OBSERVATION_TOOLS = setOf("screen_dump", "screen_list", "screen_shot")
         private val sharedLeases = ScreenLeaseRegistry()

@@ -8,12 +8,13 @@ import java.util.*;
 
 /** Root transport. Mutable display/input/capture state lives in independent workers. */
 public final class VDrive {
-    static final String BUILD = "20261027-e33-geometry";
+    static final String BUILD = "20261027-e34-authority";
     interface Worker {
         JSONObject processLine(String request);
         boolean closeSession();
         void keepAlive();
         int displayId();
+        default JSONObject geometrySnapshot() throws Exception { return null; }
         default boolean isParked() { return false; }
         default boolean claimParked() { return isParked(); }
         default boolean isCapturing() { return false; }
@@ -116,7 +117,7 @@ public final class VDrive {
                     for (Map.Entry<String, Slot> e : workers.entrySet()) {
                         sessions.put(new JSONObject().put("sessionId", e.getKey()).put("package", e.getValue().pkg)
                                 .put("closing", e.getValue().closing).put("parked", e.getValue().parked)
-                                .put("capturing", e.getValue().worker.isCapturing()));
+                                .put("capturing", e.getValue().worker.isCapturing()).put("displayId", e.getValue().worker.displayId()));
                     }
                 }
                 return new JSONObject().put("ok", true).put("pong", true).put("build", BUILD)
@@ -212,7 +213,12 @@ public final class VDrive {
                 if (cmd.equals("keepalive")) { slot.worker.keepAlive(); return ok(); }
                 if (cmd.equals("validate")) {
                     if (slot.closing || req.optInt("displayId", -1) != slot.worker.displayId()) return error("STALE_SCREEN", "屏幕已失效");
-                    return ok();
+                    // A direct DisplayManager read, never a queued worker RPC: the worker may
+                    // be waiting for this observer callback on its own handler.
+                    JSONObject geometry = slot.worker.geometrySnapshot();
+                    if (!com.eta.shadow.ScreenGeometry.valid(geometry)) return error("STALE_SCREEN", "目标显示屏已不可用")
+                            .put("reason", "DISPLAY_REMOVED").put("displayId", req.optInt("displayId", -1));
+                    return ok().put("geometry", geometry);
                 }
                 if (slot.closing && !cmd.equals("cancel")) return error("SESSION_CLOSED", "屏幕正在释放");
             }

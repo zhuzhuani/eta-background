@@ -2,20 +2,27 @@ import android.content.pm.ActivityInfo;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
 import org.json.JSONObject;
+import com.eta.shadow.ScreenGeometry;
 
 /** Logical display pixels are the shared coordinate space for screenshots, nodes and input. */
 final class DisplayGeometry {
-    final int width, height, rotation;
+    final int width, height, rotation, displayId, density;
     DisplayGeometry(int width, int height, int rotation) {
-        this.width = width; this.height = height; this.rotation = rotation & 3;
+        this(width, height, rotation, -1, 0);
+    }
+    DisplayGeometry(int width, int height, int rotation, int displayId, int density) {
+        this.width = width; this.height = height; this.rotation = rotation;
+        this.displayId = displayId; this.density = density;
     }
     JSONObject json() throws Exception {
-        return new JSONObject().put("width", width).put("height", height).put("rotation", rotation)
-                .put("coordinateSpace", "display");
+        JSONObject value = new JSONObject().put("width", width).put("height", height).put("rotation", rotation)
+                .put("coordinateSpace", "display").put("source", "root-display-manager");
+        if (displayId >= 0) value.put("displayId", displayId);
+        if (density > 0) value.put("density", density);
+        return value;
     }
     boolean matches(JSONObject expected) {
-        return expected != null && expected.optInt("width") == width && expected.optInt("height") == height
-                && expected.optInt("rotation", -1) == rotation;
+        try { return ScreenGeometry.same(expected, json()); } catch (Exception unavailable) { return false; }
     }
     boolean contains(double x, double y) {
         return !Double.isNaN(x) && !Double.isInfinite(x) && !Double.isNaN(y) && !Double.isInfinite(y)

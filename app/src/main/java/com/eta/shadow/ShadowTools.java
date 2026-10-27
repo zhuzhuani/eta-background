@@ -34,6 +34,7 @@ public final class ShadowTools {
     ShadowTools(String sessionId, LineTransport transport) { this.sessionId = sessionId; this.transport = transport; }
     private volatile int display = -1;
     private JSONObject observedGeometry;
+    private JSONObject lastRejection;
 
     public String sessionInfo() {
         return "{\"mode\":" + (mode == null ? "null" : "\"" + mode + "\"")
@@ -287,6 +288,7 @@ public final class ShadowTools {
         mode = launched.optString("mode", "hidden");
         display = disp < 0 ? 0 : disp;
         observedGeometry = null;
+        rememberGeometry(launched);
         if ("hidden".equals(mode)) {
             for (int i = 0; i < 30; i++) {
                 try {
@@ -305,16 +307,26 @@ public final class ShadowTools {
 
     private String state() throws Exception {
         JSONObject o = new JSONObject();
-        o.put("session", new JSONObject()
-                .put("mode", mode == null ? JSONObject.NULL : mode).put("display", display));
         boolean engineOk = false;
         try {
             JSONObject st = new JSONObject(engine("{\"cmd\":\"status\"}"));
             o.put("engine", st);
             engineOk = st.optBoolean("ok", false);
+            if (engineOk && mode != null) {
+                boolean found = false;
+                JSONArray sessions = st.optJSONArray("sessions");
+                if (sessions != null) for (int i = 0; i < sessions.length(); i++) {
+                    JSONObject entry = sessions.optJSONObject(i);
+                    if (entry != null && sessionId.equals(entry.optString("sessionId")) && !entry.optBoolean("closing")
+                            && !entry.optBoolean("parked") && entry.optInt("displayId", display) == display) { found = true; break; }
+                }
+                if (!found) { resetSession(); o.put("sessionValid", false).put("reason", "SESSION_RELEASED"); }
+            }
         } catch (Throwable e) {
             o.put("engine", new JSONObject().put("ok", false).put("code", "ENGINE_DOWN"));
         }
+        o.put("session", new JSONObject().put("mode", mode == null ? JSONObject.NULL : mode).put("display", display));
+        if (lastRejection != null) o.put("lastInputRejection", lastRejection);
         boolean observerOk = ShadowSettings.observerReady();
         o.put("observer", new JSONObject().put("ok", observerOk));
         o.put("health", ShadowSettings.statusLine(ShadowSettings.app()));
@@ -334,6 +346,7 @@ public final class ShadowTools {
                 if (parked) parkedHints.remember(openedPackage, sessionId);
                 mode = null;
                 display = -1;
+                observedGeometry = null;
             }
         } catch (Throwable ignored) { }
         return out;
@@ -422,14 +435,14 @@ public final class ShadowTools {
             q.put("expectedGeometry", observedGeometry);
         String response = engine(q.toString());
         JSONObject result = new JSONObject(response);
-        if ("shot".equals(cmd) && result.optBoolean("ok")) observedGeometry = result.optJSONObject("geometry");
+        if ("shot".equals(cmd) && result.optBoolean("ok")) rememberGeometry(result);
         return response;
     }
 
     private String obs(String cmd, JSONObject a) throws Exception {
         // Read-only inspection works without an open session: display stays -1 and
         // the observer falls back to the main screen.
-        boolean readOnly = "list".equals(cmd) || "dump".equals(cmd) || "diag".equals(cmd);
+        boolean readOnly = "list".equals(cmd) || "dump".equals(cmd) || "diag".equals(cmd) || "wait".equals(cmd) || "idle".equals(cmd);
         requireSession();
         int callTimeout = 25000;
         if ("wait".equals(cmd) || "idle".equals(cmd)) {
@@ -443,7 +456,7 @@ public final class ShadowTools {
         if (!readOnly && observedGeometry != null) q.put("expectedGeometry", observedGeometry);
         String response = observer(q.toString(), callTimeout);
         JSONObject result = new JSONObject(response);
-        if (readOnly && result.optBoolean("ok")) observedGeometry = result.optJSONObject("geometry");
+        if (readOnly && result.optBoolean("ok")) rememberGeometry(result);
         return response;
     }
 
@@ -526,9 +539,32 @@ public final class ShadowTools {
 
     // ---------------------------------------------------------------- transport
 
+    private void rememberGeometry(JSONObject result) throws Exception {
+        JSONObject geometry = result.optJSONObject("geometry");
+        // An App may see accessibility windows but not the corresponding private Display.
+        // Never replace an authoritative snapshot with a partial/empty observer result.
+        if (ScreenGeometry.valid(geometry) && (!geometry.has("displayId") || geometry.optInt("displayId") == display))
+            observedGeometry = new JSONObject(geometry.toString());
+    }
+
+    private String received(String response) throws Exception {
+        JSONObject result = new JSONObject(response);
+        String code = result.optString("code");
+        if ("STALE_OBSERVATION".equals(code) || "INVALID_OBSERVATION".equals(code)
+                || "GEOMETRY_UNAVAILABLE".equals(code) || "GEOMETRY_CHANGED_DURING_OPERATION".equals(code)) {
+            lastRejection = new JSONObject();
+            for (String key : new String[]{"code", "reason", "expected", "actual", "changedFields", "frameAgeMs",
+                    "frameAgeChecked", "requestedFrameId", "availableFrameId", "windows", "operationMayHaveRun"})
+                if (result.has(key)) lastRejection.put(key, result.opt(key));
+            android.util.Log.w("EtaGeometry", lastRejection.toString());
+        }
+        if ("NO_SESSION".equals(code) || "SESSION_CLOSED".equals(code) || "STALE_SCREEN".equals(code)) resetSession();
+        return response;
+    }
+
     private String engine(String json) throws Exception {
         JSONObject request = new JSONObject(json).put("sessionId", sessionId);
-        return send(ENGINE_PORT, request.toString(), 25000);
+        return received(send(ENGINE_PORT, request.toString(), 25000));
     }
 
     private String observer(String json) throws Exception {
@@ -540,7 +576,7 @@ public final class ShadowTools {
         // command may already have run, so it must not be retried anywhere else
         // (the old build re-sent it to a legacy port that nothing binds).
         try {
-            return send(OBSERVER_PORT, new JSONObject(json).put("sessionId", sessionId).toString(), timeoutMs);
+            return received(send(OBSERVER_PORT, new JSONObject(json).put("sessionId", sessionId).toString(), timeoutMs));
         } catch (java.net.ConnectException e) {
             throw new IllegalStateException("OBSERVER_DOWN: accessibility observer not reachable");
         }

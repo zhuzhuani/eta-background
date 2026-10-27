@@ -217,46 +217,82 @@ public final class Boot {
         } catch (Throwable ignored) { }
     }
 
+    interface RootQuery { JSONObject execute(JSONObject request) throws Exception; }
+    static RootQuery rootQuery = Boot::queryRoot;
+
+    private static JSONObject queryRoot(JSONObject request) throws Exception {
+        try (Socket engine = new Socket()) {
+            engine.connect(new java.net.InetSocketAddress("127.0.0.1", 8733), 1000);
+            engine.setSoTimeout(2000);
+            java.io.PrintStream out = new java.io.PrintStream(engine.getOutputStream(), true, "UTF-8");
+            out.println(request);
+            String response = new java.io.BufferedReader(new java.io.InputStreamReader(engine.getInputStream(), "UTF-8")).readLine();
+            if (response == null) throw new java.io.IOException("Root closed geometry query");
+            return new JSONObject(response.replaceFirst("^RESULT:", ""));
+        }
+    }
+
+    private static JSONObject geometryState(JSONObject req) throws Exception {
+        int did = req.optInt("displayId", 0);
+        if (req.has("sessionId")) {
+            // Accessibility can see private-display windows even when the App's
+            // DisplayManager cannot see that Root-owned display. Root is authoritative.
+            try {
+                return rootQuery.execute(new JSONObject().put("cmd", "validate")
+                        .put("sessionId", req.optString("sessionId")).put("displayId", did));
+            } catch (Exception unavailable) {
+                return new JSONObject().put("ok", false).put("code", "SESSION_UNAVAILABLE")
+                        .put("reason", "ROOT_GEOMETRY_UNAVAILABLE").put("displayId", did);
+            }
+        }
+        // Root-to-observer callbacks carry a snapshot; querying the worker synchronously
+        // here would deadlock. Root compares again when the callback returns.
+        JSONObject geometry = req.optJSONObject("engineGeometry");
+        if (geometry == null || geometry.optInt("displayId", -1) != did) geometry = displayGeometry(did);
+        JSONObject invalid = ScreenGeometry.check(null, geometry);
+        return invalid != null ? invalid : new JSONObject().put("ok", true).put("geometry", geometry);
+    }
+
     private static JSONObject handle(JSONObject req) throws Exception {
         if (service == null) return new JSONObject().put("ok", false).put("code", "SERVICE_NOT_READY");
-        if (req.has("sessionId") && !"notify".equals(req.optString("cmd")) && !"ping".equals(req.optString("cmd"))) {
-            try (Socket engine = new Socket()) {
-                engine.connect(new java.net.InetSocketAddress("127.0.0.1", 8733), 1000);
-                engine.setSoTimeout(2000);
-                java.io.PrintStream out = new java.io.PrintStream(engine.getOutputStream(), true, "UTF-8");
-                out.println(new JSONObject().put("cmd", "validate").put("sessionId", req.optString("sessionId"))
-                        .put("displayId", req.optInt("displayId", -1)));
-                String response = new java.io.BufferedReader(new java.io.InputStreamReader(engine.getInputStream(), "UTF-8")).readLine();
-                if (response == null || !new JSONObject(response.replaceFirst("^RESULT:", "")).optBoolean("ok"))
-                    return new JSONObject().put("ok", false).put("code", "STALE_SCREEN");
-            } catch (Exception e) { return new JSONObject().put("ok", false).put("code", "SESSION_UNAVAILABLE"); }
-        }
-        int did = req.optInt("displayId", 0);
-        JSONObject geometry = displayGeometry(did);
-        JSONObject expected = req.optJSONObject("expectedGeometry");
-        if (expected != null && (!expected.optString("width").equals(geometry.optString("width")) ||
-                !expected.optString("height").equals(geometry.optString("height")) ||
-                !expected.optString("rotation").equals(geometry.optString("rotation"))))
-            return new JSONObject().put("ok", false).put("code", "STALE_OBSERVATION")
-                    .put("error", "显示方向或尺寸已改变，请重新观察后操作").put("geometry", geometry);
+        String command = req.optString("cmd");
+        if ("ping".equals(command) || "notify".equals(command)) return dispatch(req);
+        JSONObject before = geometryState(req);
+        if (!before.optBoolean("ok")) return before;
+        JSONObject geometry = before.optJSONObject("geometry");
+        JSONObject invalid = ScreenGeometry.check(req.optJSONObject("expectedGeometry"), geometry);
+        if (invalid != null) return invalid.put("windows", windowGeometry(req.optInt("displayId", 0)));
         JSONObject result = dispatch(req);
-        JSONObject after = displayGeometry(did);
-        if (!geometry.toString().equals(after.toString())) return new JSONObject().put("ok", false)
-                .put("code", "GEOMETRY_CHANGED_DURING_OPERATION").put("geometry", after)
-                .put("error", "操作期间显示方向改变；先重新观察，不要盲目重放可能已经生效的动作");
-        return result.put("geometry", after);
+        JSONObject after = geometryState(req);
+        boolean mutating = "click2".equals(command) || "tapnode".equals(command) || "settext".equals(command) || "scroll".equals(command);
+        if (!after.optBoolean("ok")) return after.put("operationMayHaveRun", mutating);
+        JSONObject actual = after.optJSONObject("geometry");
+        if (!ScreenGeometry.same(geometry, actual)) return ScreenGeometry.reject(
+                "GEOMETRY_CHANGED_DURING_OPERATION", "GEOMETRY_CHANGED_DURING_OPERATION", geometry, actual)
+                .put("operationMayHaveRun", mutating).put("windows", windowGeometry(req.optInt("displayId", 0)));
+        return result.put("geometry", actual);
     }
 
     private static JSONObject displayGeometry(int did) throws Exception {
         android.hardware.display.DisplayManager manager = service.getSystemService(android.hardware.display.DisplayManager.class);
         android.view.Display display = manager.getDisplay(did < 0 ? 0 : did);
-        JSONObject result = new JSONObject().put("coordinateSpace", "display");
-        if (display != null) {
-            android.graphics.Point size = new android.graphics.Point();
-            display.getRealSize(size);
-            result.put("width", size.x).put("height", size.y).put("rotation", display.getRotation());
+        if (display == null) return null;
+        android.graphics.Point size = new android.graphics.Point(); display.getRealSize(size);
+        android.util.DisplayMetrics metrics = new android.util.DisplayMetrics(); display.getRealMetrics(metrics);
+        return new JSONObject().put("coordinateSpace", "display").put("source", "observer-display-manager")
+                .put("displayId", display.getDisplayId()).put("width", size.x).put("height", size.y)
+                .put("rotation", display.getRotation()).put("density", metrics.densityDpi);
+    }
+
+    private static JSONArray windowGeometry(int did) throws Exception {
+        JSONArray windows = new JSONArray();
+        List<AccessibilityWindowInfo> list = windowsOf(did);
+        if (list != null) for (AccessibilityWindowInfo window : list) {
+            Rect bounds = new Rect(); window.getBoundsInScreen(bounds);
+            windows.put(new JSONObject().put("id", window.getId()).put("focused", window.isFocused())
+                    .put("bounds", new JSONArray().put(bounds.left).put(bounds.top).put(bounds.right).put(bounds.bottom)));
         }
-        return result;
+        return windows;
     }
 
     private static JSONObject dispatch(JSONObject req) throws Exception {
@@ -353,7 +389,7 @@ public final class Boot {
         int index = req.optInt("index", -1);
         List<AccessibilityNodeInfo> fields = new ArrayList<>();
         for (AccessibilityNodeInfo n : flatten(windowsOf(did), 400)) {
-            if (!n.isEditable() || !n.isEnabled()) continue;
+            if (!n.isEditable() || !n.isEnabled() || !n.isVisibleToUser()) continue;
             if (!viewId.isEmpty()) {
                 String v = n.getViewIdResourceName();
                 if (v == null || !v.contains(viewId)) continue;
@@ -557,9 +593,10 @@ public final class Boot {
                         .put("bounds", new JSONArray().put(r.left).put(r.top)
                                 .put(r.right).put(r.bottom)));
             }
-            return new JSONObject().put("ok", false).put("code", "NOT_FOUND")
+            return new JSONObject().put("ok", false).put("code", cand.length() == 0 ? "NO_NODES" : "NOT_FOUND")
                     .put("candidates", cand)
-                    .put("hint", "use one of the candidates (text/desc/vid) or tap a coordinate");
+                    .put("hint", cand.length() == 0 ? "此页没有可匹配的节点，请使用 screen_shot 与截图坐标操作" :
+                            "use one of the candidates (text/desc/vid) or tap a coordinate");
         }
         if (req.has("index") && index < 0) {
             return new JSONObject().put("ok", false).put("code", "INDEX_OUT_OF_RANGE")

@@ -54,6 +54,10 @@ public class VDriveSessionsTest {
         }
         public void keepAlive() { }
         public int displayId() { return 12; }
+        public JSONObject geometrySnapshot() throws Exception {
+            return new JSONObject().put("displayId", 12).put("width", 1080).put("height", 2376)
+                    .put("rotation", 0).put("density", 420).put("coordinateSpace", "display");
+        }
     }
     @Before public void setUp() {
         original = VDrive.factory;
@@ -87,6 +91,20 @@ public class VDriveSessionsTest {
         assertTrue(keep(id).getBoolean("ok"));
     }
     private int count() throws Exception { return VDrive.processLine("{\"cmd\":\"status\"}").getInt("count"); }
+
+    @Test public void geometryValidationDoesNotQueueBehindAWorkerWaitingForObserver() throws Exception {
+        String id = open("app.private"); FakeWorker worker = made.get(id);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        Future<JSONObject> holding = executor.submit(() -> send(id, "hold"));
+        try {
+            assertTrue(worker.entered.await(1, TimeUnit.SECONDS));
+            JSONObject result = VDrive.processLine(new JSONObject().put("cmd", "validate")
+                    .put("sessionId", id).put("displayId", 12).toString());
+            assertTrue(result.getBoolean("ok"));
+            assertEquals(1080, result.getJSONObject("geometry").getInt("width"));
+            assertFalse(holding.isDone());
+        } finally { worker.finish.countDown(); holding.get(2, TimeUnit.SECONDS); executor.shutdownNow(); }
+    }
 
     @Test public void nextOwnerReusesParkedAppAndLateOldCleanupCannotCloseIt() throws Exception {
         String old = open("app.same");

@@ -41,7 +41,7 @@ android {
         minSdk = 33
         targetSdk = 37
         // versionCode 规则：yyyyMMdd + 两位当日序号（01 起），发版时随 versionName 一起手动递增。
-        versionCode = 2026102705
+        versionCode = 2026102706
         versionName = "3.3.4"
 
         ndk {
@@ -120,6 +120,7 @@ android {
         disable += "HighAppVersionCode"
     }
 
+    sourceSets.getByName("main").java.srcDir(rootProject.file("etax/shared/src"))
     // Compile the separately packaged engine into JVM tests only, so its session protocol is exercised.
     sourceSets.getByName("test").java.srcDir(rootProject.file("etax/engine/src"))
 

@@ -21,12 +21,18 @@ class BackgroundScreenRecoveryTest {
         @Volatile var releaseAllowed = true
         var pendingLaunches = 0
         val calls = CopyOnWriteArrayList<String>()
+        val keeps = CopyOnWriteArrayList<Boolean>()
+        var lost = false
         override fun execute(name: String, arguments: String): String {
             calls += name
+            if (lost && name == "screen_tap") return "{\"ok\":false,\"code\":\"STALE_SCREEN\"}"
             if (name == "screen_open" && pendingLaunches-- > 0) return "{\"ok\":false,\"code\":\"CLEANUP_PENDING\"}"
             return "{\"ok\":true}"
         }
-        override fun release(keepFinished: Boolean) = attempts.incrementAndGet() > failures && releaseAllowed
+        override fun release(keepFinished: Boolean): Boolean {
+            keeps += keepFinished
+            return attempts.incrementAndGet() > failures && releaseAllowed
+        }
         override fun keepAlive() = Unit
     }
 
@@ -67,8 +73,26 @@ class BackgroundScreenRecoveryTest {
             tools.execute("screen_open", "{\"package\":\"app.two\"}")
             assertTrue(connections.first().attempts.get() >= 5)
             assertEquals(2, connections.size)
+            assertTrue(connections.first().keeps.all { it })
             assertEquals(1, registry.owners().size)
             assertEquals(listOf("screen_open"), connections.last().calls.toList())
+        } finally { tools.close() }
+    }
+
+    @Test fun lostEngineSessionClearsBindingWithoutReplayingTheFailedInput() {
+        val registry = ScreenLeaseRegistry()
+        val connections = CopyOnWriteArrayList<Connection>()
+        val tools = BackgroundScreenTools("lost", AgentRunController(), registry = registry,
+            connectionFactory = { Connection().also { connections += it } }, retryDelayMs = 20)
+        try {
+            tools.execute("screen_open", "{\"package\":\"app.one\"}")
+            connections.first().lost = true
+            assertTrue(tools.execute("screen_tap", "{}")!!.contains("STALE_SCREEN"))
+            tools.execute("screen_open", "{\"package\":\"app.one\"}")
+            assertEquals(2, connections.size)
+            assertEquals(listOf("screen_open", "screen_tap"), connections.first().calls.toList())
+            assertEquals(listOf("screen_open"), connections.last().calls.toList())
+            assertTrue(connections.first().keeps.all { !it })
         } finally { tools.close() }
     }
 
