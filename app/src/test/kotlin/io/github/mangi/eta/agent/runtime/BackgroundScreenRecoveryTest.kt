@@ -30,6 +30,20 @@ class BackgroundScreenRecoveryTest {
         override fun keepAlive() = Unit
     }
 
+    @Test fun resumedTaskMustObserveBeforeApplyingOldCoordinates() {
+        val connection = Connection()
+        val controller = AgentRunController()
+        val tools = BackgroundScreenTools("resume", controller, registry = ScreenLeaseRegistry(), connectionFactory = { connection })
+        try {
+            tools.execute("screen_open", "{\"package\":\"app.one\"}")
+            controller.pause(); controller.resume()
+            assertTrue(tools.execute("screen_tap", "{}")!!.contains("OBSERVE_AFTER_RESUME"))
+            assertFalse(connection.calls.contains("screen_tap"))
+            tools.execute("screen_dump", "{}")
+            assertEquals("{\"ok\":true}", tools.execute("screen_tap", "{}"))
+        } finally { tools.close() }
+    }
+
     @Test fun retriesOnlyEngineConfirmedPendingCleanupBeforeLaunch() {
         val connection = Connection().apply { pendingLaunches = 2 }
         val opened = mutableListOf<String>()

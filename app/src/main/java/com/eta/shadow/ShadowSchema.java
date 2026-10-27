@@ -40,9 +40,9 @@ public final class ShadowSchema {
         try {
             tools.put(tool("screen_open",
                     "在本任务独占的后台虚拟屏打开应用。同一应用被其他任务占用时等待释放。"
-                    + "不同应用可在最多三个虚拟屏上并行；需要第四个屏时停止最早的任务。"
+                    + "不同应用最多使用两个虚拟屏；额外任务等待空闲位置，不会抢占正在执行的任务。"
                     + "所以凡是涉及界面的操作都走这个工具，不要用 terminal 执行 am/input/screencap。"
-                    + "只传包名即可（如 com.tencent.mm）。操作结束后用 screen_finish 收尾。",
+                    + "只传包名即可（如 com.tencent.mm）。暂停恢复后必须先重新观察页面再操作；操作结束后用 screen_finish 收尾。",
                     props3("component", "string", "包名或 package/activity，例如 com.tencent.mm",
                             "package", "string", "包名（与 component 二选一）",
                             "app_name", "string", "应用显示名（前两者都没有时才用）"),

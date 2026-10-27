@@ -59,7 +59,7 @@ public class VDriveSessionsTest {
         assertTrue(made.isEmpty());
     }
     @Test public void failedCleanupKeepsSlotAndRefusesFurtherActions() throws Exception {
-        String first = open("app.one"); open("app.two"); open("app.three");
+        String first = open("app.one"); open("app.two");
         made.get(first).acknowledgeClose = false;
         assertEquals("CLEANUP_PENDING", send(first, "release_session").getString("code"));
         assertEquals("SESSION_CLOSED", send(first, "tap").getString("code"));

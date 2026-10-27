@@ -54,7 +54,6 @@ final class VDriveWorker implements VDrive.Worker {
     Handler work;
     DisplayManager dm;
     VirtualDisplay vd;
-    VirtualDisplayPower displayPower;
     ImageReader reader;
     int W = 1440, H = 3168, DPI = 560;
     volatile int displayId = -1;
@@ -256,7 +255,6 @@ final class VDriveWorker implements VDrive.Worker {
         workerThread = new HandlerThread("vdrive-work");
         workerThread.start();
         work = new Handler(workerThread.getLooper());
-        displayPower = new VirtualDisplayPower(ctx);
         work.postDelayed(new Runnable() { public void run() {
             watchdog();
             work.postDelayed(this, orphanAt > 0 ? 2000 : 10000);
@@ -265,14 +263,12 @@ final class VDriveWorker implements VDrive.Worker {
     }
 
     public int displayId() { return displayId; }
-    public String powerState() { return displayPower == null ? "idle" : displayPower.state; }
 
     public void keepAlive() {
         if (!retired) work.post(() -> {
             long now = android.os.SystemClock.elapsedRealtime();
             for (Session session : sessions.values()) session.lastCmdAt = now;
             lastCmdAt = now;
-            syncWake();
         });
     }
 
@@ -329,7 +325,6 @@ final class VDriveWorker implements VDrive.Worker {
                 }
             }
             tickIdleDisplay(now);
-            syncWake();
             if (EXIT_MS > 0 && sessions.isEmpty() && now - lastCmdAt > EXIT_MS) {
                 log("idle " + EXIT_MS + "ms with no sessions, exiting");
                 shutdown();
@@ -434,12 +429,6 @@ final class VDriveWorker implements VDrive.Worker {
         }
     }
 
-    /** The display owns its power lease; a completed screen releases it immediately. */
-    void syncWake() {
-        if (displayPower != null) displayPower.update(displayId,
-                !frames.isEmpty() && orphanAt == 0 && !retired);
-    }
-
     void destroyIdleDisplay() {
         Frame frame = frames.get(displayId);
         if (frame != null) frame.close();
@@ -450,7 +439,6 @@ final class VDriveWorker implements VDrive.Worker {
             if (fr != null && fr.bmp != null) fr.bmp.recycle();
             if (fr != null) { fr.bmp = null; fr.data = null; }
         }
-        syncWake();   // etax ③: 虚拟屏可能已清空，释放 wakelock
         resetGlobals();
     }
 
@@ -461,12 +449,6 @@ final class VDriveWorker implements VDrive.Worker {
      */
     void releaseSessionFully(Session x, boolean returnTask) {
         if (x == null) return;
-        // A launcher handover can race cancellation/eviction before the watchdog notices it.
-        // Restore that escaped task on every cleanup path, before forgetting its owner.
-        Integer escaped = taskOfPackage(x.pkg);
-        if (escaped != null && displayOfTask(escaped) == Display.DEFAULT_DISPLAY) {
-            restoreMainDisplayLayout(escaped);
-        }
         if (!x.protectedPkg.isEmpty()) {
             try { protectApp(x.protectedPkg, false); } catch (Throwable ignored) { }
         }
@@ -475,7 +457,6 @@ final class VDriveWorker implements VDrive.Worker {
                 Integer tid = x.taskId > 0 ? Integer.valueOf(x.taskId) : findRootTaskSafe(x.displayId);
                 if (tid != null && tid > 0) {
                     moveTask(tid, homeDisplay);
-                    if (homeDisplay == Display.DEFAULT_DISPLAY) restoreMainDisplayLayout(tid);
                     log("returned task " + tid + " to display " + homeDisplay);
                     Thread.sleep(120);
                 }
@@ -493,7 +474,6 @@ final class VDriveWorker implements VDrive.Worker {
             if (fr != null && fr.bmp != null) fr.bmp.recycle();
             if (fr != null) { fr.bmp = null; fr.data = null; }
         }
-        syncWake();   // etax ③: 虚拟屏可能已清空，释放 wakelock
         x.reader = null;
         x.vd = null;
         x.displayId = -1;
@@ -803,7 +783,6 @@ final class VDriveWorker implements VDrive.Worker {
         try {
             JSONObject out = dispatch(cmd0, req);
             save();
-            syncWake();
             return out;
         } catch (Throwable t) {
             save();
@@ -1125,10 +1104,9 @@ final class VDriveWorker implements VDrive.Worker {
             }
         }, work);
         log("image listener registered " + W + "x" + H + " surface=" + (reader.getSurface() != null));
-        // An isolated display group plus ALWAYS_UNLOCKED allows rendering while the physical
-        // screen is locked. OWN_FOCUS keeps its input focus independent of the user's screen.
+        // Isolate focus from the user's display. Screen-off execution is disabled.
         int flags = flag("PRIVATE") | flag("OWN_CONTENT_ONLY") | flag("SUPPORTS_TOUCH")
-                | flag("TRUSTED") | flag("OWN_DISPLAY_GROUP") | flag("ALWAYS_UNLOCKED") | flag("OWN_FOCUS")
+                | flag("TRUSTED") | flag("OWN_DISPLAY_GROUP") | flag("OWN_FOCUS")
                 | flag("STEAL_TOP_FOCUS_DISABLED") | flag("ROTATES_WITH_CONTENT")
                 | flag("DESTROY_CONTENT_ON_REMOVAL");
         long t = SystemClock.elapsedRealtime();
@@ -1136,7 +1114,6 @@ final class VDriveWorker implements VDrive.Worker {
         log("virtual display flags = 0x" + Integer.toHexString(flags));
         displayId = vd.getDisplay().getDisplayId();
         frames.put(displayId, fr);   // keyed by the display id, which only exists now
-        syncWake();                  // etax ③: 有虚拟屏了，持有 wakelock
         return new JSONObject().put("ok", true).put("displayId", displayId)
                 .put("createMs", SystemClock.elapsedRealtime() - t)
                 .put("width", W).put("height", H);
@@ -1190,7 +1167,7 @@ final class VDriveWorker implements VDrive.Worker {
         String front = homeFront;
         if (front == null || front.isEmpty() || !VDrive.mainDisplayOn()) return;
         // Independent display focus normally makes any main-screen intervention unnecessary.
-        if (front.equals(focusedComponent()) || "isolated_awake".equals(powerState())) return;
+        if (front.equals(focusedComponent())) return;
         try {
             exec("am start -n " + shellQuote(front) + " --activity-single-top");
             Thread.sleep(150);
@@ -1893,7 +1870,6 @@ final class VDriveWorker implements VDrive.Worker {
             save();
             Frame frame = frames.get(did);
             if (frame != null) frame.close();
-            syncWake();
             out.put("parked", true)
                     .put("hint", "任务已完成；可从桌面打开应用，后台屏幕最多保留 1 分钟");
         }
@@ -1935,7 +1911,6 @@ final class VDriveWorker implements VDrive.Worker {
             return fail("HANDOVER_FAILED", "task " + taskId + " stayed on display "
                     + displayOfTask(taskId) + " (wanted " + to + "); the hidden display was kept");
         }
-        boolean layoutRestored = to != Display.DEFAULT_DISPLAY || restoreMainDisplayLayout(taskId);
         if (sess != null) {
             sess.taskId = -1;
             sess.orphanAt = SystemClock.elapsedRealtime();
@@ -1957,7 +1932,7 @@ final class VDriveWorker implements VDrive.Worker {
         if (keepFront && !previousFront.isEmpty()) restoreHome(previousFront);
         return new JSONObject().put("ok", true).put("moved", true)
                 .put("taskId", taskId).put("toDisplay", to)
-                .put("layoutRestored", layoutRestored)
+                .put("layoutRestored", false)
                 .put("moveMs", SystemClock.elapsedRealtime() - t);
     }
 
@@ -2045,27 +2020,6 @@ final class VDriveWorker implements VDrive.Worker {
             } catch (Throwable ignored) { }
         }
         exec("am display move-stack " + taskId + " " + display);
-    }
-
-    boolean restoreMainDisplayLayout(int taskId) {
-        try {
-            if (displayOfTask(taskId) != Display.DEFAULT_DISPLAY || atmGetService == null || atmAllRootTasks == null) return false;
-            Object atm = atmGetService.invoke(null);
-            List<?> tasks = (List<?>) atmAllRootTasks.invoke(atm);
-            if (tasks != null) for (Object task : tasks) {
-                if (readInt(task.getClass(), task, "taskId") != taskId) continue;
-                if (TaskLayoutRestorer.restore(taskId, task)) {
-                    log("queued real-display configuration restore for task " + taskId);
-                    return true;
-                }
-            }
-            // Older ROMs may lack WindowContainerTransaction; still remove stale pixel bounds.
-            Method resize = reflect(Class.forName("android.app.IActivityTaskManager"), "resizeTask", int.class, Rect.class, int.class);
-            if (resize != null) resize.invoke(atm, taskId, null, 0);
-        } catch (Throwable error) {
-            log("main display layout restore failed: " + error.getClass().getSimpleName());
-        }
-        return false;
     }
 
     /** taskId whose base activity belongs to pkg, or null. */

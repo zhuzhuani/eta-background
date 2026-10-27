@@ -184,6 +184,7 @@ internal object AgentRuntimeWire {
     }
 
     enum class RunPhase(val wireValue: String) {
+        Queued("queued"),
         Preparing("preparing"),
         Running("running"),
         WaitingForGui("waiting_for_gui"),

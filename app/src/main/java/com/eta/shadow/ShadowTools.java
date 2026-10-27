@@ -461,21 +461,14 @@ public final class ShadowTools {
                     .put("sessionLimit", status.optInt("limit"));
             String build = status.optString("build");
             out.put("build", build.matches("[A-Za-z0-9._-]{1,80}") ? build : "unknown");
-            String restore = status.optString("displayRestore");
-            out.put("displayRestore", restore.matches("[a-z_]{1,64}") ? restore : "unknown")
-                    .put("compatibilityRestarts", status.optInt("compatibilityRestarts"));
             JSONArray sessions = status.optJSONArray("sessions");
-            int closing = 0, isolated = 0, unsupported = 0;
+            int closing = 0;
             if (sessions != null) for (int i = 0; i < sessions.length(); i++) {
                 JSONObject session = sessions.optJSONObject(i);
                 if (session == null) continue;
                 if (session.optBoolean("closing")) closing++;
-                String power = session.optString("displayPower");
-                if ("isolated_awake".equals(power)) isolated++;
-                if ("cpu_only_shared_group".equals(power) || "display_power_unavailable".equals(power)) unsupported++;
             }
-            out.put("closingCount", closing).put("isolatedAwakeDisplays", isolated)
-                    .put("screenOffUnsupportedDisplays", unsupported);
+            out.put("closingCount", closing);
         } catch (Exception ignored) {
             try { out.put("reachable", false); } catch (Exception unused) { }
         }

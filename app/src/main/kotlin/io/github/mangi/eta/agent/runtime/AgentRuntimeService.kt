@@ -95,6 +95,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     @Volatile private var destroyed = false
     @Volatile private var lastGuiOwnerRunId: String? = null
     private var displayedRun: RuntimeRunRegistry.Run? = null
+    private val pendingStarts = linkedMapOf<String, () -> Unit>()
 
     private var windowManager: WindowManager? = null
     private var glowView: ComposeView? = null
@@ -111,8 +112,16 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     private val ambientState = mutableStateOf(AgentOverlayState.Initial)
     private val screenReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == Intent.ACTION_SCREEN_OFF) removeAmbientWindows()
-            else publishExecutionState()
+            if (intent?.action == Intent.ACTION_SCREEN_OFF) {
+                runs.all().filterNot { it.session.isTerminal }.forEach { run ->
+                    if (!run.session.controller.isPaused) {
+                        run.pausedForScreenOff = true
+                        requestPause(run.runId)
+                    }
+                }
+                removeAmbientWindows()
+            }
+            publishExecutionState() // Screen-on never resumes work without the user's action.
         }
     }
     private val capsuleExpanded = mutableStateOf(false)
@@ -180,6 +189,8 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
 
     override fun onDestroy() {
         destroyed = true
+        pendingStarts.clear()
+        taskStates.value = emptyList()
         if (notificationOwner === this) notificationOwner = null
         runCatching { unregisterReceiver(screenReceiver) }
         setKeepScreenOn(false)
@@ -291,64 +302,81 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         isEtaProcess: Boolean,
     ) {
         val run = admitRun(incoming.request, replyTo, incoming) ?: return
-        thread(name = "agent-runtime-image-ingest") {
-            val prepared = runCatching {
-                run.entryPersistence.join()
-                run.session.controller.throwIfCancelled()
-                run.awaitPredecessors()
-                val request = AgentRuntimeRequestConfigResolver.constrainPresentation(
-                    AgentRuntimeImageTransfer.materialize(incoming), isEtaProcess,
-                )
-                if (!AgentRuntimeRequestConfigResolver.requiresRuntimeConfig(request)) {
-                    request
-                } else {
-                    val runtimeConfig = runBlocking {
-                        if (AgentRuntimeRequestConfigResolver.usesDefaultRuntimeConfig(request)) {
-                            RuntimeConfigRepository.currentRuntimeConfig()
-                        } else {
-                            RuntimeConfigRepository.oauthRuntimeConfigFor(
-                                providerId = request.config.providerId,
-                                authMode = request.config.authMode,
-                                modelName = request.config.model,
+        enqueueRun(run) {
+            thread(name = "agent-runtime-image-ingest") {
+                val prepared = runCatching {
+                    run.entryPersistence.join()
+                    run.session.controller.throwIfCancelled()
+                    run.awaitPredecessors()
+                    val request = AgentRuntimeRequestConfigResolver.constrainPresentation(
+                        AgentRuntimeImageTransfer.materialize(incoming), isEtaProcess,
+                    )
+                    if (!AgentRuntimeRequestConfigResolver.requiresRuntimeConfig(request)) {
+                        request
+                    } else {
+                        val runtimeConfig = runBlocking {
+                            if (AgentRuntimeRequestConfigResolver.usesDefaultRuntimeConfig(request)) {
+                                RuntimeConfigRepository.currentRuntimeConfig()
+                            } else {
+                                RuntimeConfigRepository.oauthRuntimeConfigFor(
+                                    providerId = request.config.providerId,
+                                    authMode = request.config.authMode,
+                                    modelName = request.config.model,
+                                )
+                            }
+                        } ?: throw RuntimeConfigUnavailableException()
+                        AgentRuntimeRequestConfigResolver.applyRuntimeConfig(request, runtimeConfig)
+                    }
+                }
+                mainHandler.post {
+                    run.releaseIncoming()
+                    if (destroyed || !runs.contains(run) || run.session.controller.isCancelled) return@post
+                    prepared.fold(
+                        onSuccess = { request ->
+                            val permissions = AgentRuntimePolicy.permissions(
+                                Prefs.localAgentPreferences()
                             )
-                        }
-                    } ?: throw RuntimeConfigUnavailableException()
-                    AgentRuntimeRequestConfigResolver.applyRuntimeConfig(request, runtimeConfig)
+                            run.prepared(
+                                request.copy(
+                                    config = AgentRuntimePolicy.constrain(request.config, permissions),
+                                ),
+                            )
+                            executePreparedRun(run)
+                        },
+                        onFailure = { throwable ->
+                            AndroidAgentLogger.warnThrottled("runtime_request_prepare_failed") {
+                                "Agent runtime request preparation failed: type=${throwable.safeLogType()}"
+                            }
+                            failBeforeExecution(
+                                run,
+                                when (throwable) {
+                                    is AgentRuntimeImageTransfer.ImageTransferException ->
+                                        throwable.message ?: "Agent Runtime 无法读取图片"
+                                    is RuntimeConfigUnavailableException ->
+                                        "请先在 Eta 中配置可用的模型"
+                                    else -> "Agent Runtime 无法准备请求"
+                                },
+                            )
+                        },
+                    )
                 }
             }
-            mainHandler.post {
-                run.releaseIncoming()
-                if (destroyed || !runs.contains(run) || run.session.controller.isCancelled) return@post
-                prepared.fold(
-                    onSuccess = { request ->
-                        val permissions = AgentRuntimePolicy.permissions(
-                            Prefs.localAgentPreferences()
-                        )
-                        run.prepared(
-                            request.copy(
-                                config = AgentRuntimePolicy.constrain(request.config, permissions),
-                            ),
-                        )
-                        executePreparedRun(run)
-                    },
-                    onFailure = { throwable ->
-                        AndroidAgentLogger.warnThrottled("runtime_request_prepare_failed") {
-                            "Agent runtime request preparation failed: type=${throwable.safeLogType()}"
-                        }
-                        failBeforeExecution(
-                            run,
-                            when (throwable) {
-                                is AgentRuntimeImageTransfer.ImageTransferException ->
-                                    throwable.message ?: "Agent Runtime 无法读取图片"
-                                is RuntimeConfigUnavailableException ->
-                                    "请先在 Eta 中配置可用的模型"
-                                else -> "Agent Runtime 无法准备请求"
-                            },
-                        )
-                    },
-                )
-            }
         }
+    }
+
+    private fun enqueueRun(run: RuntimeRunRegistry.Run, start: () -> Unit) {
+        pendingStarts[run.runId] = start
+        drainPendingRuns()
+    }
+
+    private fun drainPendingRuns() {
+        if (destroyed) return
+        pendingStarts.keys.removeAll { runs.get(it) == null }
+        while (true) {
+            val next = runs.claimNext(pendingStarts.keys) ?: break
+            pendingStarts.remove(next.runId)?.invoke()
+        }
+        publishExecutionState()
     }
 
     private fun startRun(
@@ -356,8 +384,10 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         replyTo: Messenger? = null,
     ) {
         val run = admitRun(request, replyTo) ?: return
-        run.prepared(request)
-        executePreparedRun(run)
+        enqueueRun(run) {
+            run.prepared(request)
+            executePreparedRun(run)
+        }
     }
 
     private fun admitRun(
@@ -383,7 +413,8 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                     AgentExecutionService.release("run:${request.runId}")
                     mainHandler.post {
                         if (!destroyed) {
-                            publishExecutionState()
+                            pendingStarts.remove(request.runId)
+                            drainPendingRuns()
                             updateKeepScreenOn()
                             if (runs.all().isEmpty() && displayedRun == null && !guiControl.state.value.userPaused) stopSelf()
                         }
@@ -445,6 +476,10 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                 AgentRunCheckpointStore.start(applicationContext, request)
             }, entryPersistenceIo)
         }
+        if (!isMainDisplayOn()) {
+            run.pausedForScreenOff = true
+            run.session.controller.pause()
+        }
         publishExecutionState()
         return run
     }
@@ -480,6 +515,12 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                 try { run.entryPersistence.join() } catch (_: Exception) {
                     RuntimeDiagnostics.record("entry_persistence", "checkpoint_failed")
                     failBeforeExecution(run, "无法保存任务记录，请稍后重试")
+                    return@thread
+                }
+                try {
+                    run.session.controller.throwIfCancelled()
+                } catch (_: AgentRunCancelledException) {
+                    failBeforeExecution(run, run.session.controller.cancellationReason)
                     return@thread
                 }
                 executeRun(run)
@@ -890,11 +931,14 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     }
 
     private fun requestResume() {
+        if (!isMainDisplayOn() || getSystemService(android.app.KeyguardManager::class.java).isKeyguardLocked) return
         val run = displayedRun?.takeIf { runs.contains(it) }
+        run?.pausedForScreenOff = false
         if (run == null || run.session.controller.isCancelled || guiControl.state.value.ownerRunId == run.runId) guiControl.resumeForUser()
         else run.session.controller.resume()
         run?.let { it.overlayState = it.overlayState.copy(phase = AgentOverlayPhase.RUNNING, status = AgentOverlayStatus.Continuing) }
-        publishExecutionState()
+        drainPendingRuns()
+        updateKeepScreenOn()
     }
 
     private fun handleNotificationAction(action: String, runId: String) {
@@ -1016,22 +1060,38 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         val selected = displayedRun?.takeIf { it in active } ?: active.lastOrNull()
         if (selected != null) {
             if (displayedRun !== selected) bindDisplayedRun(selected)
-            state.value = selected.backgroundScreenPhase?.takeUnless { selected.session.controller.isPaused }
-                ?.let { selected.overlayState.copy(status = AgentOverlayStatus.BackgroundScreen(it)) } ?: selected.overlayState
-            ambientState.value = state.value.copy(phase = if (active.any { !it.session.controller.isPaused })
-                AgentOverlayPhase.RUNNING else AgentOverlayPhase.PAUSED)
-            if (isMainDisplayOn()) ensureOverlayVisible()
+            state.value = selected.overlayState.copy(status = taskStatus(selected),
+                phase = if (selected.session.controller.isPaused) AgentOverlayPhase.PAUSED else selected.overlayState.phase)
+            val working = active.any { !it.queued && !it.session.controller.isPaused && !it.session.controller.isCancelled }
+            ambientState.value = state.value.copy(phase = if (working) AgentOverlayPhase.RUNNING else AgentOverlayPhase.PAUSED)
+            if (!isMainDisplayOn()) removeAmbientWindows()
+            else if (working) ensureOverlayVisible()
+            else {
+                // Preserve fallback pause controls while removing the animated edge window.
+                glowView?.let { view -> runCatching { windowManager?.removeView(view) } }
+                glowView = null
+                glowParams = null
+            }
         } else if (displayedRun?.hasExecutedForegroundTool != true && !guiControl.state.value.userPaused) {
             displayedRun = null
             removeAmbientWindows()
         }
-        AgentExecutionService.updateTasks(this, active.map(::notificationState))
+        val snapshots = active.map(::notificationState)
+        taskStates.value = snapshots
+        AgentExecutionService.updateTasks(this, snapshots)
+    }
+
+    private fun taskStatus(run: RuntimeRunRegistry.Run): AgentOverlayStatus = when {
+        run.session.controller.isCancelled -> AgentOverlayStatus.Stopping
+        run.session.controller.isPaused -> if (run.pausedForScreenOff) AgentOverlayStatus.ScreenOffPaused else AgentOverlayStatus.Paused
+        run.queued -> AgentOverlayStatus.Queued
+        run.backgroundScreenPhase != null -> AgentOverlayStatus.BackgroundScreen(run.backgroundScreenPhase!!)
+        else -> run.overlayState.status
     }
 
     private fun notificationState(run: RuntimeRunRegistry.Run) = TaskNotificationState(
         runId = run.runId, conversationId = run.conversationId, title = run.request.prompt,
-        status = run.backgroundScreenPhase?.takeUnless { run.session.controller.isPaused }
-            ?.let { AgentOverlayStatus.BackgroundScreen(it) } ?: run.overlayState.status,
+        status = taskStatus(run),
         streamPreview = if (run.overlayState.status == AgentOverlayStatus.GeneratingAnswer || run.overlayState.status == AgentOverlayStatus.ResultReady)
             run.overlayState.detailText.takeLast(80) else run.overlayState.thought.takeLast(80),
         paused = run.session.controller.isPaused,
@@ -1506,6 +1566,9 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         )
 
     companion object {
+        private val taskStates = MutableStateFlow<List<TaskNotificationState>>(emptyList())
+        internal val tasks = taskStates.asStateFlow()
+
         private val entryPersistenceIo = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "eta-entry-persistence").apply { isDaemon = true }
         }

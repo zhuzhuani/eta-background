@@ -27,6 +27,9 @@ internal class AgentRunController {
     val isPaused: Boolean
         get() = paused
 
+    @Volatile var resumeGeneration: Long = 0
+        private set
+
     @Volatile var cancellationReason: String = "已停止"
         private set
 
@@ -88,6 +91,7 @@ internal class AgentRunController {
      */
     fun resume() {
         lock.withLock {
+            if (paused) resumeGeneration++
             paused = false
             pauseCondition.signalAll()
         }

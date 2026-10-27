@@ -15,7 +15,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.PowerManager
 import io.github.mangi.eta.R
 import io.github.mangi.eta.agent.overlay.AgentOverlayStatus
 import io.github.mangi.eta.agent.overlay.localizedText
@@ -45,8 +44,6 @@ internal class AgentExecutionService : Service() {
     private var foregroundActive = false
     private var foregroundId = 0
     @Volatile private var startRejected = false
-    private var cpuWake: PowerManager.WakeLock? = null
-    private val renewCpuWake = Runnable { syncCpuWake() }
 
     override fun onCreate() {
         super.onCreate()
@@ -68,7 +65,8 @@ internal class AgentExecutionService : Service() {
     }
 
     private fun postForegroundNotification() {
-        val task = cards.values.firstOrNull { !it.completed } ?: cards.values.lastOrNull()
+        val task = cards.values.firstOrNull { !it.completed && !it.paused && it.status != AgentOverlayStatus.Queued }
+            ?: cards.values.firstOrNull { !it.completed } ?: cards.values.lastOrNull()
         val id = task?.let { idFor(it.runId) } ?: NOTIFICATION_ID
         if (!foregroundActive || foregroundId != id || task == null || posted[id] != task) {
             val card = notification(this, task, id)
@@ -91,7 +89,6 @@ internal class AgentExecutionService : Service() {
             }
         }
         publishCards(this, exceptId = id)
-        syncCpuWake()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -112,28 +109,7 @@ internal class AgentExecutionService : Service() {
         if (current) instance = null
         stopQueue.close(leases.drainOwner(owner))
         if (current) cards.values.filterNot { it.completed }.map { it.runId }.forEach { removeCard(this, it) }
-        releaseCpuWake()
         super.onDestroy()
-    }
-
-    private fun releaseCpuWake() {
-        mainHandler.removeCallbacks(renewCpuWake)
-        cpuWake?.takeIf { it.isHeld }?.release()
-        cpuWake = null
-    }
-
-    private fun syncCpuWake() {
-        mainHandler.removeCallbacks(renewCpuWake)
-        val needed = leases.count() > 0 && cards.values.any { !it.completed && !it.paused }
-        // A lease can also cover request preparation or result persistence with no active GUI card.
-        val saving = leases.count() > 0 && cards.values.none { !it.completed }
-        if (!needed && !saving) { releaseCpuWake(); return }
-        val wake = cpuWake ?: getSystemService(PowerManager::class.java)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "etax:execution").also {
-                it.setReferenceCounted(false); cpuWake = it
-            }
-        wake.acquire(120_000L)
-        mainHandler.postDelayed(renewCpuWake, 60_000L)
     }
 
     private fun stopTasks(startFailed: Boolean = false) {
@@ -144,7 +120,6 @@ internal class AgentExecutionService : Service() {
 
     private fun refreshNotification() {
         if (leases.closeOwnerIfIdle(owner)) {
-            releaseCpuWake()
             if (foregroundActive) {
                 foregroundActive = false
                 stopForeground(STOP_FOREGROUND_DETACH)
@@ -216,7 +191,6 @@ internal class AgentExecutionService : Service() {
                     changed = true
                 }
             }
-            instance?.syncCpuWake()
             if (changed || snapshot.isEmpty()) scheduleRefresh()
         }
 
@@ -259,7 +233,6 @@ internal class AgentExecutionService : Service() {
             }
         }
 
-        internal fun cpuExecutionHeld(): Boolean = instance?.cpuWake?.isHeld == true
         internal fun usesSystemTaskSurface(): Boolean = Build.VERSION.SDK_INT >= 36 &&
             Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1
         internal fun taskNotificationsEnabled(context: Context): Boolean {
@@ -292,6 +265,7 @@ internal class AgentExecutionService : Service() {
         private fun notification(context: Context, task: TaskNotificationState?, id: Int): Notification {
             val status = task?.status
             val completed = task?.completed == true
+            val progressing = !completed && task?.paused != true && status != AgentOverlayStatus.Queued
             val label = if (completed && status == AgentOverlayStatus.ResultReady) context.getString(R.string.background_task_completed)
                 else status?.localizedText(context.resources)
                     ?: context.resources.getQuantityString(R.plurals.execution_summary, leases.count(), leases.count())
@@ -308,16 +282,19 @@ internal class AgentExecutionService : Service() {
                     if (task.paused) R.string.overlay_resume else R.string.overlay_pause,
                     if (task.paused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause))
                 builder.addAction(runAction(context, task.runId, ACTION_STOP_RUN, R.string.overlay_stop_task, R.drawable.ic_assistant_stop))
+            } else if (completed && !task?.conversationId.isNullOrBlank()) {
+                builder.addAction(Notification.Action.Builder(Icon.createWithResource(context, R.drawable.ic_notification),
+                    context.getString(R.string.overlay_open_conversation), conversationIntent(context, task?.conversationId)).build())
             } else if (task == null) {
                 val stop = PendingIntent.getService(context, 1, Intent(context, AgentExecutionService::class.java).setAction(ACTION_STOP),
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
                 builder.addAction(Notification.Action.Builder(null, context.getString(R.string.execution_stop), stop).build())
             }
             if (task != null && usesSystemTaskSurface()) {
-                builder.setStyle(Notification.ProgressStyle().setProgressIndeterminate(!completed)
+                builder.setStyle(Notification.ProgressStyle().setProgressIndeterminate(progressing)
                     .setProgressSegments(listOf(Notification.ProgressStyle.Segment(100))).setProgress(if (completed) 100 else 0))
                     .setShortCriticalText(if (completed) label.take(7) else shortText(context, task.status))
-                if (!completed) builder.setRequestPromotedOngoing(true)
+                if (progressing) builder.setRequestPromotedOngoing(true)
             }
             return builder.build()
         }
@@ -331,6 +308,8 @@ internal class AgentExecutionService : Service() {
         }
 
         private fun shortText(context: Context, status: AgentOverlayStatus): String = when (status) {
+            AgentOverlayStatus.Queued -> context.getString(R.string.background_task_queued).take(7)
+            AgentOverlayStatus.ScreenOffPaused -> context.getString(R.string.overlay_paused)
             is AgentOverlayStatus.BackgroundScreen, AgentOverlayStatus.WaitingForModel -> status.localizedText(context.resources).take(7)
             is AgentOverlayStatus.RunningTool, is AgentOverlayStatus.HostedToolRunning -> context.getString(R.string.execution_chip_running)
             AgentOverlayStatus.Paused -> context.getString(R.string.overlay_paused)

@@ -22,17 +22,16 @@ private class ShadowScreenConnection(id: String) : ScreenToolConnection {
 }
 
 /** Capacity is reserved before launch; a cancelled owner keeps its slot until engine cleanup ACK. */
-internal class ScreenLeaseRegistry(private val capacity: Int = 3) {
-    private data class Lease(val owner: String, val app: String, val stop: () -> Unit, var evicting: Boolean = false)
+internal class ScreenLeaseRegistry(private val capacity: Int = 2) {
+    private data class Lease(val owner: String, val app: String)
     private val monitor = Object()
     private val leases = linkedMapOf<String, Lease>()
 
-    fun acquire(owner: String, app: String, checkCancelled: () -> Unit, stop: () -> Unit,
+    fun acquire(owner: String, app: String, checkCancelled: () -> Unit,
         onWaiting: (BackgroundScreenPhase) -> Unit = {}) {
         val deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(10)
         while (true) {
             checkCancelled()
-            var victim: (() -> Unit)? = null
             var waiting = BackgroundScreenPhase.WaitingForApp
             synchronized(monitor) {
                 if (leases[owner]?.app == app) return
@@ -40,17 +39,13 @@ internal class ScreenLeaseRegistry(private val capacity: Int = 3) {
                 if (leases.values.none { it.app == app }) {
                     waiting = BackgroundScreenPhase.ReleasingScreen
                     if (leases.size < capacity) {
-                        leases[owner] = Lease(owner, app, stop)
+                        leases[owner] = Lease(owner, app)
                         return
                     }
-                    if (leases.values.none { it.evicting }) {
-                        leases.values.first().also { it.evicting = true; victim = it.stop }
-                    }
                 }
-                if (victim == null) monitor.wait(100)
+                monitor.wait(250)
             }
             onWaiting(waiting)
-            victim?.invoke() // cancellation may initiate cleanup; never call it under the registry lock
             check(System.nanoTime() < deadline) { "等待后台应用或屏幕释放超时，请检查正在运行的任务" }
         }
     }
@@ -81,6 +76,7 @@ internal class BackgroundScreenTools(
     private var binding: Binding? = null
     @Volatile private var closed = false
     @Volatile private var phase: BackgroundScreenPhase? = null
+    private var observedGeneration = controller.resumeGeneration
 
     private fun phase(next: BackgroundScreenPhase?) {
         if (phase == next) return
@@ -96,6 +92,9 @@ internal class BackgroundScreenTools(
     private fun executeInternal(name: String, arguments: String): String? {
         if (!name.startsWith("screen_") && name != "terminal") return null
         controller.throwIfCancelled()
+        if (binding != null && controller.resumeGeneration != observedGeneration && name in MUTATING_TOOLS) {
+            return """{"ok":false,"code":"OBSERVE_AFTER_RESUME","error":"暂停后页面可能已经变化，请先调用 screen_dump、screen_list 或 screen_shot 重新观察，再决定下一步。此操作尚未执行。"}"""
+        }
         if (name == "screen_open") {
             val args = JSONObject(arguments)
             val app = sequenceOf("component", "package", "app_name")
@@ -117,7 +116,6 @@ internal class BackgroundScreenTools(
                 next = Binding(id, app, connectionFactory(id))
                 val candidate = next
                 registry.acquire(candidate.id, app, controller::throwIfCancelled,
-                    stop = { controller.cancel("已停止：三个虚拟屏已占满，本任务按创建顺序被新任务替换") },
                     onWaiting = ::phase)
                 synchronized(lock) {
                     if (closed || controller.isCancelled) {
@@ -131,6 +129,7 @@ internal class BackgroundScreenTools(
             }
             phase(BackgroundScreenPhase.OpeningApp)
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30)
+            controller.throwIfCancelled()
             var result = next.tools.execute(name, arguments)
             // A parked screen may need asynchronous engine cleanup after the app lease
             // has been returned. Retry only the explicit pre-launch rejection, never a timeout.
@@ -141,7 +140,9 @@ internal class BackgroundScreenTools(
                 controller.throwIfCancelled()
                 result = next.tools.execute(name, arguments)
             }
-            if (runCatching { JSONObject(result.orEmpty()).optBoolean("ok") }.getOrDefault(false)) onAppOpened(app)
+            if (runCatching { JSONObject(result.orEmpty()).optBoolean("ok") }.getOrDefault(false)) {
+                onAppOpened(app)
+            }
             return result
         }
         val current = synchronized(lock) { binding }
@@ -152,7 +153,11 @@ internal class BackgroundScreenTools(
         }
         if (current.closing.get()) return "屏幕正在回收，请先调用 screen_open 打开下一应用"
         if (name == "screen_finish") phase(BackgroundScreenPhase.RestoringDisplay)
+        val observationGeneration = controller.resumeGeneration
         return current.tools.execute(name, arguments).also { result ->
+            if (name in OBSERVATION_TOOLS && runCatching { JSONObject(result.orEmpty()).optBoolean("ok") }.getOrDefault(false)) {
+                observedGeneration = observationGeneration
+            }
             if (name == "screen_finish" && runCatching { JSONObject(result.orEmpty()).optBoolean("ok") }.getOrDefault(false)) {
                 // Release ownership at the tool's confirmed finish, not only when the model
                 // eventually finishes replying. The same run can then open the next app.
@@ -189,6 +194,8 @@ internal class BackgroundScreenTools(
     }
 
     companion object {
+        private val MUTATING_TOOLS = setOf("screen_tap", "screen_click", "screen_press", "screen_swipe", "screen_drag", "screen_scroll", "screen_text")
+        private val OBSERVATION_TOOLS = setOf("screen_dump", "screen_list", "screen_shot")
         private val sharedLeases = ScreenLeaseRegistry()
         private val maintenance = java.util.concurrent.Executors.newScheduledThreadPool(3) { runnable ->
             Thread(runnable, "eta-screen-maintenance").apply { isDaemon = true }

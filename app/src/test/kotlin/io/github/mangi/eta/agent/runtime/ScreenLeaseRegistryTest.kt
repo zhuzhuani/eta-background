@@ -8,34 +8,28 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 class ScreenLeaseRegistryTest {
-    @Test fun fourthTaskCancelsOldestButWaitsForCleanupAcknowledgement() {
+    @Test fun thirdTaskWaitsForCleanupAcknowledgementWithoutEvictingOwners() {
         val registry = ScreenLeaseRegistry()
-        val cancelled = CountDownLatch(1)
-        registry.acquire("a", "app.a", {}, { cancelled.countDown() })
-        registry.acquire("b", "app.b", {}, { fail("wrong victim") })
-        registry.acquire("c", "app.c", {}, { fail("wrong victim") })
+        registry.acquire("a", "app.a", {})
+        registry.acquire("b", "app.b", {})
         val admitted = CountDownLatch(1)
-        val worker = thread {
-            registry.acquire("d", "app.d", {}, {})
-            admitted.countDown()
-        }
+        val worker = thread { registry.acquire("c", "app.c", {}); admitted.countDown() }
         try {
-            assertTrue(cancelled.await(2, TimeUnit.SECONDS))
             assertFalse(admitted.await(150, TimeUnit.MILLISECONDS))
-            assertEquals(listOf("a", "b", "c"), registry.owners())
+            assertEquals(listOf("a", "b"), registry.owners())
             registry.release("a")
             assertTrue(admitted.await(2, TimeUnit.SECONDS))
-            assertEquals(listOf("b", "c", "d"), registry.owners())
+            assertEquals(listOf("b", "c"), registry.owners())
         } finally { worker.interrupt(); worker.join(2000) }
     }
 
     @Test fun sameAppWaitsWhileUnrelatedAppsCanAdvance() {
         val registry = ScreenLeaseRegistry()
-        registry.acquire("a", "shared.app", {}, { fail("same-app wait must not evict") })
+        registry.acquire("a", "shared.app", {})
         val admitted = CountDownLatch(1)
-        val worker = thread { registry.acquire("b", "shared.app", {}, {}); admitted.countDown() }
+        val worker = thread { registry.acquire("b", "shared.app", {}); admitted.countDown() }
         try {
-            registry.acquire("c", "another.app", {}, {})
+            registry.acquire("c", "another.app", {})
             assertFalse(admitted.await(150, TimeUnit.MILLISECONDS))
             assertEquals(listOf("a", "c"), registry.owners())
             registry.release("a")
@@ -48,10 +42,10 @@ class ScreenLeaseRegistryTest {
         val registry = ScreenLeaseRegistry()
         val cancelled = AtomicBoolean(false)
         val finished = CountDownLatch(1)
-        registry.acquire("a", "shared.app", {}, {})
+        registry.acquire("a", "shared.app", {})
         val worker = thread {
             try {
-                registry.acquire("b", "shared.app", { if (cancelled.get()) throw AgentRunCancelledException() }, {})
+                registry.acquire("b", "shared.app", { if (cancelled.get()) throw AgentRunCancelledException() })
             } catch (_: AgentRunCancelledException) { finished.countDown() }
         }
         try {

@@ -8,20 +8,19 @@ import java.util.*;
 
 /** Root transport. Mutable display/input/capture state lives in independent workers. */
 public final class VDrive {
-    static final String BUILD = "20261026-e29-background";
+    static final String BUILD = "20261027-e30-stable";
     interface Worker {
         JSONObject processLine(String request);
         boolean closeSession();
         void keepAlive();
         int displayId();
-        default String powerState() { return "unknown"; }
     }
     interface WorkerFactory { Worker create(Context context) throws Exception; }
     static WorkerFactory factory = VDriveWorker::new;
     private static Context context;
     private static long now() { return System.nanoTime() / 1000000L; }
     private static final Map<String, Slot> workers = new LinkedHashMap<>();
-    private static final int LIMIT = 3;
+    private static final int LIMIT = 2;
     private static final Set<String> retired = new LinkedHashSet<>();
     private static void retire(String id) {
         if (id.equals("legacy-mcp")) return;
@@ -117,13 +116,11 @@ public final class VDrive {
                 synchronized (workers) {
                     for (Map.Entry<String, Slot> e : workers.entrySet()) {
                         sessions.put(new JSONObject().put("sessionId", e.getKey()).put("package", e.getValue().pkg)
-                                .put("closing", e.getValue().closing).put("displayPower", e.getValue().worker.powerState()));
+                                .put("closing", e.getValue().closing));
                     }
                 }
                 return new JSONObject().put("ok", true).put("pong", true).put("build", BUILD)
-                        .put("sessions", sessions).put("count", sessions.length()).put("limit", LIMIT)
-                        .put("displayRestore", TaskLayoutRestorer.lastOutcome)
-                        .put("compatibilityRestarts", TaskLayoutRestorer.compatibilityRestarts);
+                        .put("sessions", sessions).put("count", sessions.length()).put("limit", LIMIT);
             }
             if (cmd.equals("quit")) {
                 List<String> ids;

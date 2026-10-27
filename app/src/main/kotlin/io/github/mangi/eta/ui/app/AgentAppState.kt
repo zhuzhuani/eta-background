@@ -87,6 +87,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import io.github.mangi.eta.agent.runtime.AgentRuntimeService
+import io.github.mangi.eta.agent.overlay.AgentOverlayStatus
+import io.github.mangi.eta.agent.overlay.localizedText
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
@@ -157,7 +161,16 @@ internal class AgentAppState(
     )
         private set
 
+    private var runtimeTaskStatuses: Map<String, AgentOverlayStatus> = emptyMap()
+
     init {
+        scope.launch {
+            AgentRuntimeService.tasks.map { tasks -> tasks.mapNotNull { task -> task.conversationId?.let { it to task.status } }.toMap() }
+                .distinctUntilChanged().collect { statuses ->
+                    runtimeTaskStatuses = statuses
+                    refreshConversationSummaries()
+                }
+        }
         refreshConversationSummaries()
         observeRuntimeSelection()
         runtimeRecoveryInProgress.set(true)
@@ -2303,8 +2316,8 @@ internal class AgentAppState(
                     mode = ConversationModeUi.Chat,
                     characterName = state.roleplay?.characterName ?: state.conversationCharacterName,
                     characterAvatarPath = state.roleplay?.avatarPath ?: state.conversationCharacterAvatarPath,
-                    isActiveRun = state.isStreaming,
-                    runStatus = when (runStore.guiStatus(id)) {
+                    isActiveRun = state.isStreaming || id in runtimeTaskStatuses,
+                    runStatus = runtimeTaskStatuses[id]?.localizedText(appContext.resources) ?: when (runStore.guiStatus(id)) {
                         GuiControlStatus.Waiting -> appContext.getString(R.string.run_waiting_for_gui)
                         GuiControlStatus.UserPaused -> appContext.getString(R.string.run_gui_user_paused)
                         else -> null

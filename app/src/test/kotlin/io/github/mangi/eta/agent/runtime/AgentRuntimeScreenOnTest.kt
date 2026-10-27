@@ -21,7 +21,7 @@ import org.robolectric.annotation.Config
 @Config(sdk = [36], application = Application::class)
 class AgentRuntimeScreenOnTest {
     @Test
-    fun physicalScreenOffKeepsBackgroundRunWithoutRecreatingOverlayWindows() {
+    fun physicalScreenOffPausesRunAndScreenOnRequiresManualResume() {
         val controller = Robolectric.buildService(AgentRuntimeService::class.java).create()
         val service = controller.get()
         val display = service.getSystemService(android.hardware.display.DisplayManager::class.java).getDisplay(0)
@@ -31,11 +31,16 @@ class AgentRuntimeScreenOnTest {
             shadowOf(service.getSystemService(android.os.PowerManager::class.java)).setIsInteractive(true)
             shadowOf(display).setState(android.view.Display.STATE_OFF)
             org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(true)
-            service.invoke("publishExecutionState")
+            service.field<android.content.BroadcastReceiver>("screenReceiver").onReceive(service, android.content.Intent(android.content.Intent.ACTION_SCREEN_OFF))
             assertFalse(run.session.controller.isCancelled)
-            assertFalse(run.session.controller.isPaused)
+            assertTrue(run.session.controller.isPaused)
             org.junit.Assert.assertNull(service.field<ComposeView?>("glowView"))
             org.junit.Assert.assertNull(service.field<ComposeView?>("capsuleView"))
+            shadowOf(display).setState(android.view.Display.STATE_ON)
+            service.field<android.content.BroadcastReceiver>("screenReceiver").onReceive(service, android.content.Intent(android.content.Intent.ACTION_SCREEN_ON))
+            assertTrue(run.session.controller.isPaused)
+            service.invoke("requestResume")
+            assertFalse(run.session.controller.isPaused)
         } finally {
             shadowOf(display).setState(android.view.Display.STATE_ON)
             org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(false)
@@ -217,6 +222,7 @@ class AgentRuntimeScreenOnTest {
             emptyList(),
         )
         val run = (registry.admit(request) { RuntimeRunRegistry.Run(request, session) } as RuntimeRunRegistry.Admission.Accepted).run
+        registry.claimNext(setOf(runId))
         run.prepared(request)
         if (ownsGui) field<GuiControlCoordinator>("guiControl").openRun(runId, session.controller).withAction { }
         shadowOf(Looper.getMainLooper()).idle()

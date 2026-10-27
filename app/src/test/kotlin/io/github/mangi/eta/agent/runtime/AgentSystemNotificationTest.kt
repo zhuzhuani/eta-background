@@ -45,6 +45,11 @@ class AgentSystemNotificationTest {
             assertNull(shadowOf(service.application).nextStartedActivity)
             finished.notification.contentIntent.send()
             assertEquals(target, shadowOf(service.application).nextStartedActivity.component?.packageName)
+            assertEquals(1, finished.notification.actions.size)
+            finished.notification.actions.single().actionIntent.send()
+            assertEquals("chat-app-click", shadowOf(service.application).nextStartedActivity
+                .getStringExtra(MainActivity.EXTRA_CONVERSATION_ID))
+            assertEquals(original.id, manager.activeNotifications.single().id)
         } finally {
             AgentExecutionService.release("app-click")
             AgentExecutionService.updateTasks(service, emptyList())
@@ -74,7 +79,7 @@ class AgentSystemNotificationTest {
             assertEquals(setOf("chat-a", "chat-b", "chat-c"), cards.keys)
             cards.forEach { (chat, entry) ->
                 val card = entry.notification
-                assertTrue(card.hasPromotableCharacteristics())
+                assertEquals(chat != "chat-b", card.hasPromotableCharacteristics())
                 assertEquals(2, card.actions.size)
                 assertTrue(card.actions.all { shadowOf(it.actionIntent).savedIntent.getStringExtra("run_id") == chat!!.removePrefix("chat-") })
                 assertFalse(card.actions.any { shadowOf(it.actionIntent).savedIntent.action == AgentExecutionService.ACTION_NEXT_TASK })
@@ -97,7 +102,7 @@ class AgentSystemNotificationTest {
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
             assertEquals(3, manager.activeNotifications.size)
             assertEquals("chat-a", shadowOf(firstDestination).savedIntent.getStringExtra(MainActivity.EXTRA_CONVERSATION_ID))
-            assertEquals("chat-b", shadowOf(shadowOf(service).lastForegroundNotification.contentIntent)
+            assertEquals("chat-c", shadowOf(shadowOf(service).lastForegroundNotification.contentIntent)
                 .savedIntent.getStringExtra(MainActivity.EXTRA_CONVERSATION_ID))
             val remainingC = manager.activeNotifications.single { it.id == cards.getValue("chat-c").id }
             assertTrue(remainingC.notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString().contains("新进度"))
@@ -107,42 +112,6 @@ class AgentSystemNotificationTest {
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
             controller.destroy()
             manager.cancelAll()
-        }
-    }
-
-    @Test fun screenOffExecutionHoldsCpuUntilPauseOrLastTaskRelease() {
-        val controller = Robolectric.buildService(AgentExecutionService::class.java).create()
-        val service = controller.get()
-        val power = service.getSystemService(android.os.PowerManager::class.java)
-        fun wake() = service.javaClass.getDeclaredField("cpuWake").apply { isAccessible = true }
-            .get(service) as? android.os.PowerManager.WakeLock
-        try {
-            shadowOf(power).setIsInteractive(false)
-            AgentExecutionService.acquire(service, "off-test", onStop = {})
-            AgentExecutionService.updateTasks(service, listOf(task("off")))
-            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
-            val activeLock = requireNotNull(wake())
-            assertTrue(activeLock.isHeld)
-            assertFalse(power.isInteractive)
-            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMinutes(3))
-            assertTrue(activeLock.isHeld)
-            AgentExecutionService.updateTasks(service, listOf(task("off", AgentOverlayStatus.Paused, true)))
-            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
-            assertFalse(activeLock.isHeld)
-            AgentExecutionService.updateTasks(service, listOf(task("off")))
-            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
-            val resumed = requireNotNull(wake())
-            assertTrue(resumed.isHeld)
-            AgentExecutionService.release("off-test")
-            shadowOf(Looper.getMainLooper()).idle()
-            assertFalse(resumed.isHeld)
-            assertFalse(power.isInteractive)
-        } finally {
-            AgentExecutionService.release("off-test")
-            AgentExecutionService.updateTasks(service, emptyList())
-            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
-            controller.destroy()
-            service.getSystemService(NotificationManager::class.java).cancelAll()
         }
     }
 
