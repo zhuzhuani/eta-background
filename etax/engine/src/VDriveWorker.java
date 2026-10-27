@@ -43,7 +43,6 @@ final class VDriveWorker implements VDrive.Worker {
     /** Build stamp: lets status() prove which dex is actually running. */
     final String BUILD = VDrive.BUILD;
     final long ORPHAN_EMPTY_MS = 20_000;   // task left the display -> release it
-    final long ORPHAN_HOLD_MS = 60_000;    // brief handover window after completion
     final long IDLE_MS = 300_000;    // screen exists but no commands at all
     final long EMPTY_MS = 20_000;    // display held but no session and no task
     final long EXIT_MS = 0;           // 0 = resident: never exit on idle
@@ -224,7 +223,7 @@ final class VDriveWorker implements VDrive.Worker {
         public void run() {
             if (retired) return;
             watchdog();
-            if (!retired) work.postDelayed(this, orphanAt > 0 ? 2000 : 10000);
+            if (!retired) work.postDelayed(this, orphanAt > 0 ? 5000 : 10000);
         }
     };
     private final java.util.concurrent.CountDownLatch released = new java.util.concurrent.CountDownLatch(1);
@@ -385,7 +384,7 @@ final class VDriveWorker implements VDrive.Worker {
         }
         if (x.orphanAt > 0) {
             long age = now - x.orphanAt;
-            if ((!occupied && age > ORPHAN_EMPTY_MS) || age > ORPHAN_HOLD_MS) retireFromPatrol(x);
+            if (!occupied && age > ORPHAN_EMPTY_MS) retireFromPatrol(x);
             return;
         }
         if (!occupied) {
@@ -761,7 +760,7 @@ final class VDriveWorker implements VDrive.Worker {
             // A command aimed at a parked session brings it back into use. "launch" is
             // excluded: it picks its own package and must not revive (or clear the parked
             // flag of) whatever happens to be the cursor.
-            if (!"launch".equals(cmd0)) { target.orphanAt = 0; orphanAt = 0; }
+            if (!"launch".equals(cmd0) && !"present".equals(cmd0)) { target.orphanAt = 0; orphanAt = 0; }
         } else if (req.has("displayId") && req.optInt("displayId", -1) == 0) {
             // an explicit main-screen command must not inherit a hidden display handle
             save();
@@ -799,6 +798,7 @@ final class VDriveWorker implements VDrive.Worker {
             case "key": return key(req);
             case "shot": return shot(req);
             case "handover": return handover(req);
+            case "present": return presentCompleted(req);
             case "finish": return finish(req);
             case "orphan":
                 if (current != null) {
@@ -1048,7 +1048,7 @@ final class VDriveWorker implements VDrive.Worker {
         return fr;
     }
 
-    /** Keep only the task container during the short completed-task handoff window. */
+    /** Keep the task container while awaiting the user's next action, without capture buffers. */
     private void stopCapture(Session session) {
         Frame frame = frames.remove(session.displayId);
         if (frame != null) frame.close();
@@ -1883,9 +1883,36 @@ final class VDriveWorker implements VDrive.Worker {
             work.removeCallbacks(patrol);
             work.postDelayed(patrol, 500);
             out.put("parked", true)
-                    .put("hint", "任务已完成；可从桌面打开应用，后台屏幕最多保留 1 分钟");
+                    .put("hint", "本轮操作已结束，页面留待继续或打开；新任务需要屏幕容量时可能回收");
         }
         return out.put("ok", true);
+    }
+
+    /** Move the hidden display's root task to another display, and verify it arrived. */
+    JSONObject presentCompleted(JSONObject req) throws Exception {
+        Session session = current;
+        try {
+            if (session == null || session.orphanAt <= 0) return fail("NOT_PARKED", "页面尚未交还");
+            JSONObject result = handover(new JSONObject().put("package", session.pkg).put("toDisplay", 0));
+            if (!result.optBoolean("ok")) return result;
+            // Raise the existing task; never deliver a new launcher Intent to a running game.
+            try {
+                Object atm = atmGetService.invoke(null);
+                Method focus = atm.getClass().getMethod("setFocusedTask", int.class);
+                focus.setAccessible(true);
+                focus.invoke(atm, result.getInt("taskId"));
+            } catch (Throwable focusFailure) { log("focus handed-over task: " + focusFailure.getClass().getSimpleName()); }
+            // Retain the task identity for the shared occupancy check. A successful move alone
+            // does not prove that a login/child task has also left the old display.
+            session.taskId = result.getInt("taskId");
+            if (session == current) { launchedTaskId = session.taskId; save(); }
+            disposition.compareAndSet(CLAIMED, PARKED);
+            tickSession(session, SystemClock.elapsedRealtime());
+            return result.put("released", session.vd == null);
+        } finally {
+            // A failed/expired RPC must not make the preserved screen permanently unclaimable.
+            disposition.compareAndSet(CLAIMED, PARKED);
+        }
     }
 
     /** Move the hidden display's root task to another display, and verify it arrived. */

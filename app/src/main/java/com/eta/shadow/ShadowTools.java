@@ -28,7 +28,10 @@ public final class ShadowTools {
     private volatile boolean parked;
     private String openedPackage;
     private static final ParkedScreenHints parkedHints = new ParkedScreenHints();
-    public ShadowTools(String sessionId) { this.sessionId = sessionId; }
+    interface LineTransport { String send(int port, String json, int timeoutMs) throws Exception; }
+    private final LineTransport transport;
+    public ShadowTools(String sessionId) { this(sessionId, null); }
+    ShadowTools(String sessionId, LineTransport transport) { this.sessionId = sessionId; this.transport = transport; }
     private volatile int display = -1;
 
     public String sessionInfo() {
@@ -434,6 +437,17 @@ public final class ShadowTools {
     public boolean closeSession(boolean keepFinished) {
         closed = true;
         try {
+            if (keepFinished && !parked && "hidden".equals(mode) && display > 0) {
+                // A model answer (including a question to the user) can end without screen_finish.
+                // Preserve that page too; a failed park is retried, never treated as permission to destroy it.
+                JSONObject result = new JSONObject(engine(new JSONObject().put("cmd", "finish").put("mode", "notify").toString()));
+                if (result.optBoolean("parked")) {
+                    parked = true;
+                    parkedHints.remember(openedPackage, sessionId);
+                } else if (!"NO_SESSION".equals(result.optString("code")) && !"SESSION_CLOSED".equals(result.optString("code"))) {
+                    return false;
+                }
+            }
             // release_session cancels the worker itself. A failed preliminary cancel must never
             // prevent the actual release request from reaching the engine.
             JSONObject reply = new JSONObject(send(ENGINE_PORT,
@@ -448,6 +462,12 @@ public final class ShadowTools {
             }
             return false;
         }
+    }
+
+    /** Explicit notification tap only: reuse the original Android task before considering a launcher. */
+    public static String presentCompleted(String runId, String pkg) throws Exception {
+        return new ShadowTools("user-handoff").send(ENGINE_PORT,
+                new JSONObject().put("cmd", "present_completed").put("runId", runId).put("package", pkg).toString(), 35000);
     }
 
     public void keepAlive() {
@@ -513,6 +533,7 @@ public final class ShadowTools {
     }
 
     private String send(int port, String json, int timeoutMs) throws Exception {
+        if (transport != null) return transport.send(port, json, timeoutMs);
         try (Socket s = new Socket()) {
             s.connect(new InetSocketAddress("127.0.0.1", port), 2000);
             s.setSoTimeout(timeoutMs);

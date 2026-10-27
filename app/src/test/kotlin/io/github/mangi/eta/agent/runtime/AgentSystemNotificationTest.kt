@@ -41,12 +41,19 @@ class AgentSystemNotificationTest {
             shadowOf(Looper.getMainLooper()).idle()
             val finished = manager.activeNotifications.single()
             assertEquals(original.id, finished.id)
-            assertEquals(target, shadowOf(finished.notification.contentIntent).savedIntent.component?.packageName)
+            val destination = shadowOf(finished.notification.contentIntent).savedIntent
+            assertEquals(CompletedAppActivity::class.java.name, destination.component?.className)
+            assertEquals(target, destination.getStringExtra(CompletedAppActivity.EXTRA_PACKAGE))
+            assertEquals("app-click", destination.getStringExtra(CompletedAppActivity.EXTRA_RUN_ID))
             assertNull(shadowOf(service.application).nextStartedActivity)
             finished.notification.contentIntent.send()
-            assertEquals(target, shadowOf(service.application).nextStartedActivity.component?.packageName)
-            assertEquals(1, finished.notification.actions.size)
-            finished.notification.actions.single().actionIntent.send()
+            assertEquals(CompletedAppActivity::class.java.name, shadowOf(service.application).nextStartedActivity.component?.className)
+            assertEquals(2, finished.notification.actions.size)
+            finished.notification.actions[0].actionIntent.send()
+            val continuation = shadowOf(service.application).nextStartedActivity
+            assertEquals("chat-app-click", continuation.getStringExtra(MainActivity.EXTRA_CONVERSATION_ID))
+            assertTrue(continuation.getBooleanExtra(MainActivity.EXTRA_COMPOSE_REPLY, false))
+            finished.notification.actions[1].actionIntent.send()
             assertEquals("chat-app-click", shadowOf(service.application).nextStartedActivity
                 .getStringExtra(MainActivity.EXTRA_CONVERSATION_ID))
             assertEquals(original.id, manager.activeNotifications.single().id)

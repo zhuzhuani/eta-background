@@ -8,7 +8,7 @@ import java.util.*;
 
 /** Root transport. Mutable display/input/capture state lives in independent workers. */
 public final class VDrive {
-    static final String BUILD = "20261027-e31-lifecycle";
+    static final String BUILD = "20261027-e32-retained";
     interface Worker {
         JSONObject processLine(String request);
         boolean closeSession();
@@ -129,6 +129,7 @@ public final class VDrive {
                 new Thread(() -> { try { Thread.sleep(300); } catch (Exception ignored) {} System.exit(0); }).start();
                 return ok();
             }
+            if (cmd.equals("present_completed")) return presentCompleted(req);
             if (cmd.equals("release_session")) {
                 if (req.optBoolean("keep", false)) {
                     synchronized (workers) {
@@ -177,7 +178,7 @@ public final class VDrive {
                         candidate.touched = now();
                         workers.put(id, candidate);
                     } else for (Map.Entry<String, Slot> entry : workers.entrySet()) {
-                        if (entry.getValue().parked && entry.getValue().inFlight == 0
+                        if (entry.getValue().parked && entry.getValue().inFlight == 0 && entry.getValue().worker.isParked()
                                 && (entry.getValue().pkg.equals(pkg) || workers.size() >= LIMIT)) {
                             reclaim = entry.getKey(); break;
                         }
@@ -237,10 +238,34 @@ public final class VDrive {
             long time = now();
             for (Map.Entry<String, Slot> entry : workers.entrySet()) {
                 Slot slot = entry.getValue();
-                if (slot.closing || time - slot.touched > (slot.parked ? 60000 : 300000)) expired.add(entry.getKey());
+                // A completed task is not a dead client. Its worker watches actual occupancy;
+                // time alone must not destroy a game while the user is deciding what to do.
+                if (slot.closing || (!slot.parked && time - slot.touched > 300000)) expired.add(entry.getKey());
             }
         }
         for (String id : expired) release(id);
+    }
+
+    private static JSONObject presentCompleted(JSONObject request) throws Exception {
+        String run = request.optString("runId"), pkg = request.optString("package");
+        if (run.isEmpty() || pkg.isEmpty()) return error("BAD_ARGUMENT", "缺少任务信息");
+        Slot target = null;
+        synchronized (workers) {
+            for (Map.Entry<String, Slot> entry : workers.entrySet()) {
+                Slot slot = entry.getValue();
+                if (!slot.pkg.equals(pkg)) continue;
+                if (!entry.getKey().startsWith(run + ":") || entry.getKey().lastIndexOf(':') != run.length()
+                        || !slot.parked || slot.closing || slot.inFlight != 0
+                        || !slot.worker.claimParked()) return error("APP_BUSY", "应用正在被其他操作使用，请先查看聊天");
+                target = slot;
+                target.inFlight++;
+                break;
+            }
+        }
+        if (target == null) return error("NOT_FOUND", "已没有保留的后台页面");
+        try {
+            return target.worker.processLine(new JSONObject().put("cmd", "present").put("package", pkg).toString());
+        } finally { synchronized (workers) { target.inFlight--; } }
     }
 
     private static void workerReleased(Slot released) {

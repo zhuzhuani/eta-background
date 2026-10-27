@@ -15,6 +15,7 @@ public class VDriveSessionsTest {
         JSONObject lastRequest;
         volatile boolean acknowledgeClose = true;
         boolean parked, capturing, movedToMain;
+        boolean failPresent;
         int closeCalls, reconcileCalls;
         Runnable releaseListener = () -> { };
         final CountDownLatch entered = new CountDownLatch(1), finish = new CountDownLatch(1);
@@ -24,6 +25,12 @@ public class VDriveSessionsTest {
             lastRequest = json;
             if (json.optString("cmd").equals("launch")) { parked = false; capturing = true; }
             if (json.optString("cmd").equals("finish")) { parked = true; capturing = false; }
+            if (json.optString("cmd").equals("present")) {
+                parked = true;
+                if (failPresent) return new JSONObject().put("ok", false).put("code", "HANDOVER_FAILED");
+                movedToMain = true;
+                releaseListener.run();
+            }
             if (json.optString("cmd").equals("hold")) {
                 entered.countDown();
                 try { finish.await(3, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
@@ -120,7 +127,7 @@ public class VDriveSessionsTest {
         assertTrue(send(next, "tap").getBoolean("ok"));
     }
 
-    @Test public void repeatedParkingDoesNotExtendRetentionAndCannotUndoClosing() throws Exception {
+    @Test public void completedPageSurvivesTimeExpiryAndCannotUndoClosing() throws Exception {
         java.util.concurrent.atomic.AtomicLong time = new java.util.concurrent.atomic.AtomicLong(1000000);
         VDrive.clock = time::get;
         String id = open("app.expiry");
@@ -129,13 +136,50 @@ public class VDriveSessionsTest {
         assertTrue(keep(id).getBoolean("ok"));
         time.addAndGet(2000);
         VDrive.reapExpired();
-        assertEquals(0, count());
+        assertEquals(1, count());
+        time.addAndGet(TimeUnit.HOURS.toMillis(1));
+        VDrive.reapExpired();
+        assertEquals(1, count());
+        assertEquals(0, made.get(id).closeCalls);
+        send(id, "release_session");
         String closing = open("app.closing");
         FakeWorker worker = made.get(closing);
         worker.acknowledgeClose = false;
         assertEquals("CLEANUP_PENDING", send(closing, "release_session").getString("code"));
         assertEquals("CLEANUP_PENDING", keep(closing).getString("code"));
         assertEquals(1, count());
+    }
+
+    @Test public void retainedPagesStillRespectTwoScreensAndYieldOnlyWhenCapacityIsNeeded() throws Exception {
+        String oldest = open("app.retained"); park(oldest);
+        String active = open("app.active");
+        String next = open("app.new");
+        assertEquals(2, count());
+        assertEquals(1, made.get(oldest).closeCalls);
+        assertEquals(0, made.get(active).closeCalls);
+        assertTrue(send(next, "tap").getBoolean("ok"));
+    }
+
+    @Test public void explicitTapUsesOriginalOwnerAndFailedHandoffKeepsThePage() throws Exception {
+        String id = "game-run:child:" + UUID.randomUUID(); ids.add(id);
+        assertTrue(VDrive.processLine(new JSONObject().put("cmd", "launch").put("sessionId", id)
+                .put("component", "app.game").toString()).getBoolean("ok"));
+        String request = new JSONObject().put("cmd", "present_completed").put("runId", "game-run:child").put("package", "app.game").toString();
+        assertEquals("APP_BUSY", VDrive.processLine(request).getString("code"));
+        park(id);
+        FakeWorker worker = made.get(id);
+        assertEquals("APP_BUSY", VDrive.processLine(request.replace("game-run:child", "game-run")).getString("code"));
+        worker.failPresent = true;
+        assertEquals("HANDOVER_FAILED", VDrive.processLine(request).getString("code"));
+        assertEquals(1, count());
+        assertEquals(0, worker.closeCalls);
+        assertEquals("APP_BUSY", VDrive.processLine(request.replace("game-run", "stale-run")).getString("code"));
+        worker.failPresent = false;
+        assertTrue(VDrive.processLine(request).getBoolean("ok"));
+        assertEquals("present", worker.lastRequest.getString("cmd"));
+        assertTrue(worker.movedToMain);
+        assertEquals(0, count());
+        assertEquals("NOT_FOUND", VDrive.processLine(request).getString("code"));
     }
 
     @Test public void unfinishedWorkCannotBeParkedOrReassigned() throws Exception {

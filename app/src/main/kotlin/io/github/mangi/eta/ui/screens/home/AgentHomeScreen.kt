@@ -39,6 +39,8 @@ internal fun AgentHomeScreen(
     conversationLoadFailed: Boolean = false,
     historyLoadState: ConversationHistoryLoadState = ConversationHistoryLoadState.Idle,
     isDrawerOpen: Boolean = false,
+    focusInputRequest: String? = null,
+    onInputFocusHandled: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     // Keep a bounded set of lightweight viewport/composer states; task execution stays in Runtime.
@@ -81,6 +83,8 @@ internal fun AgentHomeScreen(
                         pendingFileReferences = state.pendingFileReferences,
                         queuedMessages = state.queuedMessages,
                         inputSyncVersion = state.inputSyncVersion,
+                        focusInputRequest = focusInputRequest,
+                        onInputFocusHandled = onInputFocusHandled,
                         messageEdit = state.messageEdit,
                         onReasoningEffortChange = { onAction(AgentHomeAction.ReasoningEffortChanged(it)) },
                         onCompactContext = { onAction(AgentHomeAction.CompactContext) },

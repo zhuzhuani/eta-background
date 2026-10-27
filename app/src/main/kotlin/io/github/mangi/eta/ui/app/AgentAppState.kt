@@ -686,6 +686,18 @@ internal class AgentAppState(
     suspend fun openAssistantConversation(conversationKey: String): Boolean =
         openArchivedConversation(AgentRuntimeWire.ETA_VOICE_HANDOFF_SOURCE, conversationKey)
 
+    /** Notification replies must wait for assistant archives before selecting or focusing a chat. */
+    suspend fun openConversationById(conversationId: String): Boolean {
+        withContext(Dispatchers.IO) {
+            recoverRuntimeRuns()
+            importArchivedExternalRuns()
+        }
+        return withContext(Dispatchers.Main.immediate) {
+            if (conversationsById[conversationId] == null) false
+            else { selectConversation(conversationId); true }
+        }
+    }
+
     /** 打开外部入口按 [source] 与 [conversationKey] 归档的会话；先导入尚未入库的归档结果。 */
     suspend fun openArchivedConversation(source: String, conversationKey: String): Boolean {
         if (source.isBlank() || conversationKey.isBlank()) return false

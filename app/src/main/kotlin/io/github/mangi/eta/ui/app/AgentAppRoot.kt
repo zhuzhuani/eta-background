@@ -112,6 +112,7 @@ import top.yukonga.miuix.kmp.window.WindowDialog
 fun AgentAppRoot(
     assistantConversationKey: String? = null,
     requestedConversationId: String? = null,
+    composeReply: Boolean = false,
     onRequestedConversationOpened: () -> Unit = {},
     requestedArchivedConversation: ArchivedConversationRequest? = null,
     onArchivedConversationOpened: () -> Unit = {},
@@ -219,11 +220,14 @@ fun AgentAppRoot(
         RuntimeConfigRepository.ensureDefaults(EtaApp.serviceInstance)
     }
 
-    LaunchedEffect(requestedConversationId) {
+    var pendingComposeId by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(requestedConversationId, composeReply) {
         val conversationId = requestedConversationId ?: return@LaunchedEffect
-        agentState.selectConversation(conversationId)
-        conversationPaneOpen = false
-        navigator.popToHome()
+        if (agentState.openConversationById(conversationId)) {
+            pendingComposeId = conversationId.takeIf { composeReply }
+            conversationPaneOpen = false
+            navigator.popToHome()
+        }
         onRequestedConversationOpened()
     }
 
@@ -379,6 +383,8 @@ fun AgentAppRoot(
                         state = agentState.homeState,
                         modelPickerState = agentState.modelPickerState,
                         conversationKey = agentState.conversationPaneState.selectedConversationId,
+                        focusInputRequest = pendingComposeId?.takeIf { it == agentState.conversationPaneState.selectedConversationId },
+                        onInputFocusHandled = { pendingComposeId = null },
                         onAction = { action ->
                             when (action) {
                                 is AgentHomeAction.ReasoningEffortChanged ->

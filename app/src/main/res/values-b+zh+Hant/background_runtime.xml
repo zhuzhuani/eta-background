@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="background_task_completed">任務已完成</string>
+    <string name="background_task_completed">本輪已結束</string>
+    <string name="background_continue_instruction">繼續指令</string>
+    <string name="background_handoff_unavailable">背景頁面仍在使用或暫時無法接管，請查看聊天後重試。</string>
     <string name="background_waiting_model">等待模型回覆</string>
     <string name="background_waiting_app">等待應用程式空閒</string>
     <string name="background_releasing_screen">正在回收螢幕</string>

@@ -1,6 +1,5 @@
 package io.github.mangi.eta.agent.runtime
 
-import android.app.ActivityOptions
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -241,23 +240,27 @@ internal class AgentExecutionService : Service() {
                 manager.getNotificationChannel(CHANNEL)?.importance != NotificationManager.IMPORTANCE_NONE
         }
 
-        private fun conversationIntent(context: Context, conversationId: String?): PendingIntent {
+        private fun conversationIntent(context: Context, conversationId: String?, compose: Boolean = false): PendingIntent {
             val intent = Intent(context, MainActivity::class.java)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             conversationId?.takeIf(String::isNotBlank)?.let {
                 intent.action = MainActivity.ACTION_OPEN_CONVERSATION_ID
-                intent.data = Uri.Builder().scheme("eta-task").authority("conversation").appendPath(it).build()
+                intent.data = Uri.Builder().scheme("eta-task").authority(if (compose) "continue" else "conversation").appendPath(it).build()
                 intent.putExtra(MainActivity.EXTRA_CONVERSATION_ID, it)
+                intent.putExtra(MainActivity.EXTRA_COMPOSE_REPLY, compose)
             }
             return PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
 
         private fun destination(context: Context, task: TaskNotificationState?, id: Int): PendingIntent {
             if (task?.completed == true) {
-                val launch = task.targetPackage?.let { context.packageManager.getLaunchIntentForPackage(it) }
-                if (launch != null) return PendingIntent.getActivity(context, id,
-                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-                    ActivityOptions.makeBasic().setLaunchDisplayId(android.view.Display.DEFAULT_DISPLAY).toBundle())
+                if (!task.targetPackage.isNullOrBlank()) return PendingIntent.getActivity(context, id,
+                    Intent(context, CompletedAppActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                        .setData(Uri.Builder().scheme("eta-task").authority("open").appendPath(task.runId).build())
+                        .putExtra(CompletedAppActivity.EXTRA_RUN_ID, task.runId)
+                        .putExtra(CompletedAppActivity.EXTRA_PACKAGE, task.targetPackage),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             }
             return conversationIntent(context, task?.conversationId)
         }
@@ -274,7 +277,8 @@ internal class AgentExecutionService : Service() {
                 .setContentTitle(task?.title?.take(60)?.takeIf(String::isNotBlank) ?: context.getString(R.string.execution_title))
                 .setContentText(label + task?.streamPreview?.takeIf(String::isNotBlank)?.let { " · $it" }.orEmpty())
                 .setContentIntent(destination(context, task, id))
-                .setOngoing(!completed).setAutoCancel(completed).setOnlyAlertOnce(true)
+                // Keep the continue action available, including after an unsuccessful App handoff.
+                .setOngoing(!completed).setAutoCancel(completed && task?.targetPackage.isNullOrBlank()).setOnlyAlertOnce(true)
                 .setVisibility(Notification.VISIBILITY_PRIVATE)
             if (task != null && !completed) {
                 builder.addAction(runAction(context, task.runId,
@@ -283,6 +287,8 @@ internal class AgentExecutionService : Service() {
                     if (task.paused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause))
                 builder.addAction(runAction(context, task.runId, ACTION_STOP_RUN, R.string.overlay_stop_task, R.drawable.ic_assistant_stop))
             } else if (completed && !task?.conversationId.isNullOrBlank()) {
+                builder.addAction(Notification.Action.Builder(Icon.createWithResource(context, android.R.drawable.ic_menu_edit),
+                    context.getString(R.string.background_continue_instruction), conversationIntent(context, task?.conversationId, compose = true)).build())
                 builder.addAction(Notification.Action.Builder(Icon.createWithResource(context, R.drawable.ic_notification),
                     context.getString(R.string.overlay_open_conversation), conversationIntent(context, task?.conversationId)).build())
             } else if (task == null) {
