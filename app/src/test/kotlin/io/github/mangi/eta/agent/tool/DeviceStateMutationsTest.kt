@@ -19,6 +19,15 @@ import org.robolectric.annotation.Config
 class DeviceStateMutationsTest {
     private val context: Context get() = RuntimeEnvironment.getApplication()
 
+    @Test fun freezeAndUnfreezeAreRejectedBeforeAnyRootCommand() {
+        val mutations = DeviceStateMutations(context) { error("No state-changing command should run") }
+        for (action in listOf("freeze", "unfreeze")) {
+            val result = JSONObject(mutations.appStateControl(JSONObject().put("package_name", "com.autonavi.minimap").put("action", action)))
+            assertEquals("APP_STATE_MANUAL_ONLY", result.getString("code"))
+            assertFalse(result.getBoolean("command_accepted"))
+        }
+    }
+
     @Test
     fun settingReadbackUsesExplicitUserAndPreservesValueWhitespace() {
         val commands = mutableListOf<String>()

@@ -32,6 +32,7 @@ final class McpEndpoint {
     static final int BODY_READ_TIMEOUT_MS = 10000;
 
     private static ServerSocket server;
+    private static final java.util.concurrent.Semaphore CLIENTS = new java.util.concurrent.Semaphore(8);
     private static volatile int port = DEFAULT_PORT;
     private static volatile String mode;
     private static volatile int display = -1;
@@ -86,8 +87,9 @@ final class McpEndpoint {
                     while (true) {
                         try {
                             final Socket s = server.accept();
+                            if (!CLIENTS.tryAcquire()) { s.close(); continue; }
                             Thread c = new Thread(new Runnable() {
-                                public void run() { serve(s); }
+                                public void run() { try { serve(s); } finally { CLIENTS.release(); } }
                             });
                             c.setDaemon(true);
                             c.start();
@@ -133,7 +135,13 @@ final class McpEndpoint {
             String head = new String(hb.toByteArray(), "ISO-8859-1");
             String[] lines = head.split("\r\n");
             if (lines.length == 0 || lines[0].trim().isEmpty()) return;
-            VDrive.log("mcp " + lines[0].trim());
+            String bearer = "";
+            for (String header : lines) if (header.toLowerCase(java.util.Locale.ROOT).startsWith("authorization: bearer "))
+                bearer = header.substring("authorization: bearer ".length()).trim();
+            if (!com.eta.shadow.EngineWire.authorized(new JSONObject().put("auth", bearer), VDrive.credential)) {
+                writeHttp(s, 401, "engine credential required");
+                return;
+            }
 
             boolean hasLength = false;
             int contentLength = 0;
@@ -222,6 +230,7 @@ final class McpEndpoint {
             case 200: return "OK";
             case 202: return "Accepted";
             case 400: return "Bad Request";
+            case 401: return "Unauthorized";
             case 404: return "Not Found";
             case 408: return "Request Timeout";
             case 413: return "Payload Too Large";
@@ -410,9 +419,9 @@ final class McpEndpoint {
             s.connect(new InetSocketAddress("127.0.0.1", VDrive.obsPort()), 1500);
             s.setSoTimeout(20000);
             PrintStream w = new PrintStream(s.getOutputStream(), true, "UTF-8");
-            w.println(request);
+            w.println(new JSONObject(request.toString()).put("auth", VDrive.credential));
             BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
-            String line = r.readLine();
+            String line = com.eta.shadow.EngineWire.readLine(r, com.eta.shadow.EngineWire.RESPONSE_LIMIT);
             if (line == null) throw new IOException("observer closed connection");
             return line.startsWith("RESULT:") ? line.substring(7) : line;
         } catch (IOException e) {

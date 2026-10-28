@@ -20,6 +20,23 @@ import org.robolectric.annotation.Config
 class AppInspectionToolTest {
     private val context: Context get() = RuntimeEnvironment.getApplication()
 
+    @Test fun stoppedApplicationCanStillBeEnabledAndDefaultIsNotDisabled() {
+        shadowOf(context.packageManager).installPackage(PackageInfo().apply {
+            packageName = "example.stopped"
+            applicationInfo = ApplicationInfo().apply {
+                packageName = "example.stopped"
+                enabled = true
+                flags = ApplicationInfo.FLAG_STOPPED
+            }
+        })
+        val result = AppInspectionTool(context).inspect(JSONObject().put("package_name", "example.stopped"))
+        assertTrue(result.getBoolean("enabled"))
+        assertTrue(result.getBoolean("stopped"))
+        assertEquals(0, result.getInt("enabled_setting"))
+        assertEquals("package_manager", result.getString("source"))
+        assertTrue(result.getLong("observed_at_ms") > 0)
+    }
+
     @Test
     fun inspectsPackageWithoutLauncherAndPaginatesPermissions() {
         shadowOf(context.packageManager).installPackage(PackageInfo().apply {

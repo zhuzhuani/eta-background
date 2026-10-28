@@ -78,7 +78,7 @@ public final class ShadowSettings {
         Boolean cached = engineReady;
         if (cached != null && now - lastProbe < 3000L) return cached;
         lastProbe = now;
-        boolean ok = portOpen(ENGINE_PORT, 1200);
+        boolean ok = Engine.isReady(ctx, 1200);
         engineReady = ok;
         return ok;
     }

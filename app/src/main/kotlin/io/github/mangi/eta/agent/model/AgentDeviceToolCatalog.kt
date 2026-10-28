@@ -263,10 +263,10 @@ internal object AgentDeviceToolCatalog {
             .put(
                 function(
                     "app_state_control",
-                    "停止、冻结或解冻 Eta 所属 Android 用户中的一个精确包名，包括系统应用，并读回 stopped/enabled 状态。仅 verified=true 表示目标状态已确认；不跨用户或工作资料执行。",
+                    "停止 Eta 所属 Android 用户中的一个精确包名，并读回 stopped 状态。仅 verified=true 表示目标状态已确认；不跨用户执行。冻结、解冻应用需用户在系统设置中操作，本工具不提供。",
                     properties(
                         "package_name" to string("精确 Android 包名", 255),
-                        "action" to enumString("动作", "force_stop", "freeze", "unfreeze"),
+                        "action" to enumString("动作", "force_stop"),
                         "user_id" to userId(),
                     ),
                     "package_name", "action",

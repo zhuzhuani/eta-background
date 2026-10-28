@@ -33,6 +33,9 @@ jobs:
       - name: 配置构建环境
         uses: ./.github/actions/setup-build
 
+      - name: 引擎部署回归
+        run: python3 -m unittest discover -s etax/engine/tests -v
+
       - name: 从源码编译 root 引擎并内嵌
         run: bash etax/embed_engine.sh
 

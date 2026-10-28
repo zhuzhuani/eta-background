@@ -8,7 +8,31 @@ import java.util.*;
 
 /** Root transport. Mutable display/input/capture state lives in independent workers. */
 public final class VDrive {
-    static final String BUILD = "20261028-e35-cleanup";
+    static final String BUILD = "20261028-e36-recovery";
+    static java.util.function.BooleanSupplier health = () -> true;
+    static volatile boolean systemInvalid;
+    private static final String INSTANCE = UUID.randomUUID().toString();
+    private static int pid;
+    private static String dexHash = "";
+    static String credential;
+    private static final java.util.concurrent.Semaphore clients = new java.util.concurrent.Semaphore(16);
+    static void systemFailed() {
+        if (!systemInvalid) log("event=system_connection_lost instance=" + INSTANCE);
+        systemInvalid = true;
+    }
+    static boolean healthy() {
+        if (!health.getAsBoolean()) systemFailed();
+        return !systemInvalid;
+    }
+    static JSONObject failure(Throwable error) {
+        if (com.eta.shadow.EngineFailures.systemUnavailable(error)) systemFailed();
+        if (systemInvalid) {
+            JSONObject result = error("SYSTEM_RESTARTED", "Android 系统服务连接已失效，请等待引擎恢复后重新打开屏幕");
+            try { result.put("operationMayHaveRun", true); } catch (Exception ignored) { }
+            return result;
+        }
+        return error("ENGINE_ERROR", error.getClass().getSimpleName() + ": " + error.getMessage());
+    }
     interface Worker {
         JSONObject processLine(String request);
         boolean closeSession();
@@ -35,9 +59,9 @@ public final class VDrive {
         while (retired.size() > 4096) retired.remove(retired.iterator().next());
     }
     private static final class Slot {
-        final Worker worker;
+        volatile Worker worker;
         final String pkg;
-        boolean closing, parked;
+        volatile boolean closing, parked;
         int inFlight;
         volatile long touched = now();
         Slot(Worker worker, String pkg) { this.worker = worker; this.pkg = pkg; }
@@ -52,10 +76,16 @@ public final class VDrive {
         java.lang.reflect.Method getContext = at.getDeclaredMethod("getSystemContext");
         getContext.setAccessible(true);
         context = (Context) getContext.invoke(activityThread);
+        pid = android.os.Process.myPid();
+        health = new SystemServiceHealth();
+        credential = com.eta.shadow.EngineWire.readToken(new File("/data/local/tmp/eta/engine.token"));
+        try (InputStream input = new FileInputStream("/data/local/tmp/eta/vdrive.dex")) {
+            dexHash = com.eta.shadow.EngineWire.sha256(input);
+        }
         try (FileOutputStream out = new FileOutputStream("/proc/self/oom_score_adj")) {
             out.write("-800".getBytes("UTF-8"));
         } catch (Exception ignored) { }
-        int port = 0, mcpPort = 8735;
+        int port = 0, mcpPort = 0;
         for (String arg : args) {
             if (arg.startsWith("--tcp=")) port = Integer.parseInt(arg.substring(6));
             if (arg.startsWith("--mcp=")) {
@@ -81,7 +111,8 @@ public final class VDrive {
                 while (!server.isClosed()) {
                     try {
                         Socket client = server.accept();
-                        Thread t = new Thread(() -> serve(client), "vdrive-client");
+                        if (!clients.tryAcquire()) { client.close(); continue; }
+                        Thread t = new Thread(() -> { try { serve(client); } finally { clients.release(); } }, "vdrive-client");
                         t.setDaemon(true);
                         t.start();
                     } catch (IOException e) { log(e.getClass().getSimpleName()); }
@@ -98,11 +129,19 @@ public final class VDrive {
 
     private static void serve(Socket socket) {
         try (Socket client = socket) {
-            client.setSoTimeout(120000);
+            client.setSoTimeout(10000);
             BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream(), "UTF-8"));
             PrintStream out = new PrintStream(client.getOutputStream(), true, "UTF-8");
             String line;
-            while ((line = in.readLine()) != null) out.println("RESULT:" + processLine(line));
+            while ((line = com.eta.shadow.EngineWire.readLine(in, com.eta.shadow.EngineWire.REQUEST_LIMIT)) != null) {
+                JSONObject request = new JSONObject(line);
+                if (!com.eta.shadow.EngineWire.authorized(request, credential)) {
+                    out.println("RESULT:" + error("UNAUTHORIZED", "engine credential required"));
+                    return;
+                }
+                request.remove("auth");
+                out.println("RESULT:" + processLine(request.toString()));
+            }
         } catch (Exception e) { log("client: " + e.getClass().getSimpleName()); }
     }
 
@@ -111,32 +150,44 @@ public final class VDrive {
             JSONObject req = new JSONObject(payload);
             String cmd = req.optString("cmd");
             String id = req.optString("sessionId", "legacy-mcp");
-            if (cmd.equals("status") || cmd.equals("ping") || cmd.equals("sessions")) {
-                JSONArray sessions = new JSONArray();
-                synchronized (workers) {
-                    for (Map.Entry<String, Slot> e : workers.entrySet()) {
-                        sessions.put(new JSONObject().put("sessionId", e.getKey()).put("package", e.getValue().pkg)
-                                .put("closing", e.getValue().closing).put("parked", e.getValue().parked)
-                                .put("capturing", e.getValue().worker.isCapturing()).put("displayId", e.getValue().worker.displayId()));
-                    }
-                }
-                return new JSONObject().put("ok", true).put("pong", true).put("build", BUILD)
-                        .put("sessions", sessions).put("count", sessions.length()).put("limit", LIMIT);
-            }
             if (cmd.equals("quit")) {
-                List<String> ids;
-                synchronized (workers) { ids = new ArrayList<>(workers.keySet()); }
-                for (String key : ids) release(key);
-                new Thread(() -> { try { Thread.sleep(300); } catch (Exception ignored) {} System.exit(0); }).start();
+                // Exit stays bounded even when cleanup encounters a dead/hung Binder.
+                new Thread(() -> { try { Thread.sleep(1500); } catch (Exception ignored) {} System.exit(0); }, "vdrive-exit").start();
+                new Thread(() -> {
+                    List<String> ids;
+                    synchronized (workers) { ids = new ArrayList<>(workers.keySet()); }
+                    for (String key : ids) release(key);
+                }, "vdrive-cleanup").start();
                 return ok();
             }
+            if (cmd.equals("status") || cmd.equals("ping") || cmd.equals("sessions")) {
+                JSONArray sessions = new JSONArray();
+                Map<String, Slot> snapshot;
+                synchronized (workers) {
+                    snapshot = new LinkedHashMap<>(workers);
+                }
+                    for (Map.Entry<String, Slot> e : snapshot.entrySet()) {
+                        Worker worker = e.getValue().worker;
+                        sessions.put(new JSONObject().put("sessionId", e.getKey()).put("package", e.getValue().pkg)
+                                .put("closing", e.getValue().closing).put("parked", e.getValue().parked)
+                                .put("initializing", worker == null)
+                                .put("capturing", worker != null && worker.isCapturing()).put("displayId", worker == null ? -1 : worker.displayId()));
+                    }
+                boolean ready = healthy();
+                return new JSONObject().put("ok", ready).put("pong", ready).put("healthy", ready).put("build", BUILD)
+                        .put("code", ready ? "READY" : "SYSTEM_RESTARTED").put("pid", pid).put("instance", INSTANCE)
+                        .put("dexSha256", dexHash)
+                        .put("sessions", sessions).put("count", sessions.length()).put("limit", LIMIT);
+            }
+            if (!healthy() && !cmd.equals("release_session"))
+                return error("SYSTEM_RESTARTED", "Android 系统服务连接已失效；请等待引擎恢复后重新 screen_open");
             if (cmd.equals("present_completed")) return presentCompleted(req);
             if (cmd.equals("release_session")) {
                 if (req.optBoolean("keep", false)) {
                     synchronized (workers) {
                         Slot parked = workers.get(id);
                         if (parked == null) { retire(id); return ok(); }
-                        if (parked.closing || parked.inFlight != 0) return error("CLEANUP_PENDING", "屏幕仍在收尾");
+                        if (parked.worker == null || parked.closing || parked.inFlight != 0) return error("CLEANUP_PENDING", "屏幕仍在收尾");
                         if (!parked.worker.isParked()) return error("NOT_PARKED", "屏幕尚未完成收尾");
                         retire(id);
                         if (!parked.parked) {
@@ -188,6 +239,7 @@ public final class VDrive {
                 if (reclaim != null && !release(reclaim).optBoolean("ok")) return error("CLEANUP_PENDING", "等待旧屏幕清理");
             }
             Slot slot;
+            boolean initialize = false;
             synchronized (workers) {
                 // release can race the preliminary launch/reclaim check above.
                 if (retired.contains(id) && !cmd.equals("cancel")) return error("SESSION_CLOSED", "任务已结束");
@@ -203,24 +255,42 @@ public final class VDrive {
                     if (workers.size() >= LIMIT) return error(
                             workers.values().stream().anyMatch(value -> value.closing) ? "CLEANUP_PENDING" : "SESSION_LIMIT",
                             "等待旧屏幕清理完成");
-                    Slot created = new Slot(factory.create(context), pkg);
+                    Slot created = new Slot(null, pkg);
                     slot = created;
                     workers.put(id, created);
-                    created.worker.setReleaseListener(() -> workerReleased(created));
+                    initialize = true;
                 }
                 if (slot == null) return error("NO_SESSION", "请先打开本任务的屏幕");
                 slot.touched = now();
-                if (cmd.equals("keepalive")) { slot.worker.keepAlive(); return ok(); }
-                if (cmd.equals("validate")) {
+                if (slot.closing && !cmd.equals("cancel")) return error("SESSION_CLOSED", "屏幕正在释放");
+            }
+            // Reserve capacity above, but never hold the session monitor across system calls.
+            if (initialize) {
+                final Slot created = slot;
+                try {
+                    created.worker = factory.create(context);
+                    created.worker.setReleaseListener(() -> workerReleased(created));
+                } catch (Throwable error) {
+                    synchronized (workers) { if (workers.get(id) == created) workers.remove(id); }
+                    return failure(error);
+                }
+                boolean discarded;
+                synchronized (workers) { discarded = workers.get(id) != created || created.closing || retired.contains(id); }
+                if (discarded) { created.worker.closeSession(); return error("SESSION_CLOSED", "创建期间任务已结束"); }
+            }
+            if (slot.worker == null) return error("SESSION_STARTING", "屏幕正在初始化");
+            if (cmd.equals("keepalive")) { slot.worker.keepAlive(); return ok(); }
+            if (cmd.equals("validate")) {
                     if (slot.closing || req.optInt("displayId", -1) != slot.worker.displayId()) return error("STALE_SCREEN", "屏幕已失效");
                     // A direct DisplayManager read, never a queued worker RPC: the worker may
                     // be waiting for this observer callback on its own handler.
                     JSONObject geometry = slot.worker.geometrySnapshot();
                     if (!com.eta.shadow.ScreenGeometry.valid(geometry)) return error("STALE_SCREEN", "目标显示屏已不可用")
                             .put("reason", "DISPLAY_REMOVED").put("displayId", req.optInt("displayId", -1));
+                    synchronized (workers) {
+                        if (workers.get(id) != slot || slot.closing) return error("STALE_SCREEN", "屏幕已释放");
+                    }
                     return ok().put("geometry", geometry);
-                }
-                if (slot.closing && !cmd.equals("cancel")) return error("SESSION_CLOSED", "屏幕正在释放");
             }
             if (!id.equals("legacy-mcp")) {
                 if (cmd.equals("launch")) req.put("forceHidden", true);
@@ -235,7 +305,7 @@ public final class VDrive {
             }
             try { return slot.worker.processLine(req.toString()); }
             finally { synchronized (workers) { slot.inFlight--; } }
-        } catch (Exception e) { return error("ENGINE_ERROR", e.getClass().getSimpleName() + ": " + e.getMessage()); }
+        } catch (Exception e) { return failure(e); }
     }
 
     static void reapExpired() {
@@ -292,7 +362,7 @@ public final class VDrive {
             if (slot == null) return ok();
             slot.closing = true;
         }
-        if (!slot.worker.closeSession()) return error("CLEANUP_PENDING", "旧操作尚未退出，屏幕容量仍保留");
+        if (slot.worker == null || !slot.worker.closeSession()) return error("CLEANUP_PENDING", "旧操作尚未退出，屏幕容量仍保留");
         synchronized (workers) { if (workers.get(id) == slot) workers.remove(id); }
         return ok();
     }

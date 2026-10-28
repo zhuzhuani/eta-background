@@ -23,9 +23,10 @@ class BackgroundScreenRecoveryTest {
         val calls = CopyOnWriteArrayList<String>()
         val keeps = CopyOnWriteArrayList<Boolean>()
         var lost = false
+        var lostCode = "STALE_SCREEN"
         override fun execute(name: String, arguments: String): String {
             calls += name
-            if (lost && name == "screen_tap") return "{\"ok\":false,\"code\":\"STALE_SCREEN\"}"
+            if (lost && name == "screen_tap") return "{\"ok\":false,\"code\":\"$lostCode\"}"
             if (name == "screen_open" && pendingLaunches-- > 0) return "{\"ok\":false,\"code\":\"CLEANUP_PENDING\"}"
             return "{\"ok\":true}"
         }
@@ -47,6 +48,22 @@ class BackgroundScreenRecoveryTest {
             assertFalse(connection.calls.contains("screen_tap"))
             tools.execute("screen_dump", "{}")
             assertEquals("{\"ok\":true}", tools.execute("screen_tap", "{}"))
+        } finally { tools.close() }
+    }
+
+    @Test fun systemRestartReleasesOnlyLostBindingAndNeverReplaysInput() {
+        val connections = CopyOnWriteArrayList<Connection>()
+        val tools = BackgroundScreenTools("dead-system", AgentRunController(), registry = ScreenLeaseRegistry(),
+            connectionFactory = { Connection().also { connections += it } }, retryDelayMs = 20)
+        try {
+            tools.execute("screen_open", "{\"package\":\"app.one\"}")
+            connections.single().apply { lost = true; lostCode = "SYSTEM_RESTARTED" }
+            assertTrue(tools.execute("screen_tap", "{}")!!.contains("SYSTEM_RESTARTED"))
+            tools.execute("screen_open", "{\"package\":\"app.one\"}")
+            assertEquals(2, connections.size)
+            assertEquals(listOf("screen_open", "screen_tap"), connections.first().calls.toList())
+            assertEquals(listOf("screen_open"), connections.last().calls.toList())
+            assertTrue(connections.first().keeps.all { !it })
         } finally { tools.close() }
     }
 

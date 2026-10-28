@@ -145,6 +145,9 @@ internal class BackgroundScreenTools(
             if (runCatching { JSONObject(result.orEmpty()).optBoolean("ok") }.getOrDefault(false)) {
                 onAppOpened(app)
             }
+            if (runCatching { JSONObject(result.orEmpty()).optString("code") in LOST_SESSION_CODES }.getOrDefault(false)) {
+                cleanup(next, keepFinished = false)
+            }
             return result
         }
         val current = synchronized(lock) { binding }
@@ -202,7 +205,7 @@ internal class BackgroundScreenTools(
     }
 
     companion object {
-        private val LOST_SESSION_CODES = setOf("NO_SESSION", "SESSION_CLOSED", "STALE_SCREEN")
+        private val LOST_SESSION_CODES = setOf("NO_SESSION", "SESSION_CLOSED", "STALE_SCREEN", "SYSTEM_RESTARTED")
         private val MUTATING_TOOLS = setOf("screen_tap", "screen_click", "screen_press", "screen_swipe", "screen_drag", "screen_scroll", "screen_text")
         private val OBSERVATION_TOOLS = setOf("screen_dump", "screen_list", "screen_shot")
         private val sharedLeases = ScreenLeaseRegistry()

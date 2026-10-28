@@ -66,15 +66,11 @@ public final class Boot {
         android.util.Log.i("EtaShadow", "server started, engine released");
     }
 
-    /**
-     * The engine is deployed by the operator (`install_vdrive.sh`): one dex, one place.
-     * The app only reports what is on disk, so reinstalling the APK cannot silently put
-     * an older engine back in charge of a newer one.
-     */
+    /** Report the private staging directory; Engine verifies the running pair separately. */
     private static void reportEngine() {
         try {
-            java.io.File dex = new java.io.File(service.getFilesDir(), "vdrive.dex");
-            java.io.File verFile = new java.io.File(service.getFilesDir(), "vdrive.version");
+            java.io.File dex = new java.io.File(service.getFilesDir(), "eta-engine-stage/vdrive.dex");
+            java.io.File verFile = new java.io.File(service.getFilesDir(), "eta-engine-stage/vdrive.version");
             android.util.Log.i("EtaShadow", "engine on disk: "
                     + (dex.exists() ? dex.length() + "B" : "missing")
                     + " stamp=" + readText(verFile).trim());
@@ -195,24 +191,31 @@ public final class Boot {
 
     private static void serve(Socket sock) {
         try (Socket s = sock) {
+            s.setSoTimeout(10000);
             BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
-            String line = r.readLine();
+            String line = EngineWire.readLine(r, EngineWire.REQUEST_LIMIT);
             if (line == null) return;
             PrintStream w = new PrintStream(s.getOutputStream(), true, "UTF-8");
             while (line != null) {
                 line = line.trim();
-                if (line.isEmpty()) { line = r.readLine(); continue; }
+                if (line.isEmpty()) { line = EngineWire.readLine(r, EngineWire.REQUEST_LIMIT); continue; }
                 JSONObject res;
                 long t0 = SystemClock.elapsedRealtime();
                 try {
-                    res = handle(new JSONObject(line));
+                    JSONObject request = new JSONObject(line);
+                    if (!EngineWire.authorized(request, EngineCredential.get(service))) {
+                        w.println("RESULT:{\"ok\":false,\"code\":\"UNAUTHORIZED\"}");
+                        return;
+                    }
+                    request.remove("auth");
+                    res = handle(request);
                 } catch (Throwable e) {
                     res = new JSONObject().put("ok", false)
                             .put("error", e.getClass().getSimpleName() + ": " + e.getMessage());
                 }
                 res.put("ms", SystemClock.elapsedRealtime() - t0);
                 w.println("RESULT:" + res);
-                line = r.readLine();
+                line = EngineWire.readLine(r, EngineWire.REQUEST_LIMIT);
             }
         } catch (Throwable ignored) { }
     }
@@ -225,8 +228,8 @@ public final class Boot {
             engine.connect(new java.net.InetSocketAddress("127.0.0.1", 8733), 1000);
             engine.setSoTimeout(2000);
             java.io.PrintStream out = new java.io.PrintStream(engine.getOutputStream(), true, "UTF-8");
-            out.println(request);
-            String response = new java.io.BufferedReader(new java.io.InputStreamReader(engine.getInputStream(), "UTF-8")).readLine();
+            out.println(new JSONObject(request.toString()).put("auth", EngineCredential.get(service)));
+            String response = EngineWire.readLine(new java.io.BufferedReader(new java.io.InputStreamReader(engine.getInputStream(), "UTF-8")), EngineWire.RESPONSE_LIMIT);
             if (response == null) throw new java.io.IOException("Root closed geometry query");
             return new JSONObject(response.replaceFirst("^RESULT:", ""));
         }

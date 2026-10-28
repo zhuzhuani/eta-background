@@ -45,11 +45,14 @@ internal class RootShellTerminalController(
         )
     }
 
-    fun executeTool(name: String, args: JSONObject): String = when (name) {
-        "terminal" -> terminal(args)
-        "terminal_job" -> terminalJob(args)
-        "terminal_daemon" -> terminalDaemon(args)
-        else -> errorJson("UNKNOWN_TOOL", "未知终端工具：$name")
+    fun executeTool(name: String, args: JSONObject): String {
+        if (AppStateCommandGuard.rejects(args)) return AppStateCommandGuard.rejection()
+        return when (name) {
+            "terminal" -> terminal(args)
+            "terminal_job" -> terminalJob(args)
+            "terminal_daemon" -> terminalDaemon(args)
+            else -> errorJson("UNKNOWN_TOOL", "未知终端工具：$name")
+        }
     }
 
     private fun terminal(args: JSONObject): String = when (args.optString("action", "exec").lowercase()) {

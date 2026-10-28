@@ -50,6 +50,9 @@ public final class Engine {
     private static volatile long lastAttemptAt = 0L;
     private static volatile String lastReason = null;
     private static volatile String bundledVer = null;
+    private static volatile String bundledHash;
+    private static volatile long nextAttemptAt;
+    private static int failures;
 
     private Engine() {}
 
@@ -61,12 +64,13 @@ public final class Engine {
      * 明确失败（无 root / 没打进包）返回 FAILED。
      */
     public static int ensureRunningBounded(Context ctx, long waitMs) {
-        if (portOpen(800)) return UP;
+        if (isReady(ctx, 800)) return UP;
         if (ctx == null) { lastReason = "NO_CONTEXT"; return FAILED; }
         kickWorker(ctx);
+        if (!WORKER_BUSY.get() && lastReason != null) return FAILED;
         long deadline = SystemClock.elapsedRealtime() + waitMs;
         while (SystemClock.elapsedRealtime() < deadline) {
-            if (portOpen(500)) return UP;
+            if (isReady(ctx, 500)) return UP;
             String r = lastReason;
             // worker 已结束且是终态失败：不用再等
             if (!WORKER_BUSY.get()
@@ -75,7 +79,7 @@ public final class Engine {
             }
             try { Thread.sleep(300); } catch (InterruptedException e) { break; }
         }
-        if (portOpen(500)) return UP;
+        if (isReady(ctx, 500)) return UP;
         return WORKER_BUSY.get() ? STARTING : FAILED;
     }
 
@@ -96,6 +100,10 @@ public final class Engine {
                     + "请确认手机已 root，并在 Magisk/KernelSU 里允许 io.github.mangi.etax 使用 root，然后重试。"
                     + "（刚重启过的话临时 root 已失效，需要先重新获取 root。）";
         }
+        if ("START_FAILED".equals(r) || "INSTALL_FAILED".equals(r) || "TIMEOUT".equals(r)) {
+            return "后台引擎恢复尚未完成，已限制重试频率，请稍后重新打开后台屏幕；"
+                    + "不要重复发送可能已执行的点击或消息。可在设置中导出诊断查看恢复结果。";
+        }
         return ShadowSettings.engineFixHint();
     }
 
@@ -103,16 +111,24 @@ public final class Engine {
 
     private static void kickWorker(final Context ctx) {
         long now = SystemClock.elapsedRealtime();
+        if (now < nextAttemptAt) return;
         // 节流：最近一次尝试刚因终态原因失败（无 root / 没打进包），6s 内不再踢，避免反复弹授权框
         String r = lastReason;
         if (now - lastAttemptAt < 6000L && ("NO_ROOT".equals(r) || "NOT_BUNDLED".equals(r))) return;
         if (!WORKER_BUSY.compareAndSet(false, true)) return;   // 已有 worker 在跑
         lastAttemptAt = now;
+        lastReason = null;
+        EngineJournal.record(ctx, "engine_start", "requested");
         Thread t = new Thread(new Runnable() {
             public void run() {
                 try { doEnsure(ctx); }
-                catch (Throwable ignored) { }
-                finally { WORKER_BUSY.set(false); }
+                catch (Throwable error) { lastReason = "START_FAILED"; }
+                finally {
+                    EngineJournal.record(ctx, "engine_result", lastReason == null ? "ready" : lastReason);
+                    if (lastReason == null) { failures = 0; nextAttemptAt = 0; }
+                    else nextAttemptAt = SystemClock.elapsedRealtime() + Math.min(60000L, 5000L << Math.min(failures++, 4));
+                    WORKER_BUSY.set(false);
+                }
             }
         }, "eta-engine-start");
         t.setDaemon(true);
@@ -122,54 +138,47 @@ public final class Engine {
     private static void doEnsure(Context ctx) {
         File stage = stageAssets(ctx);
         if (stage == null) { lastReason = "NOT_BUNDLED"; return; }
-        boolean force = false;
-        if (portOpen(800)) {
-            // S2：引擎在跑，但 build 和内置版本不一致 → 强制重启到内置 dex，保证 APK⇄引擎配套
-            String running = probeBuild(2000);
-            String want = bundledVersion(ctx);
-            if (running != null && want != null && !want.isEmpty() && !want.equals(running)) {
-                android.util.Log.i(TAG, "engine build " + running + " != bundled " + want + ", restarting");
-                force = true;
-            } else if (running != null) {
-                lastReason = null;
-                ShadowSettings.markEngineReady(true);
-                return;                                        // 已在跑且配套，什么都不用做
-            }
-        }
-        runSu(buildScript(stage.getAbsolutePath(), force));
-        if (portOpen(1500)) {
+        if (isReady(ctx, 1500)) {
             lastReason = null;
-            ShadowSettings.markEngineReady(true);              // 立即刷新健康缓存，不等 3s 过期
+            ShadowSettings.markEngineReady(true);
+            return;
+        }
+        ShadowSettings.markEngineReady(false);
+        runSu(buildScript(stage.getAbsolutePath()));
+        boolean ready = isReady(ctx, 2000);
+        ShadowSettings.markEngineReady(ready);
+        if (ready) lastReason = null;
+        else if (lastReason == null) lastReason = "START_FAILED";
+    }
+
+    static boolean isReady(Context ctx, int timeoutMs) {
+        if (ctx == null) return false;
+        try {
+            org.json.JSONObject status = probeStatus(ctx, timeoutMs);
+            String want = bundledVersion(ctx);
+            return status.optBoolean("ok") && status.optBoolean("healthy") && want != null
+                    && want.equals(status.optString("build")) && bundledHash(ctx).equals(status.optString("dexSha256"));
+        } catch (Exception error) { return false; }
+    }
+
+    static org.json.JSONObject probeStatus(Context ctx, int timeoutMs) throws Exception {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("127.0.0.1", ENGINE_PORT), Math.min(1000, timeoutMs));
+            socket.setSoTimeout(timeoutMs);
+            PrintStream out = new PrintStream(socket.getOutputStream(), true, "UTF-8");
+            out.println(new org.json.JSONObject().put("cmd", "status").put("auth", EngineCredential.get(ctx)));
+            String line = EngineWire.readLine(new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8")), 65536);
+            if (line == null) throw new java.io.EOFException("engine closed health check");
+            return new org.json.JSONObject(line.startsWith("RESULT:") ? line.substring(7) : line);
         }
     }
 
-    // ------------------------------------------------------------- internals
-
-    private static boolean portOpen(int timeoutMs) {
-        try (Socket s = new Socket()) {
-            s.connect(new InetSocketAddress("127.0.0.1", ENGINE_PORT), timeoutMs);
-            return true;
-        } catch (Throwable t) {
-            return false;
+    private static String bundledHash(Context ctx) throws Exception {
+        String hash = bundledHash;
+        if (hash == null) try (InputStream input = ctx.getAssets().open("vdrive.dex")) {
+            bundledHash = hash = EngineWire.sha256(input);
         }
-    }
-
-    /** 问引擎的 build 版本串（status 命令），拿不到返回 null。 */
-    private static String probeBuild(int timeoutMs) {
-        try (Socket s = new Socket()) {
-            s.connect(new InetSocketAddress("127.0.0.1", ENGINE_PORT), 1000);
-            s.setSoTimeout(timeoutMs);
-            PrintStream w = new PrintStream(s.getOutputStream(), true, "UTF-8");
-            w.println("{\"cmd\":\"status\"}");
-            BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
-            String line = r.readLine();
-            if (line == null) return null;
-            if (line.startsWith("RESULT:")) line = line.substring(7);
-            String build = new org.json.JSONObject(line).optString("build", "");
-            return build.isEmpty() ? null : build;
-        } catch (Throwable t) {
-            return null;
-        }
+        return hash;
     }
 
     private static String bundledVersion(Context ctx) {
@@ -190,77 +199,51 @@ public final class Engine {
 
     /**
      * 把 assets 里的引擎释放到应用私有目录（无需 root，总能写）。root 脚本随后从这里
-     * 复制到 /data/local/tmp/eta/。只在文件缺失或大小变化时重写，省去无谓 IO。
+     * 复制到 /data/local/tmp/eta/。逐字节核对内容，原子替换变化的私有副本。
      *
      * @return 释放目录；assets 里缺少引擎 dex 时返回 null。
      */
     private static File stageAssets(Context ctx) {
-        File dir = new File(ctx.getFilesDir(), "eta-engine-stage");
-        if (!dir.exists() && !dir.mkdirs()) return null;
-        boolean haveDex = false;
-        for (String[] p : PAYLOAD) {
-            File out = new File(dir, p[1]);
-            long assetLen = assetLength(ctx, p[0]);
-            if (assetLen < 0) continue;                        // assets 里没有这个文件
-            try {
-                if (!(out.exists() && out.length() == assetLen)) {
-                    copyAsset(ctx, p[0], out);
+        File directory = new File(ctx.getFilesDir(), "eta-engine-stage");
+        if (!directory.isDirectory() && !directory.mkdirs()) return null;
+        try {
+            EngineCredential.get(ctx);
+            // File locking also covers the accessibility and runtime processes.
+            try (java.io.RandomAccessFile lock = new java.io.RandomAccessFile(new File(directory, ".stage.lock"), "rw");
+                 java.nio.channels.FileLock held = lock.getChannel().lock()) {
+                for (String[] payload : PAYLOAD) {
+                    File target = new File(directory, payload[1]);
+                    File temporary = new File(directory, payload[1] + ".new");
+                    try {
+                        copyAsset(ctx, payload[0], temporary);
+                        boolean same = target.isFile() && java.util.Arrays.equals(
+                                java.nio.file.Files.readAllBytes(target.toPath()), java.nio.file.Files.readAllBytes(temporary.toPath()));
+                        if (!same) java.nio.file.Files.move(temporary.toPath(), target.toPath(),
+                                java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    } finally { temporary.delete(); }
                 }
-                if ("vdrive.dex".equals(p[1])) haveDex = true;
-            } catch (Throwable t) {
-                android.util.Log.w(TAG, "stage " + p[0] + " failed: " + t);
             }
-        }
-        return haveDex ? dir : null;
-    }
-
-    private static long assetLength(Context ctx, String asset) {
-        try (InputStream in = ctx.getAssets().open(asset)) {
-            long n = 0; byte[] buf = new byte[8192]; int r;
-            while ((r = in.read(buf)) > 0) n += r;
-            return n;
-        } catch (Throwable t) {
-            return -1;
+            return directory;
+        } catch (Exception error) {
+            android.util.Log.w(TAG, "stage engine failed: " + error.getClass().getSimpleName());
+            return null;
         }
     }
 
     private static void copyAsset(Context ctx, String asset, File out) throws Exception {
-        try (InputStream in = ctx.getAssets().open(asset);
-             FileOutputStream fo = new FileOutputStream(out)) {
-            byte[] buf = new byte[8192]; int n;
-            while ((n = in.read(buf)) > 0) fo.write(buf, 0, n);
-            fo.getFD().sync();
+        try (InputStream in = ctx.getAssets().open(asset); FileOutputStream stream = new FileOutputStream(out)) {
+            byte[] buffer = new byte[8192];
+            for (int count; (count = in.read(buffer)) != -1;) stream.write(buffer, 0, count);
+            stream.getFD().sync();
         }
     }
 
-    /**
-     * root 脚本：force=true 或 dex 变了 → 重铺并强制重启（vd.sh 无参=停旧起新）；
-     * 否则只在没跑时启动（vd.sh status 在跑 exit 0 / 没跑 exit 1）。
-     * stage 目录路径无空格，直接内插安全。
-     */
-    private static String buildScript(String stage, boolean force) {
-        return "set -u\n"
-                + "D=/data/local/tmp/eta\n"
-                + "SRC=" + stage + "\n"
-                + "FORCE=" + (force ? "1" : "0") + "\n"
-                + "[ \"$(id -u 2>/dev/null)\" = 0 ] || { echo ETA_NO_ROOT; exit 97; }\n"
-                + "mkdir -p \"$D\" || { echo ETA_MKDIR_FAIL; exit 20; }\n"
-                + "restage=0\n"
-                + "if [ ! -f \"$D/vdrive.dex\" ]; then restage=1; else\n"
-                + "  a=$(sha256sum \"$SRC/vdrive.dex\" 2>/dev/null | awk '{print $1}')\n"
-                + "  b=$(sha256sum \"$D/vdrive.dex\" 2>/dev/null | awk '{print $1}')\n"
-                + "  [ -n \"$a\" ] && [ \"$a\" = \"$b\" ] || restage=1\n"
-                + "fi\n"
-                + "if [ \"$restage\" = 1 ] || [ \"$FORCE\" = 1 ]; then\n"
-                + "  for f in vdrive.dex vdrive.version vd.sh install_vdrive.sh check_pair.sh; do\n"
-                + "    [ -f \"$SRC/$f\" ] && cp -f \"$SRC/$f\" \"$D/$f\"\n"
-                + "  done\n"
-                + "  chmod 700 \"$D\"/*.sh 2>/dev/null\n"
-                + "  echo ETA_STAGED\n"
-                + "  sh \"$D/vd.sh\"; rc=$?; echo \"ETA_VD_RC=$rc\"; exit $rc\n"
-                + "fi\n"
-                + "if sh \"$D/vd.sh\" status >/dev/null 2>&1; then echo ETA_ALREADY; exit 0; fi\n"
-                + "sh \"$D/vd.sh\"; rc=$?; echo \"ETA_VD_RC=$rc\"; exit $rc\n";
+    private static String quote(String value) { return "'" + value.replace("'", "'\\''") + "'"; }
+
+    /** One installer owns stop, verification, atomic replacement and rollback. */
+    private static String buildScript(String stage) {
+        return "[ \"$(id -u 2>/dev/null)\" = 0 ] || { echo ETA_NO_ROOT; exit 97; }\n"
+                + "sh " + quote(stage + "/install_vdrive.sh") + " " + quote(stage) + "\n";
     }
 
     /** 用 su 开一个 root shell，把脚本喂给它的 stdin 执行。 */
@@ -281,10 +264,12 @@ public final class Engine {
             });
             reader.setDaemon(true);
             reader.start();
-            boolean done = p.waitFor(45, TimeUnit.SECONDS);
+            boolean done = p.waitFor(90, TimeUnit.SECONDS);
             if (!done) {
                 lastReason = "TIMEOUT";
-                p.destroy();
+                p.destroyForcibly();
+            } else if (p.exitValue() != 0 && lastReason == null) {
+                lastReason = "INSTALL_FAILED";
             }
         } catch (java.io.IOException e) {
             lastReason = "NO_ROOT";                 // 没有 su 二进制：这台机器没 root
@@ -301,8 +286,8 @@ public final class Engine {
             byte[] buf = new byte[1024];
             StringBuilder sb = new StringBuilder();
             int n;
-            while ((n = in.read(buf)) > 0 && sb.length() < 4096) {
-                sb.append(new String(buf, 0, n, "UTF-8"));
+            while ((n = in.read(buf)) > 0) {
+                if (sb.length() < 4096) sb.append(new String(buf, 0, n, "UTF-8"));
             }
             String out = sb.toString();
             if (out.contains("ETA_NO_ROOT")) lastReason = "NO_ROOT";

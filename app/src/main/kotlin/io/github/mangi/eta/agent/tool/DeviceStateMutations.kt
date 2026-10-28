@@ -58,10 +58,14 @@ internal class DeviceStateMutations(
             return DeviceToolContract.failure("INVALID_PACKAGE", "包名格式无效").toString()
         }
         val action = args.optString("action").lowercase(Locale.ROOT)
+        if (action == "freeze" || action == "unfreeze") {
+            com.eta.shadow.EngineJournal.record(context, "application_state", "${action}_blocked")
+            return DeviceToolContract.failure("APP_STATE_MANUAL_ONLY",
+                "ETA 不自动冻结或解冻应用。请由用户在系统应用设置中调整；不得改用终端绕过。应用打不开时先检查引擎和应用状态。")
+                .put("package_name", packageName).put("action", action).put("command_accepted", false).toString()
+        }
         val command = when (action) {
             "force_stop" -> "am force-stop --user $userId ${DeviceToolContract.quote(packageName)}"
-            "freeze" -> "pm disable-user --user $userId ${DeviceToolContract.quote(packageName)}"
-            "unfreeze" -> "pm enable --user $userId ${DeviceToolContract.quote(packageName)}"
             else -> return invalid("不支持的应用状态动作")
         }
         val before = readApplicationState(packageName, action)
@@ -69,7 +73,8 @@ internal class DeviceStateMutations(
                 .put("user_id", userId).toString()
         val result = executeRoot(command)
         val after = readApplicationState(packageName, action)
-        return mutation("app_state_control", userId, "app_user", before, after, action != "freeze", result)
+        com.eta.shadow.EngineJournal.record(context, "application_state", "force_stop_requested")
+        return mutation("app_state_control", userId, "app_user", before, after, true, result)
             .put("package_name", packageName).put("action", action)
             .put("state_field", if (action == "force_stop") "stopped" else "enabled").toString()
     }

@@ -283,8 +283,14 @@ class VDriveWorker implements VDrive.Worker {
         workerThread = new HandlerThread("vdrive-work");
         workerThread.start();
         work = new Handler(workerThread.getLooper());
-        dm.registerDisplayListener(geometryListener, work);
-        work.postDelayed(patrol, 2000);
+        try {
+            dm.registerDisplayListener(geometryListener, work);
+            work.postDelayed(patrol, 2000);
+        } catch (Throwable error) {
+            try { dm.unregisterDisplayListener(geometryListener); } catch (Throwable ignored) { }
+            workerThread.quitSafely();
+            throw error;
+        }
 
     }
 
@@ -453,7 +459,8 @@ class VDriveWorker implements VDrive.Worker {
         Frame frame = frames.get(displayId);
         if (frame != null) frame.close();
         try { if (reader != null) reader.close(); } catch (Throwable ignored) { }
-        if (vd != null) vd.release();
+        try { if (vd != null) vd.release(); }
+        catch (Throwable error) { if (!com.eta.shadow.EngineFailures.systemUnavailable(error)) throw error; VDrive.systemFailed(); }
         if (displayId >= 0) {
             Frame fr = frames.remove(displayId);
             if (fr != null && fr.bmp != null) fr.bmp.recycle();
@@ -485,7 +492,8 @@ class VDriveWorker implements VDrive.Worker {
             }
         }
         stopCapture(x);
-        if (x.vd != null) x.vd.release();
+        try { if (x.vd != null) x.vd.release(); }
+        catch (Throwable error) { if (!com.eta.shadow.EngineFailures.systemUnavailable(error)) throw error; VDrive.systemFailed(); }
         int gone = x.displayId;
         x.reader = null;
         x.vd = null;
@@ -610,13 +618,13 @@ class VDriveWorker implements VDrive.Worker {
             } catch (CanceledException ce) {
                 res = failFlag("CANCELED",
                         "command was cancelled; input already injected may still arrive",
-                        "cancelRequested");
+                        "cancelRequested", "operationMayHaveRun");
+            } catch (java.net.SocketTimeoutException deadline) {
+                res = failFlag("TIMEOUT", "system command exceeded its deadline; observe before retrying",
+                        "operationMayHaveRun");
             } catch (Throwable e) {
-                String why = String.valueOf(e);
-                if (why.contains("DeadSystem") || why.contains("DeadObjectException")) {
-                    // system_server restarted under us: every cached binder is dead now
-                    res = fail("SYSTEM_RESTARTED", "Android 系统重启过，引擎里的 binder 已失效；"
-                            + "执行 sh /data/local/tmp/eta/vd.sh 重启引擎即可恢复");
+                if (com.eta.shadow.EngineFailures.systemUnavailable(e)) {
+                    res = VDrive.failure(e);
                 } else {
                     boolean bad = e instanceof org.json.JSONException;
                     res = fail(bad ? "BAD_REQUEST" : "INTERNAL",
@@ -890,19 +898,18 @@ class VDriveWorker implements VDrive.Worker {
     }
 
     /**
-     * The observer lives in whichever Eta build bound its port first. 8738 is the port
-     * only the rebuilt bridge uses, so preferring it makes the choice deterministic;
-     * 8734 stays as the legacy fallback.
+     * Only use this installation's authenticated observer. Never fall back to an
+     * unrelated original Eta instance that happens to own the legacy port.
      */
     volatile int obsPort = 0;
 
     int obsPort() {
         int p = obsPort;
         if (p > 0) return p;
-        for (int cand : new int[]{8738, 8734}) {
+        for (int cand : new int[]{8738}) {
             if (portOpen(cand)) { obsPort = cand; log("observer on " + cand); return cand; }
         }
-        return 8734;
+        return 8738;
     }
 
     boolean portOpen(int port) {
@@ -929,10 +936,10 @@ class VDriveWorker implements VDrive.Worker {
             sock.connect(new java.net.InetSocketAddress("127.0.0.1", obsPort()), Math.min(2000, timeoutMs));
             sock.setSoTimeout(timeoutMs);
             java.io.PrintStream w = new java.io.PrintStream(sock.getOutputStream(), true, "UTF-8");
-            w.println(req.toString());
+            w.println(new JSONObject(req.toString()).put("auth", VDrive.credential).toString());
             java.io.BufferedReader r = new java.io.BufferedReader(
                     new java.io.InputStreamReader(sock.getInputStream(), "UTF-8"));
-            String line = r.readLine();
+            String line = com.eta.shadow.EngineWire.readLine(r, com.eta.shadow.EngineWire.RESPONSE_LIMIT);
             if (line == null) return null;
             if (line.startsWith("RESULT:")) line = line.substring(7);
             JSONObject result = new JSONObject(line);
@@ -943,7 +950,7 @@ class VDriveWorker implements VDrive.Worker {
             return result.put("geometry", after);
         } catch (Throwable t) {
             log("a11y proxy failed on " + obsPort() + ": " + t);
-            obsPort = 0;   // port may have moved to the other build; re-probe next call
+            obsPort = 0;
             return null;
         }
     }
@@ -2160,17 +2167,16 @@ class VDriveWorker implements VDrive.Worker {
     }
 
     /** Keep the parked app out of the low-memory killer while it waits on the hidden display. */
+    private final ProcessProtection protection = new ProcessProtection(java.nio.file.Paths.get("/proc"));
     void protectApp(String pkg, boolean on) {
+        if (!on) { protection.restoreAll(); return; }
         if (pkg == null || pkg.isEmpty()) return;
         try {
             String pids = exec("pidof " + shellQuote(pkg)).trim();
             if (pids.isEmpty()) return;
             for (String p : pids.split("\\s+")) {
                 if (p.isEmpty()) continue;
-                try (java.io.FileOutputStream f =
-                             new java.io.FileOutputStream("/proc/" + p + "/oom_score_adj")) {
-                    f.write((on ? "-200" : "0").getBytes());
-                }
+                protection.protect(Integer.parseInt(p));
             }
         } catch (Throwable t) {
             log("protectApp failed: " + t);
@@ -2450,13 +2456,7 @@ class VDriveWorker implements VDrive.Worker {
     }
 
     String exec(String cmd) throws Exception {
-        Process p = Runtime.getRuntime().exec(new String[]{"/system/bin/sh", "-c", cmd});
-        ByteArrayOutputStream b = new ByteArrayOutputStream();
-        byte[] tmp = new byte[4096];
-        int n;
-        while ((n = p.getInputStream().read(tmp)) > 0) b.write(tmp, 0, n);
-        p.waitFor();
-        return new String(b.toByteArray(), "UTF-8");
+        return BoundedShell.execute(cmd, 15000, this::checkCanceled);
     }
 
     String shellQuote(String s) {
@@ -2464,7 +2464,10 @@ class VDriveWorker implements VDrive.Worker {
     }
 
     void shutdown() {
-        if (dm != null) dm.unregisterDisplayListener(geometryListener);
+        protection.restoreAll();
+        // Local capture/thread cleanup must still run when unregister hits a dead proxy.
+        try { if (dm != null) dm.unregisterDisplayListener(geometryListener); }
+        catch (Throwable error) { log("display listener cleanup: " + error.getClass().getSimpleName()); }
         for (Session x : new java.util.ArrayList<>(sessions.values())) {
             releaseSessionFully(x, false);
         }

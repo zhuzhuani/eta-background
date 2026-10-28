@@ -10,11 +10,11 @@ D=/data/local/tmp/eta
 APK=${1:-$(pm path io.github.mangi.etax | sed -n 's/^package://p')}
 [ -f "$APK" ] || { echo "pair: no apk at ${APK:-?}"; exit 1; }
 
-apk_engine=$(unzip -p "$APK" assets/vdrive.dex 2>/dev/null | sha256sum | cut -c1-16)
+apk_engine=$(unzip -p "$APK" assets/vdrive.dex 2>/dev/null | sha256sum | cut -d' ' -f1)
 apk_stamp=$(unzip -p "$APK" assets/vdrive.version 2>/dev/null | tr -d '\r\n')
-live=$(sha256sum "$D/vdrive.dex" | cut -c1-16)
-running=$(printf '{"cmd":"status"}\n' | nc -w 2 127.0.0.1 8733 \
-          | sed -n 's/.*"build":"\([^"]*\)".*/\1/p')
+live=$(sha256sum "$D/vdrive.dex" | cut -d' ' -f1)
+status=$(sh "$D/vd.sh" status 2>/dev/null) || { echo 'PAIR FAIL: engine unavailable or unhealthy'; exit 1; }
+running=$(printf '%s' "$status" | sed -n 's/.*"build":"\([^"]*\)".*/\1/p')
 
 echo "apk engine dex : ${apk_engine:-unknown}"
 echo "apk stamp      : ${apk_stamp:-unknown}"

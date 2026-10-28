@@ -100,8 +100,9 @@ public final class ShadowTools {
                 ShadowSettings.markEngineReady(false);
                 Engine.warm(ctx);
                 text = "后台虚拟屏引擎连接中断，已在后台尝试重启。请重新 screen_open 后再继续。";
-            } else if (msg != null && msg.contains("timed out")) {
-                text = ShadowSettings.engineFixHint();
+            } else if (e instanceof java.net.SocketTimeoutException || (msg != null && msg.contains("timed out"))) {
+                text = "{\"ok\":false,\"code\":\"TIMEOUT\",\"operationMayHaveRun\":true,"
+                        + "\"message\":\"操作等待超时，可能已执行；请先重新观察，勿直接重复点击或发送。\"}";
             } else {
                 text = "失败：" + e.getClass().getSimpleName() + (msg == null ? "" : "：" + msg);
             }
@@ -471,7 +472,8 @@ public final class ShadowTools {
                 if (result.optBoolean("parked")) {
                     parked = true;
                     parkedHints.remember(openedPackage, sessionId);
-                } else if (!"NO_SESSION".equals(result.optString("code")) && !"SESSION_CLOSED".equals(result.optString("code"))) {
+                } else if (!"NO_SESSION".equals(result.optString("code")) && !"SESSION_CLOSED".equals(result.optString("code"))
+                        && !"SYSTEM_RESTARTED".equals(result.optString("code"))) {
                     return false;
                 }
             }
@@ -523,6 +525,9 @@ public final class ShadowTools {
                     .put("sessionLimit", status.optInt("limit"));
             String build = status.optString("build");
             out.put("build", build.matches("[A-Za-z0-9._-]{1,80}") ? build : "unknown");
+            out.put("healthy", status.optBoolean("healthy")).put("pid", status.optInt("pid", -1));
+            String instance = status.optString("instance");
+            if (instance.matches("[a-f0-9-]{36}")) out.put("instance", instance);
             JSONArray sessions = status.optJSONArray("sessions");
             int closing = 0;
             if (sessions != null) for (int i = 0; i < sessions.length(); i++) {
@@ -558,13 +563,19 @@ public final class ShadowTools {
                 if (result.has(key)) lastRejection.put(key, result.opt(key));
             android.util.Log.w("EtaGeometry", lastRejection.toString());
         }
-        if ("NO_SESSION".equals(code) || "SESSION_CLOSED".equals(code) || "STALE_SCREEN".equals(code)) resetSession();
+        if ("NO_SESSION".equals(code) || "SESSION_CLOSED".equals(code) || "STALE_SCREEN".equals(code)
+                || "SYSTEM_RESTARTED".equals(code)) resetSession();
+        if ("SYSTEM_RESTARTED".equals(code)) {
+            EngineJournal.record(ShadowSettings.app(), "system_connection", "lost");
+            ShadowSettings.markEngineReady(false);
+            Engine.warm(ShadowSettings.app());
+        }
         return response;
     }
 
     private String engine(String json) throws Exception {
         JSONObject request = new JSONObject(json).put("sessionId", sessionId);
-        return received(send(ENGINE_PORT, request.toString(), 25000));
+        return received(send(ENGINE_PORT, request.toString(), 35000));
     }
 
     private String observer(String json) throws Exception {
@@ -588,9 +599,9 @@ public final class ShadowTools {
             s.connect(new InetSocketAddress("127.0.0.1", port), 2000);
             s.setSoTimeout(timeoutMs);
             PrintStream w = new PrintStream(s.getOutputStream(), true, "UTF-8");
-            w.println(json);
+            w.println(new JSONObject(json).put("auth", EngineCredential.get(ShadowSettings.app())).toString());
             BufferedReader r = new BufferedReader(new InputStreamReader(s.getInputStream(), "UTF-8"));
-            String line = r.readLine();
+            String line = EngineWire.readLine(r, EngineWire.RESPONSE_LIMIT);
             if (line == null) throw new java.io.IOException("closed");
             return line.startsWith("RESULT:") ? line.substring(7) : line;
         }

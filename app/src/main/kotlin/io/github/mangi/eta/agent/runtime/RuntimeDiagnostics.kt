@@ -37,6 +37,7 @@ internal object RuntimeDiagnostics {
             .put("liveUpdatesAllowed", if (AgentExecutionService.usesSystemTaskSurface())
                 runCatching { manager.canPostPromotedNotifications() }.getOrDefault(false) else false)
             .put("engine", engineSnapshot())
+            .put("engineHistory", com.eta.shadow.EngineJournal.snapshot(context))
             .put("events", JSONArray().apply {
                 entries.forEach { put(JSONObject().put("elapsedMs", it.elapsed).put("event", it.event).put("state", it.state)) }
             }).toString(2)
