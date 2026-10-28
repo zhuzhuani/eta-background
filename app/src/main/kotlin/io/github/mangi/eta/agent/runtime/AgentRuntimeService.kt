@@ -642,7 +642,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                 }
                 if (displayedRun === run && !run.session.isTerminal) {
                     state.value = run.overlayState
-                    ensureOverlayVisible()
+                    syncActiveRunOverlayVisibility(run)
                 }
                 publishExecutionState()
             }.onFailure { throwable ->
@@ -1029,6 +1029,42 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         showOverlay()
     }
 
+    private fun syncActiveRunOverlayVisibility(run: RuntimeRunRegistry.Run?) {
+        if (AgentOverlayVisibilityPolicy.shouldSuppressOverlayInEtaUi(
+                handoffSource = run?.request?.handoff?.source,
+                etaUiInForeground = MainActivity.isInForeground,
+            )
+        ) {
+            removeAmbientWindows()
+        } else {
+            ensureOverlayVisible()
+        }
+    }
+
+    private fun handleEtaUiVisibilityChanged() {
+        if (destroyed) return
+        val run = displayedRun ?: return
+        val suppress = AgentOverlayVisibilityPolicy.shouldSuppressOverlayInEtaUi(
+            handoffSource = run.request.handoff?.source,
+            etaUiInForeground = MainActivity.isInForeground,
+        )
+        if (resultCardView != null) {
+            if (suppress) dismissResult(run)
+            return
+        }
+        if (runs.contains(run) && !run.session.isTerminal) {
+            publishExecutionState()
+            return
+        }
+        if (!guiControl.state.value.userPaused) return
+        if (suppress) {
+            removeAmbientWindows()
+        } else {
+            state.value = run.overlayState
+            ensureOverlayVisible()
+        }
+    }
+
     private fun updateKeepScreenOn() {
         val guiState = guiControl.state.value
         val session = guiState.ownerRunId?.let(runs::get)?.session
@@ -1053,7 +1089,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                     detailText = "手机操作已暂停",
                 )
                 owner?.overlayState = state.value
-                ensureOverlayVisible()
+                syncActiveRunOverlayVisibility(owner ?: displayedRun)
             }
             owner != null -> {
                 if (owner.overlayState.phase == AgentOverlayPhase.PAUSED) {
@@ -1064,7 +1100,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                     )
                 }
                 state.value = owner.overlayState
-                ensureOverlayVisible()
+                syncActiveRunOverlayVisibility(owner)
             }
             else -> if (runs.all().isEmpty()) removeAmbientWindows()
         }
@@ -1086,15 +1122,17 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         taskItems.value = active.map { run ->
             io.github.mangi.eta.agent.overlay.OverlayTaskItem(run.runId, run.request.prompt.take(38))
         }
-        val selected = displayedRun?.takeIf { it in active } ?: active.lastOrNull()
+        val selected = active.firstOrNull { it.runId == guiControl.state.value.ownerRunId }
+            ?: displayedRun?.takeIf { it in active } ?: active.lastOrNull()
         if (selected != null) {
             if (displayedRun !== selected) bindDisplayedRun(selected)
             state.value = selected.overlayState.copy(status = taskStatus(selected),
                 phase = if (selected.session.controller.isPaused) AgentOverlayPhase.PAUSED else selected.overlayState.phase)
             val working = active.any { !it.queued && !it.session.controller.isPaused && !it.session.controller.isCancelled }
             ambientState.value = state.value.copy(phase = if (working) AgentOverlayPhase.RUNNING else AgentOverlayPhase.PAUSED)
-            if (!isMainDisplayOn()) removeAmbientWindows()
-            else if (working) ensureOverlayVisible()
+            if (!isMainDisplayOn() || AgentOverlayVisibilityPolicy.shouldSuppressOverlayInEtaUi(
+                    selected.request.handoff?.source, MainActivity.isInForeground)) removeAmbientWindows()
+            else if (working) syncActiveRunOverlayVisibility(selected)
             else {
                 // Preserve fallback pause controls while removing the animated edge window.
                 glowView?.let { view -> runCatching { windowManager?.removeView(view) } }
@@ -1523,8 +1561,14 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             return
         }
 
-        if (displayedRun?.hasExecutedForegroundTool == true) {
-            // 撤掉胶囊和边缘光，改显半屏结果卡片，不自动关闭，用户手动关闭
+        val run = displayedRun
+        if (AgentOverlayVisibilityPolicy.shouldShowResultCard(
+                hasExecutedForegroundTool = run?.hasExecutedForegroundTool == true,
+                handoffSource = run?.request?.handoff?.source,
+                etaUiInForeground = MainActivity.isInForeground,
+            )
+        ) {
+            // 非系统通知回退界面采用上游结果卡；无交互时由卡片延时退场。
             capsuleExpanded.value = false
             removeAmbientWindows()
             if (windowManager == null && (AgentAccessibilityService.current() != null || Settings.canDrawOverlays(this))) {
@@ -1619,6 +1663,11 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         // 只投影到 App 与 GUI 浮层的现有窗口，窗口不可见时由系统恢复息屏。
         private val keepScreenOnState = MutableStateFlow(false)
         val keepScreenOn = keepScreenOnState.asStateFlow()
+
+        internal fun onEtaUiVisibilityChanged() {
+            val instance = notificationOwner ?: return
+            instance.mainHandler.post { instance.handleEtaUiVisibilityChanged() }
+        }
 
         private const val ACTION_KEEP_ALIVE = "io.github.mangi.eta.agent.runtime.KEEP_ALIVE"
         private const val HIDE_DELAY_MS = 2_500L

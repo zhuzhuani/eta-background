@@ -274,8 +274,7 @@ internal class AgentExecutionService : Service() {
             }
         }
 
-        internal fun usesSystemTaskSurface(): Boolean = Build.VERSION.SDK_INT >= 36 &&
-            Build.VERSION.SDK_INT_FULL >= Build.VERSION_CODES_FULL.BAKLAVA_1
+        internal fun usesSystemTaskSurface(): Boolean = Build.VERSION.SDK_INT >= 36
         internal fun taskNotificationsEnabled(context: Context): Boolean {
             val manager = context.getSystemService(NotificationManager::class.java)
             return manager.areNotificationsEnabled() &&
@@ -351,7 +350,7 @@ internal class AgentExecutionService : Service() {
                 builder.setStyle(Notification.ProgressStyle().setProgressIndeterminate(progressing)
                     .setProgressSegments(listOf(Notification.ProgressStyle.Segment(100))).setProgress(if (completed) 100 else 0))
                     .setShortCriticalText(if (completed) label.take(7) else shortText(context, task.status))
-                if (progressing) builder.setRequestPromotedOngoing(true)
+                if (progressing) builder.extras.putBoolean("android.requestPromotedOngoing", true)
             }
             return builder.build()
         }

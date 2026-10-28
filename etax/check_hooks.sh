@@ -19,7 +19,7 @@ need $K/agent/accessibility/AgentAccessibilityService.kt 'com.eta.shadow.Boot.in
 need $K/agent/accessibility/AgentAccessibilityService.kt 'com.eta.shadow.Boot.onEvent(event)'       '2 无障碍事件 → 观察者'
 need $K/agent/accessibility/AgentAccessibilityService.kt 'com.eta.shadow.Boot.detach(this)'         '3 无障碍解绑 → 释放观察者'
 need $K/agent/runtime/AgentExecutionService.kt  'streamPreview'              '4 前台通知正文'
-need $K/agent/runtime/AgentExecutionService.kt  'setRequestPromotedOngoing(true)'    '5 状态栏实时活动'
+need $K/agent/runtime/AgentExecutionService.kt  'extras.putBoolean("android.requestPromotedOngoing", true)'    '5 状态栏实时活动（API 36 标准 extra）'
 need $K/ui/MainActivity.kt                      'com.eta.shadow.ShadowNotice.handleHandoverIntent(intent)' '6 通知点击 → 移回主屏'
 need $K/agent/mcp/McpRunContext.kt              'shadow?.execute('              '7 工具执行拦截 screen_*'
 need $K/agent/runtime/AgentRuntimeService.kt                'run.notice.append('                '8 流式正文 → 通知栏'

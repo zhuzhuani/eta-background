@@ -60,12 +60,7 @@ jobs:
         run: |
           ./gradlew --no-daemon --no-configuration-cache --max-workers=2 \
             "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
-            :app:testDebugUnitTest \
-            --tests "io.github.mangi.eta.agent.runtime.*" \
-            --tests "io.github.mangi.eta.ui.app.AgentAppStateConversationLoadingTest" \
-            --tests "io.github.mangi.eta.ui.app.AgentRuntimeHistoryReducerTest" \
-            --tests "com.eta.shadow.*" \
-            --tests "VDrive*Test" --tests "DisplayGeometryTest" --tests "CapturePixelsTest"
+            :app:testDebugUnitTest
           # Keep CPU-heavy lint away from time-bounded Robolectric UI recovery tests.
           ./gradlew --no-daemon --no-configuration-cache --max-workers=2 \
             "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \

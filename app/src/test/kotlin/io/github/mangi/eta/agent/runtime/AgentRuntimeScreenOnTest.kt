@@ -6,9 +6,11 @@ import androidx.compose.ui.platform.ComposeView
 import io.github.mangi.eta.agent.model.AgentModelClient
 import io.github.mangi.eta.agent.overlay.AgentOverlayPhase
 import io.github.mangi.eta.agent.overlay.AgentOverlayState
+import io.github.mangi.eta.agent.overlay.AgentOverlayStatus
 import androidx.compose.runtime.MutableState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -20,6 +22,32 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36], application = Application::class)
 class AgentRuntimeScreenOnTest {
+    @Test
+    fun returningToEtaSuppressesAmbientWindowsButRetainsBackgroundTaskCard() {
+        val controller = Robolectric.buildService(AgentRuntimeService::class.java).create()
+        val service = controller.get()
+        val foreground = io.github.mangi.eta.ui.MainActivity::class.java.getDeclaredField("isInForeground").apply {
+            isAccessible = true
+        }
+        val previous = foreground.getBoolean(null)
+        try {
+            service.registerRun("eta-ui-background", ownsGui = false, handoffSource = AgentRuntimeWire.AGENT_UI_HANDOFF_SOURCE)
+            service.invoke("publishExecutionState")
+            service.setField("capsuleView", ComposeView(service))
+            service.setField("glowView", ComposeView(service))
+            foreground.setBoolean(null, true)
+            AgentRuntimeService.onEtaUiVisibilityChanged()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertNull(service.field<ComposeView?>("capsuleView"))
+            assertNull(service.field<ComposeView?>("glowView"))
+            assertEquals(listOf("eta-ui-background"), AgentRuntimeService.tasks.value.map { it.runId })
+            assertFalse(AgentRuntimeService.keepScreenOn.value)
+        } finally {
+            foreground.setBoolean(null, previous)
+            controller.destroy()
+        }
+    }
+
     @Test
     fun physicalScreenOffPausesRunAndScreenOnRequiresManualResume() {
         val controller = Robolectric.buildService(AgentRuntimeService::class.java).create()
@@ -213,13 +241,80 @@ class AgentRuntimeScreenOnTest {
         }
     }
 
-    private fun AgentRuntimeService.registerRun(runId: String, ownsGui: Boolean = true): RuntimeRunRegistry.Run {
+    @Test
+    fun executionStatusFollowsGuiOwnershipWithoutGivingBackgroundRunsScreenControl() {
+        val serviceController = Robolectric.buildService(AgentRuntimeService::class.java).create()
+        try {
+            val service = serviceController.get()
+            val background = service.registerRun("background-run", ownsGui = false).apply {
+                overlayState = overlayState.copy(status = AgentOverlayStatus.RunningTool("terminal_job"))
+            }
+            val guiCoordinator = service.field<GuiControlCoordinator>("guiControl")
+            service.assertTaskStatuses(mapOf(background.runId to background.overlayState.status))
+            assertNull(guiCoordinator.state.value.ownerRunId)
+            assertFalse(AgentRuntimeService.keepScreenOn.value)
+
+            val guiRun = service.registerRun("gui-run", ownsGui = false).apply {
+                overlayState = overlayState.copy(status = AgentOverlayStatus.GeneratingAnswer)
+            }
+            val guiControl = guiCoordinator.openRun(guiRun.runId, guiRun.session.controller)
+            guiControl.withAction { }
+            service.assertTaskStatuses(mapOf(background.runId to background.overlayState.status, guiRun.runId to AgentOverlayStatus.GeneratingAnswer))
+            assertEquals(guiRun.runId, guiCoordinator.state.value.ownerRunId)
+            assertTrue(AgentRuntimeService.keepScreenOn.value)
+
+            guiControl.release()
+            service.assertTaskStatuses(mapOf(background.runId to background.overlayState.status, guiRun.runId to guiRun.overlayState.status))
+            assertNull(guiCoordinator.state.value.ownerRunId)
+            assertFalse(AgentRuntimeService.keepScreenOn.value)
+        } finally {
+            serviceController.destroy()
+        }
+    }
+
+    @Test
+    fun retainedGuiPauseDoesNotPauseBackgroundNotificationOrKeepFinishedRunsPromoted() {
+        val serviceController = Robolectric.buildService(AgentRuntimeService::class.java).create()
+        try {
+            val service = serviceController.get()
+            val guiRun = service.registerRun("paused-run")
+            service.invokeForRun("requestPause", guiRun.runId)
+            val background = service.registerRun("background-run", ownsGui = false).apply {
+                overlayState = overlayState.copy(status = AgentOverlayStatus.RunningTool("terminal_job"))
+            }
+            service.assertTaskStatuses(mapOf(guiRun.runId to AgentOverlayStatus.Paused, background.runId to background.overlayState.status))
+
+            guiRun.session.controller.cancel()
+            guiRun.session.complete(AgentRuntimeWire.RunResult(guiRun.runId, true, "完成"))
+            service.assertTaskStatuses(mapOf(background.runId to background.overlayState.status))
+            val guiCoordinator = service.field<GuiControlCoordinator>("guiControl")
+            assertTrue(guiCoordinator.state.value.userPaused)
+            assertNull(guiCoordinator.state.value.ownerRunId)
+            assertFalse(background.session.controller.isPaused)
+            assertFalse(AgentRuntimeService.keepScreenOn.value)
+
+            background.session.complete(AgentRuntimeWire.RunResult(background.runId, true, "完成"))
+            service.assertTaskStatuses(emptyMap())
+            assertTrue(guiCoordinator.state.value.userPaused)
+        } finally {
+            serviceController.destroy()
+        }
+    }
+
+    private fun AgentRuntimeService.assertTaskStatuses(expected: Map<String, AgentOverlayStatus>) {
+        invoke("publishExecutionState")
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(expected, AgentRuntimeService.tasks.value.associate { it.runId to it.status })
+    }
+
+    private fun AgentRuntimeService.registerRun(runId: String, ownsGui: Boolean = true, handoffSource: String? = null): RuntimeRunRegistry.Run {
         val registry = field<RuntimeRunRegistry>("runs")
         lateinit var session: AgentRuntimeSession
         session = AgentRuntimeSession(runId, beforeTerminalPublish = { registry.finish(runId, session) })
         val request = AgentRuntimeWire.RunRequest(
             runId, "测试", AgentModelClient.ModelConfig(baseUrl = "https://example.invalid", apiKey = "test-key", model = "test-model", systemPrompt = ""),
             emptyList(),
+            handoff = handoffSource?.let { AgentRuntimeWire.EntryHandoff(runId, it, "{}") },
         )
         val run = (registry.admit(request) { RuntimeRunRegistry.Run(request, session) } as RuntimeRunRegistry.Admission.Accepted).run
         registry.claimNext(setOf(runId))

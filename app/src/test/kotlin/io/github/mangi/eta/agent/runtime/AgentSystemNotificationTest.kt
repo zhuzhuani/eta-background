@@ -16,7 +16,7 @@ import org.robolectric.annotation.Config
 import java.time.Duration
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [37], application = Application::class)
+@Config(sdk = [36, 37], application = Application::class)
 class AgentSystemNotificationTest {
     @Test fun completedCardOpensItsOwnTargetAppOnlyOnUserTap() {
         val controller = Robolectric.buildService(AgentExecutionService::class.java).create()
@@ -95,7 +95,12 @@ class AgentSystemNotificationTest {
             assertEquals(setOf("chat-a", "chat-b", "chat-c"), cards.keys)
             cards.forEach { (chat, entry) ->
                 val card = entry.notification
-                assertEquals(chat != "chat-b", card.hasPromotableCharacteristics())
+                assertEquals(chat != "chat-b", card.extras.getBoolean("android.requestPromotedOngoing"))
+                // API 36 accepts the standard request extra; its framework eligibility
+                // helper does not implement the newer 36.1+/37 promotion contract.
+                if (android.os.Build.VERSION.SDK_INT >= 37) {
+                    assertEquals(chat != "chat-b", card.hasPromotableCharacteristics())
+                }
                 assertEquals(2, card.actions.size)
                 assertTrue(card.actions.all { shadowOf(it.actionIntent).savedIntent.getStringExtra("run_id") == chat!!.removePrefix("chat-") })
                 assertFalse(card.actions.any { shadowOf(it.actionIntent).savedIntent.action == AgentExecutionService.ACTION_NEXT_TASK })
