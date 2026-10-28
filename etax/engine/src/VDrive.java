@@ -8,7 +8,7 @@ import java.util.*;
 
 /** Root transport. Mutable display/input/capture state lives in independent workers. */
 public final class VDrive {
-    static final String BUILD = "20261027-e34-authority";
+    static final String BUILD = "20261028-e35-cleanup";
     interface Worker {
         JSONObject processLine(String request);
         boolean closeSession();

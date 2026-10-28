@@ -1,70 +1,46 @@
-# Eta 发布流程
+# Eta 后台版构建与分发
 
-## 配置签名 Secrets
+## 从源码构建
 
-发布证书和密码不得提交到 Git。首次使用前，在仓库的
-`Settings > Secrets and variables > Actions` 中添加：
-
-- `ETA_RELEASE_KEYSTORE_BASE64`：发布证书的 Base64 文本
-- `ETA_RELEASE_STORE_PASSWORD`：KeyStore 密码
-- `ETA_RELEASE_KEY_ALIAS`：Key alias
-- `ETA_RELEASE_KEY_PASSWORD`：Key 密码
-
-macOS 可以用下面的命令复制证书的 Base64 文本：
+使用 JDK 25、仓库自带的 Gradle Wrapper、Android SDK `platforms;android-37.0` 和 `build-tools;35.0.0`，并设置 `ANDROID_HOME`。CI 工具版本见 [setup-build](actions/setup-build/action.yml)。
 
 ```bash
-base64 < /path/to/Eta-release.jks | tr -d '\n' | pbcopy
+bash etax/check_hooks.sh
+bash etax/embed_engine.sh
+./gradlew :app:testDebugUnitTest
+./gradlew :app:lintDebug :app:assembleDebug
 ```
 
-也可以使用 GitHub CLI。密码类 Secret 不要直接写在命令参数中，运行命令后按提示输入：
+`embed_engine.sh` 从 `etax/engine/src` 和 `etax/shared/src` 编译 Root 引擎，读取源码 BUILD 常量，并将 dex、版本与启动脚本放入 APK assets。这些是生成文件，不提交到 Git。直接运行 Gradle 前必须先执行该步骤；签名构建和 PR 检查共用同一个脚本。
 
-```bash
-base64 < /path/to/Eta-release.jks | gh secret set ETA_RELEASE_KEYSTORE_BASE64
-gh secret set ETA_RELEASE_STORE_PASSWORD
-gh secret set ETA_RELEASE_KEY_ALIAS
-gh secret set ETA_RELEASE_KEY_PASSWORD
-```
+本地自定义工具链可设置 `ANDROID_JAR`、`R8_JAR`、`JAVA`、`JAVAC`。引擎默认编译目录为 `etax/engine/build/`，已忽略。升级引擎源代码时同步更新 `VDrive.java` 中的 BUILD 标识。
 
-## PR 检查
+## GitHub Actions
 
-指向 `main` 的 Pull Request 会触发 `PR Check`，依次执行 Lint、单元测试和 Debug 构建，
-失败时上传检查报告。该工作流不读取任何 Secrets，来自 fork 的 PR 需要维护者在 PR 页面
-批准后才会运行，批准前请重点检查 `.github/` 下的改动。
+- **Etax Build**：推送到 `main`、`etax-*` 分支或手动运行时触发。接线与引擎编译通过后，依次运行全量单元测试、lint、Release 构建、签名及包名检查，最后上传 APK，保留 30 天。
+- **PR Check**：检查面向 `main` 的 PR，编译相同的内嵌引擎，运行单元测试、lint 和 Debug 构建；不读取发布签名 Secrets。失败报告保留 7 天。外部分支首次运行的审批取决于仓库 Actions 设置。
 
-`main` 分支通过仓库规则集要求 `Lint / Test / Debug Build` 检查通过后才能合并。
-修改该 job 名称时需同步更新规则集。
+单元测试先于 lint 执行，减少 CPU 竞争对 UI 时序测试的影响。只有检查通过的构建才进入签名打包。可在仓库分支规则中将 `Lint / Test / Debug Build` 设为必需检查。
 
-## 构建与发布
+## 签名
 
-以下情况会在同一次工作流中生成 Debug APK 和经过签名验证的 Release APK，
-并作为两个可直接下载的 Actions Artifact 保存 14 天：
+在 `Settings → Secrets and variables → Actions` 配置以下四项；不要提交证书或密码：
 
-- 向 `main` 推送提交
-- 推送 `v*` 标签
-- 在 GitHub 的 `Actions > Eta Build` 中手动运行
+| Secret | 内容 |
+| --- | --- |
+| `ETAX_KEYSTORE_BASE64` | 发布 keystore 的 Base64 文本 |
+| `ETAX_STORE_PASSWORD` | keystore 密码 |
+| `ETAX_KEY_ALIAS` | 签名别名 |
+| `ETAX_KEY_PASSWORD` | 对应私钥密码 |
 
-同一工作流会并行执行 Lint 与单元测试。检查失败不影响 APK 上传，但推送标签时不会创建
-Release 草稿。
+配置了 keystore 但缺少其他项会直接报错。全部未配置时会生成临时证书，仅供自行测试；临时证书每次不同，不能用来覆盖既有安装。维护者分发必须沿用原发布证书，避免用户需要卸载及丢失数据。
 
-非标签构建会在版本名后追加 SemVer 构建元数据 `+<短提交号>`，例如 `Eta-v3.2.0+a1b2c3d.apk`，
-用于区分同一版本号下的不同构建；只有标签构建产出不带后缀的正式版本名。Actions Artifact
-需要登录才能下载且到期失效，仅供开发测试，面向用户的分发只使用 GitHub Releases。
+CI 将上述 Secrets 映射为 Gradle 读取的 `ETA_RELEASE_STORE_FILE`、`ETA_RELEASE_STORE_PASSWORD`、`ETA_RELEASE_KEY_ALIAS`、`ETA_RELEASE_KEY_PASSWORD`。本地 Release 构建也可提供这四个环境变量后运行 `./gradlew :app:assembleRelease`。
 
-推送 `v*` 标签时，工作流还会创建一个只附带 Release APK 的 GitHub Release 草稿，
-说明预填自动生成的变更列表。草稿不会被应用内更新检查读到，发布始终由维护者手动完成。
+## 版本、历史与下载
 
-正式发布前先更新 `versionCode` 和 `versionName`，然后创建与
-`versionName` 对应的标签。`versionCode` 使用 `yyyyMMdd` 加两位当日序号，
-只能递增，否则已安装用户无法覆盖升级。推送标签时，工作流会校验标签与 `versionName`
-一致，不一致时构建失败。例如发布 `2.2.2`：
+`app/build.gradle.kts` 的 `versionCode` 使用 `yyyyMMdd` 加两位序号，只能递增。`versionName` 表示当前上游基础版本；后台版变更由 versionCode、源码提交与 [更新日志](../etax/README.md) 区分。CI 文件名如 `Etax-v3.3.5+etax.<短提交号>.apk`。
 
-```bash
-git tag v2.2.2
-git push origin v2.2.2
-```
+历史源码通过分支和提交保留，无需复制整套源码目录。正式分发前更新版本日志，在真机检查通知内回复、双任务、微信截图坐标、横屏游戏及前台接管，再从成功的 Etax Build 取得签名 APK。
 
-标签推送后，等待 `Eta Build` 工作流完成，然后：
-
-1. 在仓库的 `Releases` 中打开 `vX.Y.Z` 草稿，确认附件为 `Eta-vX.Y.Z.apk`。
-2. 改写发布说明。
-3. 检查版本、说明和附件后，由维护者手动发布。
+Actions 附件需要登录且到期失效。长期下载由维护者在本仓库 Releases 创建版本、选择经过验证的提交并上传 APK，附上版本说明与 SHA-256。当前流程不自动创建或发布 Release；推送标签也不会自动触发构建。发布源码及 APK 时保留 [LICENSE](../LICENSE) 和上游 Required Notice。

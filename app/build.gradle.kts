@@ -35,13 +35,13 @@ android {
     ndkVersion = libs.versions.ndk.get()
 
     defaultConfig {
-        // etax: 独立包名，可与官方 Eta 共存；显示名统一为「Eta 助手·后台版」
+        // etax: 独立包名，可与官方 Eta 共存；显示名统一为「Eta 后台版」
         applicationId = "io.github.mangi.etax"
-        manifestPlaceholders["etaxLabel"] = "Eta 助手·后台版"
+        manifestPlaceholders["etaxLabel"] = "Eta 后台版"
         minSdk = 33
         targetSdk = 37
         // versionCode 规则：yyyyMMdd + 两位当日序号（01 起），发版时随 versionName 一起手动递增。
-        versionCode = 2026102801
+        versionCode = 2026102802
         versionName = "3.3.5"
 
         ndk {

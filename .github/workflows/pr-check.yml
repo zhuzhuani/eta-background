@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   check:
-    # 名称会作为 main 分支规则集的必需检查，修改时同步更新仓库规则集
+    # 可在仓库规则集中将此名称配置为必需检查。
     name: Lint / Test / Debug Build
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -29,15 +29,23 @@ jobs:
       - name: 配置构建环境
         uses: ./.github/actions/setup-build
 
-      # PR 来自 fork 时拿不到 Secrets，这里只做无需签名的检查
-      # 提交号取 PR 头部提交，而非 GitHub 生成的临时合并提交
-      - name: Lint、单元测试与 Debug 构建
+      - name: 校验接线并内嵌 root 引擎
+        run: |
+          bash etax/check_hooks.sh
+          bash etax/embed_engine.sh
+
+      # PR 不读取签名 Secrets；耗 CPU 的 lint 在 UI 测试结束后运行。
+      - name: 单元测试、Lint 与 Debug 构建
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: >-
-          ./gradlew --no-daemon --no-configuration-cache --continue
-          "-Peta.buildMetadata=${HEAD_SHA::7}"
-          :app:lintDebug :app:testDebugUnitTest :app:assembleDebug
+        run: |
+          ./gradlew --no-daemon --no-configuration-cache --max-workers=2 \
+            "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
+            :app:testDebugUnitTest
+          ./gradlew --no-daemon --no-configuration-cache --max-workers=2 \
+            "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
+            "-Peta.buildMetadata=etax.${HEAD_SHA::7}" \
+            :app:lintDebug :app:assembleDebug
 
       - name: 上传检查报告
         if: failure()

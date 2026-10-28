@@ -1,9 +1,10 @@
 name: Etax Build
 
-# 只在 etax-* 分支或手动触发时运行，不影响上游自带的工作流
+# 后台版唯一的签名构建入口；PR 检查不读取签名 Secrets。
 on:
   push:
     branches:
+      - main
       - "etax-*"
   workflow_dispatch:
 
@@ -23,6 +24,8 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: 校验 etax 接线完整
         run: bash etax/check_hooks.sh
@@ -31,30 +34,7 @@ jobs:
         uses: ./.github/actions/setup-build
 
       - name: 从源码编译 root 引擎并内嵌
-        run: |
-          set -euo pipefail
-          # 引擎是独立的 javac + D8 一步（非 Gradle 模块）。稳健编译：从源码现编，不强求与本地逐字节一致。
-          sdkmanager "build-tools;35.0.0" >/dev/null
-          BT="$ANDROID_HOME/build-tools/35.0.0"
-          AJ="$ANDROID_HOME/platforms/android-37/android.jar"
-          [[ -f "$AJ" ]] || AJ="$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar | sort -V | tail -1)"
-          D8JAR="$BT/lib/d8.jar"
-          echo "android.jar=$AJ  d8=$D8JAR"
-          OUT="$RUNNER_TEMP/engine-out"
-          ANDROID_JAR="$AJ" R8_JAR="$D8JAR" SRC="$PWD/etax/engine/src" \
-            OUT="$OUT" WORK="$RUNNER_TEMP/engine-work" \
-            sh etax/engine/build_engine.sh
-          # 版本串从源码 BUILD 常量抽取，和 dex 同源、永不漂移
-          BUILD="$(sed -n 's/.*static final String BUILD = "\([^"]*\)".*/\1/p' etax/engine/src/VDrive.java | head -1)"
-          [[ -n "$BUILD" ]] || { echo "::error::无法从 VDrive.java 读取 BUILD 常量"; exit 1; }
-          # dex 和 version 放 assets 根（check_pair.sh 读这里）；启动脚本放 assets/eta-engine/（App 首次运行释放到 /data/local/tmp/eta/）
-          cp "$OUT/classes.dex" app/src/main/assets/vdrive.dex
-          printf '%s' "$BUILD" > app/src/main/assets/vdrive.version
-          mkdir -p app/src/main/assets/eta-engine
-          for f in vd.sh install_vdrive.sh check_pair.sh; do
-            cp "etax/engine/$f" "app/src/main/assets/eta-engine/$f"
-          done
-          echo "引擎已内嵌：build=$BUILD dex=$(sha256sum app/src/main/assets/vdrive.dex | cut -c1-16) ($(stat -c%s app/src/main/assets/vdrive.dex)B)"
+        run: bash etax/embed_engine.sh
 
       - name: 后台任务回归与静态检查
         run: |

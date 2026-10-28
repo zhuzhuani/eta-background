@@ -1,8 +1,7 @@
 #!/bin/sh
-# build_engine.sh — compile vdrive/src/*.java into classes.dex.
-# This is exactly what build_all.sh:17-23 does, extracted so it can run alone in CI.
+# Compile engine/src and shared/src into classes.dex, independently of Gradle.
 #
-#   ANDROID_JAR=/opt/android/platforms/android-36/android.jar \
+#   ANDROID_JAR=/opt/android/platforms/android-37.0/android.jar \
 #   R8_JAR=/opt/buildtools/r8.jar \
 #   OUT=$PWD/out \
 #   sh build_engine.sh
@@ -12,10 +11,10 @@
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-SRC=${SRC:-$HERE/vdrive/src}
+SRC=${SRC:-$HERE/src}
 SHARED=${SHARED:-$HERE/../shared/src}
-OUT=${OUT:-$HERE/vdrive/dexout}
-WORK=${WORK:-$HERE/vbuild2}
+OUT=${OUT:-$HERE/build/dex}
+WORK=${WORK:-$HERE/build/work}
 ANDROID_JAR=${ANDROID_JAR:?set ANDROID_JAR to platforms/android-XX/android.jar}
 R8_JAR=${R8_JAR:?set R8_JAR to r8.jar (contains com.android.tools.r8.D8)}
 MIN_API=${MIN_API:-29}
