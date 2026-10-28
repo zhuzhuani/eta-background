@@ -15,6 +15,7 @@ import org.robolectric.annotation.Config
 class AgentRuntimeServiceRetentionTest {
     @Test
     fun dismissReleasesContinuationHistoryBeforeTheServiceIsDestroyed() {
+        io.github.mangi.eta.data.datastore.SettingsDataStore.init(org.robolectric.RuntimeEnvironment.getApplication())
         val controller = Robolectric.buildService(AgentRuntimeService::class.java).create()
         try {
             val service = controller.get()

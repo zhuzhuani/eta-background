@@ -22,6 +22,52 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36], application = Application::class)
 class AgentRuntimeScreenOnTest {
+    @org.junit.Before
+    fun initializeSettings() {
+        io.github.mangi.eta.data.datastore.SettingsDataStore.init(org.robolectric.RuntimeEnvironment.getApplication())
+    }
+
+    @Test
+    @Config(sdk = [37])
+    fun glowOffCreatesNoBackgroundWindowButPreservesForegroundScreenOn() {
+        org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(false)
+        val previous = kotlinx.coroutines.runBlocking {
+            io.github.mangi.eta.data.repository.AppearanceSettingsRepository.settings().also {
+                io.github.mangi.eta.data.repository.AppearanceSettingsRepository.update(it.copy(runtimeGlowEnabled = false))
+            }
+        }
+        val controller = Robolectric.buildService(AgentRuntimeService::class.java).create()
+        try {
+            val service = controller.get()
+            service.registerRun("glow-off-background", ownsGui = false)
+            repeat(100) {
+                if (service.field<Boolean>("runtimeGlowEnabled")) {
+                    shadowOf(Looper.getMainLooper()).idle()
+                    Thread.sleep(10)
+                }
+            }
+            assertFalse(service.field<Boolean>("runtimeGlowEnabled"))
+            org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(true)
+            service.invoke("publishExecutionState")
+            assertNull(service.field<ComposeView?>("glowView"))
+            org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(false)
+            service.registerRun("glow-off-foreground", ownsGui = true)
+            org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(true)
+            service.invoke("publishExecutionState")
+            val view = service.field<ComposeView>("glowView")
+            val params = service.field<android.view.WindowManager.LayoutParams>("glowParams")
+            assertTrue(view.keepScreenOn)
+            assertEquals(1, params.width)
+            assertEquals(1, params.height)
+        } finally {
+            controller.destroy()
+            kotlinx.coroutines.runBlocking {
+                io.github.mangi.eta.data.repository.AppearanceSettingsRepository.update(previous)
+            }
+            org.robolectric.shadows.ShadowSettings.setCanDrawOverlays(false)
+        }
+    }
+
     @Test
     fun returningToEtaSuppressesAmbientWindowsButRetainsBackgroundTaskCard() {
         val controller = Robolectric.buildService(AgentRuntimeService::class.java).create()

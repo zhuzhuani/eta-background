@@ -18,6 +18,11 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36], application = Application::class)
 class AgentRuntimePreparationFailureTest {
+    @org.junit.Before
+    fun initializeSettings() {
+        io.github.mangi.eta.data.datastore.SettingsDataStore.init(RuntimeEnvironment.getApplication())
+    }
+
     @Test
     fun cancellationWaitsForEntryPersistenceBeforePublishingTerminalResult() {
         val context = RuntimeEnvironment.getApplication()

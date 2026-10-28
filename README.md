@@ -8,6 +8,7 @@
 
 | 功能 | Eta 后台版的实现 |
 | --- | --- |
+| 前后台选择 | 当前页面与当面操作使用前台工具；明确要求后台执行或续接后台任务时使用虚拟屏。 |
 | 后台操作 App | Root 虚拟屏承载目标 App；每个任务独立管理屏幕、观察结果与输入状态。 |
 | 双任务与队列 | 最多两个任务执行、两块执行或保留中的虚拟屏；其他请求排队，同一 App 串行使用。 |
 | 实时会话 | 长按电源键提交后即可在 ETA 会话看到运行记录，退出助手面板不取消任务。 |
@@ -15,7 +16,7 @@
 | 通知栏继续指令 | 原生内联输入直接提交到原会话，无需打开聊天；另有“打开 ETA 会话”入口。 |
 | 完成后接管 App | 停止截图采集并保留页面，点击结果卡请求将原有任务移回前台；确认旧屏为空后释放。 |
 | 横屏、截图与节点 | 统一屏幕身份、逻辑尺寸和方向；截图坐标带帧引用，错误原因可诊断；无节点页面可使用截图坐标工具。 |
-| 助手界面 | 边缘流光、助手面板退出与拖动过渡、会话阅读位置恢复。 |
+| 助手界面 | 可在外观设置开关的边缘流光、助手面板退出与拖动过渡、会话阅读位置恢复。 |
 | 稳定性策略 | 息屏暂停、解锁后手动继续；不使用后台唤醒锁维持息屏执行，不为铺满屏幕强制重启目标 App。 |
 
 上游 v3.3.5 的子智能体、独立子模型、过程详情、工具摘要和 Debian 环境恢复已合入。后台版仍限制两块虚拟屏；子智能体不能借用父任务的后台屏幕工具。详见[版本对比与更新记录](etax/README.md)。
@@ -34,12 +35,12 @@
 
 | 版本 | 源码 | 更新内容 |
 | --- | --- | --- |
-| 3.3.5 后台版 | [main](https://github.com/Lmin2419/claude/tree/main) | 上游 3.3.5 与后台版特性整合；项目整理与命名。 |
-| 3.3.4 后台扩展历程 | [历史记录](https://github.com/Lmin2419/claude/commits/etax-3.3.4-background-multitask) | 多任务、原生通知、双屏稳定性、接管与几何修复。该开发分支之后已继续合入 3.3.5。 |
-| 3.3.4 早期版 | [etax-3.3.4](https://github.com/Lmin2419/claude/tree/etax-3.3.4) | 后台引擎源码化、通知与电源键入口接线。 |
-| 3.3.3 早期版 | [etax-3.3.3](https://github.com/Lmin2419/claude/tree/etax-3.3.3) | 初版后台扩展及 Root 引擎内嵌、自启。 |
+| 3.3.5 后台版 | [main](https://github.com/Lmin2419/eta-background/tree/main) | 上游 3.3.5 与后台版特性整合；项目整理与命名。 |
+| 3.3.4 后台扩展历程 | [历史记录](https://github.com/Lmin2419/eta-background/commits/etax-3.3.4-background-multitask) | 多任务、原生通知、双屏稳定性、接管与几何修复。该开发分支之后已继续合入 3.3.5。 |
+| 3.3.4 早期版 | [etax-3.3.4](https://github.com/Lmin2419/eta-background/tree/etax-3.3.4) | 后台引擎源码化、通知与电源键入口接线。 |
+| 3.3.3 早期版 | [etax-3.3.3](https://github.com/Lmin2419/eta-background/tree/etax-3.3.3) | 初版后台扩展及 Root 引擎内嵌、自启。 |
 
-在 [Actions → Etax Build](https://github.com/Lmin2419/claude/actions/workflows/etax-build.yml) 的成功构建中下载 APK。Actions 附件需要登录且会过期；长期分发可由维护者上传到本仓库 Releases。自行构建与签名见[构建说明](.github/RELEASING.md)。官方 Eta 的安装包不包含本分支的后台扩展。
+在 [Actions → Etax Build](https://github.com/Lmin2419/eta-background/actions/workflows/etax-build.yml) 的成功构建中下载 APK。Actions 附件需要登录且会过期；长期分发可由维护者上传到本仓库 Releases。自行构建与签名见[构建说明](.github/RELEASING.md)。官方 Eta 的安装包不包含本分支的后台扩展。
 
 ## 源码与测试
 
@@ -49,7 +50,7 @@ Android 应用位于 `app/`；后台桥接在 `app/src/main/java/com/eta/shadow/
 
 ## 上游与许可
 
-感谢 **蛮吉（Mangi-11）** 及 [Eta 上游贡献者](https://github.com/Mangi-11/Eta/graphs/contributors)。原始项目：[Mangi-11/Eta](https://github.com/Mangi-11/Eta)；本分支维护：[Lmin2419/claude](https://github.com/Lmin2419/claude)。
+感谢 **蛮吉（Mangi-11）** 及 [Eta 上游贡献者](https://github.com/Mangi-11/Eta/graphs/contributors)。原始项目：[Mangi-11/Eta](https://github.com/Mangi-11/Eta)；本分支维护：[Lmin2419/eta-background](https://github.com/Lmin2419/eta-background)。
 
 本项目沿用 **[PolyForm Noncommercial 1.0.0](LICENSE)**，保留上游版权与 Required Notice。源码可按该许可证使用、修改和分发，商业用途不在其一般授权范围内。这是带非商业限制的源码公开项目，不是 MIT/Apache 或 OSI 定义的开源许可。第三方组件继续遵循各自许可证。
 

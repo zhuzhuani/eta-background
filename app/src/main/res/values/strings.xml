@@ -1467,4 +1467,6 @@
   <string name="chat_queue_remove">移除排队消息</string>
   <string name="chat_queue_images_only">[%1$d 张图片]</string>
   <string name="chat_queue_files_only">[%1$d 个文件]</string>
+    <string name="appearance_runtime_glow">Runtime edge glow</string>
+    <string name="appearance_runtime_glow_summary">Show screen edge lighting during assistant wake and task execution. Changes take effect immediately.</string>
 </resources>

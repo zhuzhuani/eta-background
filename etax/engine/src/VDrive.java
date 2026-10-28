@@ -8,7 +8,7 @@ import java.util.*;
 
 /** Root transport. Mutable display/input/capture state lives in independent workers. */
 public final class VDrive {
-    static final String BUILD = "20261028-e36-recovery";
+    static final String BUILD = "20261028-e37-deploy";
     static java.util.function.BooleanSupplier health = () -> true;
     static volatile boolean systemInvalid;
     private static final String INSTANCE = UUID.randomUUID().toString();
@@ -68,6 +68,14 @@ public final class VDrive {
     }
 
     public static void main(String[] args) throws Exception {
+        // Fail before attaching to Android services, without exposing credentials or a bare stack trace.
+        try {
+            credential = com.eta.shadow.EngineWire.readToken(new File("/data/local/tmp/eta/engine.token"));
+        } catch (com.eta.shadow.EngineWire.CredentialException error) {
+            System.err.println("ETA_ENGINE_ERROR=" + error.code);
+            System.exit(78);
+            return;
+        }
         Looper.prepareMainLooper();
         Class<?> at = Class.forName("android.app.ActivityThread");
         java.lang.reflect.Method systemMain = at.getDeclaredMethod("systemMain");
@@ -78,7 +86,6 @@ public final class VDrive {
         context = (Context) getContext.invoke(activityThread);
         pid = android.os.Process.myPid();
         health = new SystemServiceHealth();
-        credential = com.eta.shadow.EngineWire.readToken(new File("/data/local/tmp/eta/engine.token"));
         try (InputStream input = new FileInputStream("/data/local/tmp/eta/vdrive.dex")) {
             dexHash = com.eta.shadow.EngineWire.sha256(input);
         }
@@ -106,7 +113,13 @@ public final class VDrive {
         if (port > 0) {
             ServerSocket server = new ServerSocket();
             server.setReuseAddress(true);
-            server.bind(new InetSocketAddress("127.0.0.1", port));
+            try { server.bind(new InetSocketAddress("127.0.0.1", port)); }
+            catch (java.net.BindException busy) {
+                server.close();
+                System.err.println("ETA_ENGINE_ERROR=PORT_BUSY");
+                System.exit(98);
+                return;
+            }
             new Thread(() -> {
                 while (!server.isClosed()) {
                     try {

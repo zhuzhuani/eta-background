@@ -57,6 +57,7 @@ import io.github.mangi.eta.core.AndroidAgentLogger
 import io.github.mangi.eta.core.ModuleConfig
 import io.github.mangi.eta.core.safeLogType
 import io.github.mangi.eta.data.repository.RuntimeConfigRepository
+import io.github.mangi.eta.data.repository.AppearanceSettingsRepository
 import kotlin.concurrent.thread
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -101,6 +102,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
 
     private var windowManager: WindowManager? = null
     private var glowView: ComposeView? = null
+    private var runtimeGlowEnabled = true
     private var capsuleView: ComposeView? = null
     private var resultCardView: ComposeView? = null
     private var glowParams: WindowManager.LayoutParams? = null
@@ -166,6 +168,17 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         }, Context.RECEIVER_NOT_EXPORTED)
         AgentOverlayClearance.attach(clearanceHost)
         serviceScope.launch { guiControl.state.collect(::applyGuiControlState) }
+        serviceScope.launch {
+            AppearanceSettingsRepository.settingsFlow().collect { appearance ->
+                if (runtimeGlowEnabled != appearance.runtimeGlowEnabled) {
+                    runtimeGlowEnabled = appearance.runtimeGlowEnabled
+                    glowView?.let { view -> runCatching { windowManager?.removeView(view) } }
+                    glowView = null
+                    glowParams = null
+                    publishExecutionState()
+                }
+            }
+        }
     }
 
     override fun onBind(intent: Intent): IBinder? {
@@ -1178,6 +1191,11 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         keepScreenOnState.value = enabled
         capsuleView?.keepScreenOn = enabled
         glowView?.keepScreenOn = enabled
+        if (!enabled && !runtimeGlowEnabled) {
+            glowView?.let { view -> runCatching { windowManager?.removeView(view) } }
+            glowView = null
+            glowParams = null
+        }
     }
 
     private fun isMainDisplayOn(): Boolean = getSystemService(android.hardware.display.DisplayManager::class.java)
@@ -1191,11 +1209,15 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         windowManager = wm
 
         // ── 氛围光窗口：全屏触摸穿透，彩虹光圈，截图时被 takeScreenshotOfWindow 过滤 ─
-        if (glowView == null) {
+        if ((runtimeGlowEnabled || keepScreenOn.value) && glowView == null) {
             val glow = createOverlayComposeView {
-                AgentOverlayGlow(state = ambientState.value, corners = screenCornerRadii())
+                if (runtimeGlowEnabled) AgentOverlayGlow(state = ambientState.value, corners = screenCornerRadii())
             }
-            val glowLp = glowLayoutParams()
+            val glowLp = glowLayoutParams().apply {
+                // Keep the existing foreground-only screen-on behavior when visuals are off.
+                // This empty, touch-through window has no animation and acquires no wake lock.
+                if (!runtimeGlowEnabled) { width = 1; height = 1 }
+            }
             glow.keepScreenOn = keepScreenOn.value
             runCatching { wm.addView(glow, glowLp) }.onFailure { throwable ->
                 AndroidAgentLogger.warnThrottled("runtime_glow_add_view_failed") {

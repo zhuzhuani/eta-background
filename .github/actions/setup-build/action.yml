@@ -4,6 +4,12 @@ description: 安装 JDK、Gradle 与 Android SDK，供 PR Check 和 Etax Build �
 runs:
   using: composite
   steps:
+    - name: 安装 Android Shell 兼容性测试工具
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends mksh busybox toybox
+
     - name: 配置 JDK 25
       uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
       with:

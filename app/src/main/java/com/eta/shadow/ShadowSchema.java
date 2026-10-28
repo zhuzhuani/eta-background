@@ -3,32 +3,12 @@ package com.eta.shadow;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
 /** Appends the hidden-display tools to Eta's tool schema array. */
 public final class ShadowSchema {
 
-    /**
-     * Native GUI tools superseded by screen_*. They are removed from the model's
-     * tool list while the engine is healthy, otherwise the model keeps picking
-     * launch_app/observe_screen and drives the user's own screen.
-     */
-    private static final Set<String> REPLACED = new HashSet<>(Arrays.asList(
-            "launch_app", "observe_screen", "tap", "tap_element",
-            "long_press", "long_press_element", "swipe", "scroll", "scroll_element",
-            "type_text", "press_key", "wait_for_text", "wait_for_package"));
-
     public static void append(JSONArray tools) {
-        android.content.Context ctx = ShadowSettings.app();
-        boolean engine = ctx != null && ShadowSettings.engineReady(ctx);
-        if (ctx != null) android.util.Log.i("EtaShadow", "schema append engine=" + engine + " n=" + tools.length());
-        if (engine) {
-            removeReplaced(tools);
-        }
+        // Foreground tools remain available even with a healthy background engine.
+        // The user's current-page request must never force an App onto another display.
         try {
             for (int i = 0; i < tools.length(); i++) {
                 JSONObject o = tools.optJSONObject(i);
@@ -41,7 +21,7 @@ public final class ShadowSchema {
             tools.put(tool("screen_open",
                     "在本任务独占的后台虚拟屏打开应用。同一应用被其他任务占用时等待释放。"
                     + "不同应用最多使用两个虚拟屏；额外任务等待空闲位置，不会抢占正在执行的任务。"
-                    + "所以凡是涉及界面的操作都走这个工具，不要用 terminal 执行 am/input/screencap。"
+                    + "仅用于用户明确要求后台执行或续接已有后台任务。当前页面、已登录页面、当面操作请用 observe_screen 等前台工具，不要搬走应用。不要用 terminal 执行 am/input/screencap。"
                     + "只传包名即可（如 com.tencent.mm）。暂停恢复后必须先重新观察页面再操作；操作结束后用 screen_finish 收尾。",
                     props3("component", "string", "包名或 package/activity，例如 com.tencent.mm",
                             "package", "string", "包名（与 component 二选一）",
@@ -99,26 +79,6 @@ public final class ShadowSchema {
                                     + "destroy（直接释放虚拟屏）")),
                     ""));
         } catch (Throwable ignored) { }
-    }
-
-    /** Drop native GUI tools so screen_* is the only way to drive an app. */
-    private static void removeReplaced(JSONArray tools) {
-        try {
-            List<JSONObject> keep = new ArrayList<>();
-            for (int i = 0; i < tools.length(); i++) {
-                JSONObject o = tools.optJSONObject(i);
-                if (o == null) continue;
-                JSONObject fn = o.optJSONObject("function");
-                String name = fn != null ? fn.optString("name") : o.optString("name");
-                if (!REPLACED.contains(name)) keep.add(o);
-            }
-            int before = tools.length();
-            while (tools.length() > 0) tools.remove(tools.length() - 1);
-            for (JSONObject o : keep) tools.put(o);
-            android.util.Log.i("EtaShadow", "tools " + before + " -> " + tools.length());
-        } catch (Throwable t) {
-            android.util.Log.w("EtaShadow", "removeReplaced failed: " + t);
-        }
     }
 
     private static JSONObject tool(String name, String desc, JSONObject properties, String required) {

@@ -1448,4 +1448,6 @@
   <string name="chat_queue_remove">移除排队消息</string>
   <string name="chat_queue_images_only">[%1$d 张图片]</string>
   <string name="chat_queue_files_only">[%1$d 个文件]</string>
+    <string name="appearance_runtime_glow">运行时屏幕流光</string>
+    <string name="appearance_runtime_glow_summary">显示助手唤醒及任务执行时的屏幕边缘光效，修改后立即生效。</string>
 </resources>

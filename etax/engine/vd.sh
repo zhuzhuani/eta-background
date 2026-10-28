@@ -9,9 +9,22 @@ umask 077
 mkdir -p "$D"
 chmod 700 "$D"
 if [ "${ETA_ENGINE_LOCKED:-0}" != 1 ]; then
-  exec 9>"$D/engine.lock"
-  flock -n 9 || { echo 'engine deployment busy'; exit 75; }
+  : >> "$D/engine.lock"
+  (
+    flock -n 0 || { echo 'ETA_ENGINE_ERROR=DEPLOY_BUSY'; exit 75; }
+    export ETA_ENGINE_LOCKED=1
+    sh "$0" "$@"
+  ) < "$D/engine.lock"
+  exit $?
 fi
+
+# During upgrade this script and dex live in the incoming transaction directory,
+# so even an e34 installation can use the new, Binder-free bind probe.
+CONTROL_DEX=$(dirname "$0")/vdrive.dex
+wait_port_free() {
+  [ -s "$CONTROL_DEX" ] || { echo 'ETA_ENGINE_ERROR=CONTROL_PAYLOAD_MISSING'; return 1; }
+  CLASSPATH="$CONTROL_DEX" /system/bin/app_process /system/bin EngineControl await-port "$PORT" 10000
+}
 
 is_engine_pid() {
   directory=/proc/$1
@@ -57,7 +70,8 @@ stop_engine() {
     started=$(identity "$process")
     [ -n "$started" ] && records="$records $process:$started"
   done
-  [ -n "$records" ] || return 0
+  # No recognized PID is not evidence that the listening port is available.
+  [ -n "$records" ] || { wait_port_free; return $?; }
   rpc quit >/dev/null || true
   for record in $records; do
     process=${record%:*}; started=${record#*:}
@@ -72,9 +86,10 @@ stop_engine() {
       sleep 0.2
       count=$((count + 1))
     done
-    [ "$(identity "$process")" != "$started" ] || { echo 'old engine has not exited'; return 1; }
+    [ "$(identity "$process")" != "$started" ] || { echo 'ETA_ENGINE_ERROR=STOP_FAILED'; return 1; }
   done
-  [ -z "$(engine_pids)" ] || { echo 'another engine appeared during stop'; return 1; }
+  [ -z "$(engine_pids)" ] || { echo 'ETA_ENGINE_ERROR=STOP_FAILED'; return 1; }
+  wait_port_free
 }
 
 healthy_status() {
@@ -97,18 +112,27 @@ case "${1:-}" in
   status) healthy_status; exit $? ;;
 esac
 
-[ -s "$DEX" ] && [ -s "$D/engine.token" ] && [ -s "$D/vdrive.version" ] || { echo 'engine payload incomplete'; exit 1; }
+[ -s "$DEX" ] && [ -s "$D/vdrive.version" ] || { echo 'ETA_ENGINE_ERROR=CONTROL_PAYLOAD_MISSING'; exit 1; }
+[ -f "$D/engine.token" ] || { echo 'ETA_ENGINE_ERROR=TOKEN_MISSING'; exit 78; }
+if [ "$(wc -c < "$D/engine.token")" -gt 65 ] ||
+   ! LC_ALL=C grep -aEq '^[0-9a-f]{64}$' "$D/engine.token"; then
+  echo 'ETA_ENGINE_ERROR=TOKEN_INVALID'; exit 78
+fi
 stop_engine
 for number in 2 1; do
   [ ! -f "$LOG.$number" ] || mv -f "$LOG.$number" "$LOG.$((number + 1))"
 done
 [ ! -f "$LOG" ] || mv -f "$LOG" "$LOG.1"
-# The engine must not inherit the installer's lock descriptor.
-setsid nohup env CLASSPATH="$DEX" /system/bin/app_process /system/bin --nice-name=eta-vdrive-8733 VDrive --tcp="$PORT" --no-mcp >"$LOG" 2>&1 9>&- &
+# The resident engine must inherit neither the lock's stdin nor its ownership flag.
+(
+  unset ETA_ENGINE_LOCKED
+  exec setsid nohup env CLASSPATH="$DEX" /system/bin/app_process /system/bin --nice-name=eta-vdrive-8733 VDrive --tcp="$PORT" --no-mcp </dev/null >"$LOG" 2>&1
+) &
 started_pid=$!
 started_at=$(identity "$started_pid")
 count=0
-while [ "$count" -lt 35 ]; do
+startup_deadline=$(( $(cut -d. -f1 /proc/uptime) + 20 ))
+while [ "$count" -lt 35 ] && [ "$(cut -d. -f1 /proc/uptime)" -lt "$startup_deadline" ]; do
   if response=$(healthy_status); then
     got=$(printf '%s' "$response" | sed -n 's/.*"pid":\([0-9]*\).*/\1/p')
     if [ "$got" = "$started_pid" ] && [ "$(identity "$started_pid")" = "$started_at" ]; then
@@ -121,6 +145,7 @@ while [ "$count" -lt 35 ]; do
   sleep 0.2
   count=$((count + 1))
 done
+grep '^ETA_ENGINE_ERROR=' "$LOG" 2>/dev/null || true
 stop_engine || true
-echo 'engine startup verification failed'
+echo 'ETA_ENGINE_ERROR=START_FAILED'
 exit 1

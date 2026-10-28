@@ -23,12 +23,24 @@ public final class EngineWire {
         }
         return out.length() == 0 ? null : out.toString();
     }
+    public static final class CredentialException extends IOException {
+        public final String code;
+        public CredentialException(String code) { super(code); this.code = code; }
+    }
     public static String readToken(File file) throws IOException {
-        try (Reader reader = new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)) {
-            String token = readLine(reader, 65);
-            if (token == null || !token.trim().matches("[a-f0-9]{64}")) throw new IOException("invalid engine credential");
-            return token.trim();
-        }
+        if (!file.exists()) throw new CredentialException("TOKEN_MISSING");
+        try (InputStream input = new FileInputStream(file)) {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            for (int value; (value = input.read()) != -1;) {
+                if (bytes.size() >= 65) throw new CredentialException("TOKEN_INVALID");
+                bytes.write(value);
+            }
+            String token = new String(bytes.toByteArray(), StandardCharsets.UTF_8);
+            // App-generated tokens are exactly 64 bytes; accept one legacy LF, no extra lines.
+            if (!token.matches("[a-f0-9]{64}\\n?")) throw new CredentialException("TOKEN_INVALID");
+            return token.substring(0, 64);
+        } catch (CredentialException error) { throw error; }
+        catch (IOException error) { throw new CredentialException("TOKEN_UNREADABLE"); }
     }
     public static String sha256(InputStream input) throws Exception {
         MessageDigest digest = MessageDigest.getInstance("SHA-256");

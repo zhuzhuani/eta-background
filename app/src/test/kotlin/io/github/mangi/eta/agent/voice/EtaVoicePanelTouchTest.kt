@@ -50,6 +50,18 @@ import top.yukonga.miuix.kmp.squircle.LocalSquircleEnabled
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class EtaVoicePanelTouchTest {
     @Test
+    fun disablingGlowStillRevealsTextInputAndCompletesEntranceOnce() =
+        withPanel(recognitionEnabled = false, glowEnabled = false, initialFrames = 1) { panel ->
+            panel.gainWindowFocus()
+            panel.advanceUntil { panel.contentReveals == 1 }
+            assertEquals(1, panel.entrances)
+            panel.advance()
+            assertEquals(1, panel.contentReveals)
+            assertEquals(1, panel.entrances)
+            assertTrue(panel.keyboardShows > 0)
+        }
+
+    @Test
     fun shortDragSettlesEvenWhenItReturnsToTheSameAnchor() = withPanel { panel ->
         panel.showReply()
         val before = panel.handleBounds()
@@ -226,10 +238,11 @@ class EtaVoicePanelTouchTest {
         recognitionEnabled: Boolean = true,
         initialFrames: Int = 180,
         motionScale: Float = 1f,
+        glowEnabled: Boolean = true,
         block: (Panel) -> Unit,
     ) {
         val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup().visible()
-        val panel = Panel(controller.get(), recognitionEnabled, motionScale) { controller.windowFocusChanged(true) }
+        val panel = Panel(controller.get(), recognitionEnabled, motionScale, glowEnabled) { controller.windowFocusChanged(true) }
         try {
             panel.advance(initialFrames)
             block(panel)
@@ -243,6 +256,7 @@ class EtaVoicePanelTouchTest {
         val activity: ComponentActivity,
         recognitionEnabled: Boolean,
         motionScale: Float,
+        glowEnabled: Boolean,
         private val onGainWindowFocus: () -> Unit,
     ) {
         val state = mutableStateOf(EtaVoiceUiState())
@@ -274,7 +288,7 @@ class EtaVoicePanelTouchTest {
             val view = ComposeView(activity)
             view.setParentCompositionContext(recomposer)
             view.setContent {
-                AgentAppTheme(AppearanceSettings(), applyInterfaceScale = false) {
+                AgentAppTheme(AppearanceSettings(runtimeGlowEnabled = glowEnabled), applyInterfaceScale = false) {
                     CompositionLocalProvider(
                         LocalSquircleEnabled provides false,
                         LocalSoftwareKeyboardController provides keyboard,

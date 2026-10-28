@@ -14,6 +14,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 自启后台虚拟屏引擎（etax）。
@@ -100,6 +101,11 @@ public final class Engine {
                     + "请确认手机已 root，并在 Magisk/KernelSU 里允许 io.github.mangi.etax 使用 root，然后重试。"
                     + "（刚重启过的话临时 root 已失效，需要先重新获取 root。）";
         }
+        if ("STAGE_FAILED".equals(r)) return "无法暂存 APK 内的引擎文件，请检查应用存储空间并导出诊断。";
+        if ("DEPLOY_BUSY".equals(r)) return "另一次后台引擎部署尚未结束，请稍后重试。";
+        if ("PORT_BUSY".equals(r)) return "后台引擎端口尚未释放，本次启动未完成，请稍后重试；可导出诊断查看部署结果。";
+        if (r != null && r.startsWith("TOKEN_")) return "后台引擎认证文件缺失、损坏或无法读取，请导出诊断；不会绕过认证启动。";
+        if ("STOP_FAILED".equals(r) || "ROLLBACK_FAILED".equals(r)) return "未能确认引擎完全退出，已中止后续替换或回滚，请导出诊断。";
         if ("START_FAILED".equals(r) || "INSTALL_FAILED".equals(r) || "TIMEOUT".equals(r)) {
             return "后台引擎恢复尚未完成，已限制重试频率，请稍后重新打开后台屏幕；"
                     + "不要重复发送可能已执行的点击或消息。可在设置中导出诊断查看恢复结果。";
@@ -137,7 +143,7 @@ public final class Engine {
 
     private static void doEnsure(Context ctx) {
         File stage = stageAssets(ctx);
-        if (stage == null) { lastReason = "NOT_BUNDLED"; return; }
+        if (stage == null) { if (lastReason == null) lastReason = "NOT_BUNDLED"; return; }
         if (isReady(ctx, 1500)) {
             lastReason = null;
             ShadowSettings.markEngineReady(true);
@@ -205,7 +211,7 @@ public final class Engine {
      */
     private static File stageAssets(Context ctx) {
         File directory = new File(ctx.getFilesDir(), "eta-engine-stage");
-        if (!directory.isDirectory() && !directory.mkdirs()) return null;
+        if (!directory.isDirectory() && !directory.mkdirs()) { lastReason = "STAGE_FAILED"; return null; }
         try {
             EngineCredential.get(ctx);
             // File locking also covers the accessibility and runtime processes.
@@ -225,6 +231,8 @@ public final class Engine {
             }
             return directory;
         } catch (Exception error) {
+            lastReason = error instanceof EngineWire.CredentialException
+                    ? ((EngineWire.CredentialException) error).code : "STAGE_FAILED";
             android.util.Log.w(TAG, "stage engine failed: " + error.getClass().getSimpleName());
             return null;
         }
@@ -259,17 +267,20 @@ public final class Engine {
                 os.flush();
             }
             final Process proc = p;
+            final AtomicReference<String> failure = new AtomicReference<>();
             Thread reader = new Thread(new Runnable() {
-                public void run() { drain(proc); }
+                public void run() { drain(proc, failure); }
             });
             reader.setDaemon(true);
             reader.start();
             boolean done = p.waitFor(90, TimeUnit.SECONDS);
+            // The child can exit before the pipe reader processes its last diagnostic.
+            if (done) reader.join(1000);
             if (!done) {
                 lastReason = "TIMEOUT";
                 p.destroyForcibly();
-            } else if (p.exitValue() != 0 && lastReason == null) {
-                lastReason = "INSTALL_FAILED";
+            } else if (p.exitValue() != 0) {
+                lastReason = failure.get() == null ? "INSTALL_FAILED" : failure.get();
             }
         } catch (java.io.IOException e) {
             lastReason = "NO_ROOT";                 // 没有 su 二进制：这台机器没 root
@@ -281,17 +292,24 @@ public final class Engine {
         }
     }
 
-    private static void drain(Process p) {
+    static String deploymentFailure(String line, String previous) {
+        if ("ETA_NO_ROOT".equals(line)) return "NO_ROOT";
+        if (previous != null || !line.startsWith("ETA_ENGINE_ERROR=")) return previous;
+        String code = line.substring("ETA_ENGINE_ERROR=".length());
+        return code.matches("DEPLOY_BUSY|PORT_BUSY|PORT_CHECK_FAILED|PORT_CHECK_INTERRUPTED|CONTROL_PAYLOAD_MISSING|TOKEN_MISSING|TOKEN_INVALID|TOKEN_UNREADABLE|STOP_FAILED|START_FAILED|ROLLBACK_FAILED") ? code : previous;
+    }
+
+    private static void drain(Process p, AtomicReference<String> failure) {
         try (InputStream in = p.getInputStream()) {
-            byte[] buf = new byte[1024];
-            StringBuilder sb = new StringBuilder();
-            int n;
-            while ((n = in.read(buf)) > 0) {
-                if (sb.length() < 4096) sb.append(new String(buf, 0, n, "UTF-8"));
+            StringBuilder line = new StringBuilder();
+            for (int value; (value = in.read()) != -1;) {
+                if (value == '\n') {
+                    failure.set(deploymentFailure(line.toString(), failure.get()));
+                    line.setLength(0);
+                } else if (line.length() < 512) line.append((char)value);
             }
-            String out = sb.toString();
-            if (out.contains("ETA_NO_ROOT")) lastReason = "NO_ROOT";
-            if (!out.trim().isEmpty()) android.util.Log.i(TAG, "vd.sh: " + out.trim());
+            failure.set(deploymentFailure(line.toString(), failure.get()));
+            if (failure.get() != null) android.util.Log.w(TAG, "engine deployment: " + failure.get());
         } catch (Throwable ignored) { }
     }
 }

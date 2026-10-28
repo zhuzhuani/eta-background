@@ -238,10 +238,14 @@ internal fun EtaVoicePanel(
                 ),
         )
 
-        EtaAssistantEdgeGlow(
+        if (io.github.mangi.eta.ui.app.LocalAppearanceSettings.current.runtimeGlowEnabled) EtaAssistantEdgeGlow(
             active = (speech.active || !entranceComplete) && !exitRequested,
             onEntranceFinished = onEntranceFinished,
         )
+        else LaunchedEffect(entranceComplete) {
+            // Text entry must not wait for an animation that the user has disabled.
+            if (!entranceComplete) onEntranceFinished()
+        }
         EtaAssistantWave(
             active = (speech.active || !entranceComplete) && !exitRequested,
             level = speechLevel,

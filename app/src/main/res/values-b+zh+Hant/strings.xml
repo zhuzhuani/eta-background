@@ -1378,4 +1378,6 @@
   <string name="chat_queue_remove">移除排隊訊息</string>
   <string name="chat_queue_images_only">[%1$d 張圖片]</string>
   <string name="chat_queue_files_only">[%1$d 個檔案]</string>
+    <string name="appearance_runtime_glow">執行時螢幕流光</string>
+    <string name="appearance_runtime_glow_summary">顯示助手喚醒及任務執行時的螢幕邊緣光效，修改後立即生效。</string>
 </resources>

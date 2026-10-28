@@ -127,9 +127,9 @@ public final class ShadowTools {
                     if (cmd.contains(p)) { hit = p; break; }
                 }
                 if (hit != null) {
-                    return "请改用 screen_* 工具做界面操作（检测到 shell 命令 `"
+                    return "请使用 GUI 工具做界面操作（检测到 shell 命令 `"
                             + hit.trim() + "`）。"
-                            + "screen_open 会把目标应用绑定到本任务的后台虚拟屏，同一应用被占用时等待。";
+                            + "当前页面使用 observe_screen/tap_element 等前台工具；只有用户要求后台执行时使用 screen_*，不要擅自切换操作位置。";
                 }
             }
         } catch (Throwable ignored) {

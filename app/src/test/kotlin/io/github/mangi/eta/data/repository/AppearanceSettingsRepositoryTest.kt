@@ -25,6 +25,7 @@ class AppearanceSettingsRepositoryTest {
         val appearance = AppearanceSettings(
             themeMode = AppearanceThemeMode.DARK,
             monetEnabled = true,
+            runtimeGlowEnabled = false,
             accentColor = AppearanceAccentColor.TEAL,
             interfaceScale = 0.9f,
         )
