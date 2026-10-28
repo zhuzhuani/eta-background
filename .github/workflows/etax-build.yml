@@ -138,6 +138,21 @@ jobs:
           "$bt/apksigner" verify --print-certs "$apk" | head -n 3
           pkg="$("$bt/aapt2" dump packagename "$apk")"
           [[ "$pkg" == "io.github.mangi.etax" ]] || { echo "::error::包名是 $pkg，应为 io.github.mangi.etax"; exit 1; }
+          # Check the signed artifact, not only the staging directory.
+          python3 - "$apk" <<'PY'
+          import pathlib, sys, zipfile
+          with zipfile.ZipFile(sys.argv[1]) as apk:
+              for entry, source in {
+                  "assets/vdrive.dex": "app/src/main/assets/vdrive.dex",
+                  "assets/vdrive.version": "app/src/main/assets/vdrive.version",
+                  "assets/eta-engine/vd.sh": "etax/engine/vd.sh",
+                  "assets/eta-engine/install_vdrive.sh": "etax/engine/install_vdrive.sh",
+                  "assets/eta-engine/check_pair.sh": "etax/engine/check_pair.sh",
+              }.items():
+                  assert apk.read(entry) == pathlib.Path(source).read_bytes(), entry
+              assert not any(name.endswith("/engine.token") for name in apk.namelist())
+              print("Signed APK engine pair verified:", apk.read("assets/vdrive.version").decode().strip())
+          PY
           sha256sum "$apk"
           echo "path=$apk" >> "$GITHUB_OUTPUT"
 

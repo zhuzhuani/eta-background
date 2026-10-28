@@ -128,6 +128,10 @@ android {
         unitTests.isIncludeAndroidResources = true
         // Robolectric 在高版本 JDK 下需要访问内部 API，参数只作用于测试 JVM。
         unitTests.all {
+            // Robolectric plus large backup fixtures exceed Gradle's default 512 MB test heap.
+            // This limit applies only to host tests, never to the Android app process.
+            it.maxHeapSize = "2g"
+            it.maxParallelForks = 1
             it.jvmArgs(
                 "--add-opens=java.base/java.lang=ALL-UNNAMED",
                 "--add-opens=java.base/java.util=ALL-UNNAMED",
