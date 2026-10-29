@@ -93,6 +93,29 @@ class AgentAppStateConversationLoadingTest {
     }
 
     @Test
+    fun concurrentNotificationOpensImportOneArchiveWithoutExposingAnUnsavedConversation() {
+        seed("first" to conversation("first"))
+        val source = AgentRuntimeWire.ETA_VOICE_HANDOFF_SOURCE
+        val handoff = AgentRuntimeWire.EntryHandoff("concurrent-archive", source,
+            io.github.mangi.eta.agent.runtime.AgentExternalArchivePayload("核查", "concurrent", "核查任务").toJson())
+        io.github.mangi.eta.agent.runtime.AgentRunArchiveStore.add(context,
+            io.github.mangi.eta.agent.runtime.AgentRunArchiveStore.ArchivedRun(
+                handoff, emptyList(), AgentRuntimeWire.RunResult("concurrent-archive", true, "核查结果"), System.currentTimeMillis()))
+        val state = AgentAppState(context, scope)
+        val chat = io.github.mangi.eta.agent.runtime.AgentConversationIdentity.archiveConversationId(source, "concurrent")
+        val opened = mutableListOf<Boolean>()
+        repeat(3) { scope.launch { opened += state.openConversationById(chat) } }
+        awaitCondition { opened.size == 3 }
+        assertTrue(opened.all { it })
+        awaitLoaded(state, chat)
+        assertEquals(1, state.homeState.messages.filterIsInstance<AgentMessageUi>().count { it.content == "核查结果" })
+        awaitCondition {
+            runBlocking { AgentConversationStore.loadConversation(context, chat) }
+                ?.messages?.filterIsInstance<AgentMessageUi>()?.count { it.content == "核查结果" } == 1
+        }
+    }
+
+    @Test
     fun fastConversationSwitchesKeepTheLastSelectionAndRestoreEveryBody() {
         seed("first" to conversation("first"), "second" to conversation("second"), "third" to conversation("third"))
         val state = AgentAppState(context, scope)

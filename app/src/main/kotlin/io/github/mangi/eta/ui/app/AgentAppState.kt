@@ -274,6 +274,7 @@ internal class AgentAppState(
             val outbox = TaskConversationDeliveryStore.forContext(appContext)
             val results = TaskRunResultStore.forContext(appContext)
             val pending = outbox.pending()
+            if (pending.isEmpty()) return@withLock
             val savedResults = pending.associate { it.runId to results.read(it.runId) }
             withLoadedConversations(pending.mapTo(mutableSetOf()) { it.conversationId }) {
                 val acknowledge = withContext(Dispatchers.Main.immediate) {
@@ -728,7 +729,13 @@ internal class AgentAppState(
         observationJob.start()
     }
 
-    private suspend fun importArchivedExternalRuns() {
+    // Initialization, notification navigation and task receipts share one reconciliation boundary.
+    // Without it, a second importer can observe a just-created conversation before its first save.
+    private suspend fun importArchivedExternalRuns() = runtimeReconcileMutex.withLock {
+        importArchivedExternalRunsLocked()
+    }
+
+    private suspend fun importArchivedExternalRunsLocked() {
         val archivedRuns = withContext(Dispatchers.IO) {
             AgentRunArchiveStore.list(appContext)
                 .filter { AgentExternalArchivePayload.from(it.handoff.payload) != null }
