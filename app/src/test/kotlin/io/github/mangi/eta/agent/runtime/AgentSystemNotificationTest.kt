@@ -59,7 +59,7 @@ class AgentSystemNotificationTest {
             val continuation = shadowOf(reply.actionIntent).savedIntent
             assertEquals(AgentExecutionService::class.java.name, continuation.component?.className)
             assertEquals(AgentExecutionService.ACTION_REPLY, continuation.action)
-            assertEquals("app-click", continuation.getStringExtra(AgentExecutionService.EXTRA_RUN_ID))
+            assertEquals("app-click", continuation.getStringExtra("run_id"))
             assertEquals(android.net.Uri.parse("eta-task://reply/app-click"), continuation.data)
             assertEquals("chat-app-click", continuation.getStringExtra(AgentExecutionService.EXTRA_CONVERSATION_ID))
             finished.notification.actions[1].actionIntent.send()
