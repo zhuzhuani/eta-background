@@ -237,6 +237,10 @@ internal class AgentExecutionService : Service() {
         /** Terminal events bypass streaming throttles and update the original task card immediately. */
         fun completeTask(context: Context, task: TaskNotificationState) = onMain {
             val previous = cards[task.runId]
+            if (io.github.mangi.eta.agent.tasks.TaskRunResultStore.forContext(context).read(task.runId) == null) {
+                // No report means no result-ready notification; active/diagnostic state remains available.
+                return@onMain
+            }
             if (previous?.completed == true && previous.status == task.status && previous.targetPackage == task.targetPackage &&
                 previous.streamPreview == task.streamPreview) return@onMain
             cards[task.runId] = task.copy(completed = true, paused = false)
@@ -295,12 +299,12 @@ internal class AgentExecutionService : Service() {
 
         private fun destination(context: Context, task: TaskNotificationState?, id: Int): PendingIntent {
             if (task?.completed == true) {
-                if (!task.targetPackage.isNullOrBlank()) return PendingIntent.getActivity(context, id,
-                    Intent(context, CompletedAppActivity::class.java)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
-                        .setData(Uri.Builder().scheme("eta-task").authority("open").appendPath(task.runId).build())
-                        .putExtra(CompletedAppActivity.EXTRA_RUN_ID, task.runId)
-                        .putExtra(CompletedAppActivity.EXTRA_PACKAGE, task.targetPackage),
+                return PendingIntent.getActivity(context, 0,
+                    Intent(context, MainActivity::class.java)
+                        .setAction(MainActivity.ACTION_OPEN_TASK_RUN)
+                        .setData(Uri.Builder().scheme("eta-task").authority("run").appendPath(task.runId).build())
+                        .putExtra(MainActivity.EXTRA_TASK_RUN_ID, task.runId)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             }
             return conversationIntent(context, task?.conversationId)
@@ -310,17 +314,31 @@ internal class AgentExecutionService : Service() {
             val status = task?.status
             val completed = task?.completed == true
             val progressing = !completed && task?.paused != true && status != AgentOverlayStatus.Queued
+            val report = if (completed && task != null) io.github.mangi.eta.agent.tasks.TaskRunResultStore.forContext(context).read(task.runId) else null
             val label = if (completed && status == AgentOverlayStatus.ResultReady) context.getString(R.string.background_task_completed)
                 else status?.localizedText(context.resources)
                     ?: context.resources.getQuantityString(R.plurals.execution_summary, leases.count(), leases.count())
             val builder = Notification.Builder(context, CHANNEL)
                 .setSmallIcon(R.drawable.ic_notification)
-                .setContentTitle(task?.title?.take(60)?.takeIf(String::isNotBlank) ?: context.getString(R.string.execution_title))
-                .setContentText(label + task?.streamPreview?.takeIf(String::isNotBlank)?.let { " · $it" }.orEmpty())
+                .setContentTitle((task?.title?.take(60)?.takeIf(String::isNotBlank) ?: context.getString(R.string.execution_title)) +
+                    if (report == null) "" else when (report.status) {
+                        io.github.mangi.eta.agent.tasks.TaskRunStatus.Succeeded -> " · 成功"
+                        io.github.mangi.eta.agent.tasks.TaskRunStatus.Partial -> " · 部分成功"
+                        io.github.mangi.eta.agent.tasks.TaskRunStatus.Failed -> " · 失败"
+                        io.github.mangi.eta.agent.tasks.TaskRunStatus.Cancelled -> " · 已取消"
+                        io.github.mangi.eta.agent.tasks.TaskRunStatus.Unconfirmed -> " · 结果待确认"
+                    })
+                .setContentText(report?.summary ?: (label + task?.streamPreview?.takeIf(String::isNotBlank)?.let { " · $it" }.orEmpty()))
                 .setContentIntent(destination(context, task, id))
                 // Keep the continue action available, including after an unsuccessful App handoff.
-                .setOngoing(!completed).setAutoCancel(completed && task?.targetPackage.isNullOrBlank()).setOnlyAlertOnce(true)
+                .setOngoing(!completed).setAutoCancel(completed).setOnlyAlertOnce(true)
                 .setVisibility(Notification.VISIBILITY_PRIVATE)
+            if (report != null) {
+                builder.setStyle(Notification.BigTextStyle().bigText(report.summary))
+                builder.setPublicVersion(Notification.Builder(context, CHANNEL)
+                    .setSmallIcon(R.drawable.ic_notification).setContentTitle("任务执行已结束")
+                    .setContentText("解锁后查看结果").setVisibility(Notification.VISIBILITY_PUBLIC).build())
+            }
             if (task != null && !completed) {
                 builder.addAction(runAction(context, task.runId,
                     if (task.paused) ACTION_RESUME_RUN else ACTION_PAUSE_RUN,
@@ -346,7 +364,7 @@ internal class AgentExecutionService : Service() {
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
                 builder.addAction(Notification.Action.Builder(null, context.getString(R.string.execution_stop), stop).build())
             }
-            if (task != null && usesSystemTaskSurface()) {
+            if (task != null && usesSystemTaskSurface() && report == null) {
                 builder.setStyle(Notification.ProgressStyle().setProgressIndeterminate(progressing)
                     .setProgressSegments(listOf(Notification.ProgressStyle.Segment(100))).setProgress(if (completed) 100 else 0))
                     .setShortCriticalText(if (completed) label.take(7) else shortText(context, task.status))

@@ -104,6 +104,7 @@ internal class AgentLocalTools(
     private val rootAvailable: () -> Boolean = { RootAccess.isGranted },
     private val guiControl: GuiControlCoordinator.RunControl? = null,
     browserSession: AgentBrowserSession? = null,
+    private val ownerConversationId: String? = null,
 ) : AgentModelClient.ToolExecutor, AutoCloseable {
 
     private val closed = AtomicBoolean(false)
@@ -133,6 +134,7 @@ internal class AgentLocalTools(
         logger = logger,
         rootAvailable = rootAvailable,
         executionContext = terminalExecutionContext,
+        ownerConversationId = ownerConversationId,
         backgroundJobs = io.github.mangi.eta.agent.terminal.TerminalRuntime.backgroundJobs(context),
         detachedSupervisor = DetachedTaskSupervisor(
             logger = logger,

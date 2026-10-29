@@ -4,6 +4,9 @@ import android.content.Context
 import io.github.mangi.eta.core.AndroidAgentLogger
 import io.github.mangi.eta.agent.device.RootAccess
 import io.github.mangi.eta.agent.runtime.AgentExecutionService
+import io.github.mangi.eta.agent.tasks.TaskCommandResultReader
+import io.github.mangi.eta.agent.tasks.TaskRunResultStore
+import io.github.mangi.eta.agent.tasks.TaskConversationDeliveryStore
 import java.io.File
 
 internal enum class LinuxExecutionBackend(val wireName: String) {
@@ -22,12 +25,22 @@ internal object TerminalRuntime {
     @Synchronized
     fun backgroundJobs(context: Context): BackgroundTerminalJobs {
         val app = context.applicationContext
-        return backgroundJobs ?: BackgroundTerminalJobs(
-            supervisor = DetachedTaskSupervisor(AndroidAgentLogger, DetachedTaskSupervisor.defaultRecordsFile(app)),
+        backgroundJobs?.let { return it }
+        val supervisor = DetachedTaskSupervisor(AndroidAgentLogger, DetachedTaskSupervisor.defaultRecordsFile(app))
+        val results = TaskRunResultStore.forContext(app)
+        return BackgroundTerminalJobs(
+            supervisor = supervisor,
             logger = AndroidAgentLogger,
             acquireLease = { onStop -> AgentExecutionService.acquire(app, "terminal-background-commands", onStop = onStop) },
             releaseLease = { AgentExecutionService.release("terminal-background-commands") },
-            onCompleted = { BackgroundCommandNotification.show(app, it) },
+            onCompleted = { task ->
+                // At-least-once completion delivery: reuse a finalized result after any notification retry.
+                val result = results.read(task.id) ?: results.save(TaskCommandResultReader.read(
+                    task, supervisor.readStructuredResult(task), task.taskId, task.conversationId, results))
+                // Commit the conversation outbox before notification ACK; failure remains retryable.
+                TaskConversationDeliveryStore.forContext(app).enqueue(result)
+                BackgroundCommandNotification.show(app, result)
+            },
             completionNotificationsEnabled = { app.getSystemService(android.app.NotificationManager::class.java).areNotificationsEnabled() },
         ).also { backgroundJobs = it }
     }

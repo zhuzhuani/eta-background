@@ -13,9 +13,14 @@ internal data class MainActivityLaunchRequests(
     val archivedConversation: ArchivedConversationRequest? = null,
     val speechSettings: Boolean = false,
     val terminal: Boolean = false,
+    val taskRunId: String? = null,
 ) {
     fun accept(intent: Intent?): MainActivityLaunchRequests = when (intent?.action) {
         MainActivity.ACTION_OPEN_TERMINAL -> copy(terminal = true)
+        MainActivity.ACTION_OPEN_TASK_RUN -> copy(
+            // The data URI only distinguishes notification PendingIntents; never derive a target from it.
+            taskRunId = intent.nonBlankExtra(MainActivity.EXTRA_TASK_RUN_ID)?.takeIf { it.length <= 200 && it.none(Char::isISOControl) },
+        )
         ACTION_SPEECH_SETTINGS -> copy(speechSettings = true)
         MainActivity.ACTION_OPEN_CONVERSATION_ID -> copy(
             conversationId = intent.nonBlankExtra(MainActivity.EXTRA_CONVERSATION_ID),
@@ -46,6 +51,7 @@ internal data class MainActivityLaunchRequests(
             putString("archive_conversation_key", archivedConversation?.conversationKey)
             putBoolean("speech_settings", speechSettings)
             putBoolean("terminal", terminal)
+            putString("task_run_id", taskRunId)
         })
     }
 
@@ -67,6 +73,7 @@ internal data class MainActivityLaunchRequests(
                 } else null,
                 speechSettings = saved.getBoolean("speech_settings"),
                 terminal = saved.getBoolean("terminal"),
+                taskRunId = saved.getString("task_run_id")?.takeIf { it.isNotBlank() && it.length <= 200 && it.none(Char::isISOControl) },
             )
         }
     }

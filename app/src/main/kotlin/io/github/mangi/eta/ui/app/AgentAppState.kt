@@ -1,6 +1,9 @@
 package io.github.mangi.eta.ui.app
 
 import io.github.mangi.eta.agent.model.AgentContextSnapshot
+import io.github.mangi.eta.agent.tasks.TaskConversationDeliveryStore
+import io.github.mangi.eta.agent.tasks.TaskRunResult
+import io.github.mangi.eta.agent.tasks.TaskRunResultStore
 
 import android.content.ContentResolver
 import android.content.Context
@@ -173,6 +176,9 @@ internal class AgentAppState(
         }
         refreshConversationSummaries()
         observeRuntimeSelection()
+        scope.launch(Dispatchers.IO) {
+            TaskConversationDeliveryStore.changes.collect { recoverTaskConversationDeliveries() }
+        }
         runtimeRecoveryInProgress.set(true)
         scope.launch {
             AssistantRunRecovery.changes.collect {
@@ -184,6 +190,7 @@ internal class AgentAppState(
             try {
                 recoverRuntimeRuns()
                 importArchivedExternalRuns()
+                recoverTaskConversationDeliveries()
             } finally {
                 runtimeRecoveryInProgress.set(false)
             }
@@ -254,9 +261,56 @@ internal class AgentAppState(
             try {
                 recoverRuntimeRuns()
                 importArchivedExternalRuns()
+                recoverTaskConversationDeliveries()
             } finally {
                 runtimeRecoveryInProgress.set(false)
             }
+        }
+    }
+
+    /** Event/entry-driven completion writeback. Never creates a conversation or calls the model. */
+    private suspend fun recoverTaskConversationDeliveries() = runtimeReconcileMutex.withLock {
+        try {
+            val outbox = TaskConversationDeliveryStore.forContext(appContext)
+            val results = TaskRunResultStore.forContext(appContext)
+            val pending = outbox.pending()
+            val savedResults = pending.associate { it.runId to results.read(it.runId) }
+            withLoadedConversations(pending.mapTo(mutableSetOf()) { it.conversationId }) {
+                val acknowledge = withContext(Dispatchers.Main.immediate) {
+                    val ready = mutableListOf<TaskConversationDeliveryStore.Delivery>()
+                    pending.forEach { delivery ->
+                        val state = conversationsById[delivery.conversationId]
+                        val result = savedResults[delivery.runId]
+                        val decision = io.github.mangi.eta.agent.tasks.TaskConversationDeliveryPolicy.decide(
+                            delivery, result, exists = state != null,
+                            busy = delivery.conversationId in pendingConversationDeletes || state?.isStreaming == true ||
+                                state?.messageEdit != null || runStore.activeRunId(delivery.conversationId) != null,
+                        )
+                        when (decision) {
+                            io.github.mangi.eta.agent.tasks.TaskConversationDeliveryPolicy.Decision.Defer -> return@forEach
+                            io.github.mangi.eta.agent.tasks.TaskConversationDeliveryPolicy.Decision.AcknowledgeDeleted -> {
+                                ready += delivery
+                                return@forEach
+                            }
+                            io.github.mangi.eta.agent.tasks.TaskConversationDeliveryPolicy.Decision.Append -> Unit
+                        }
+                        val updated = appendTaskConversationResult(requireNotNull(state), requireNotNull(result))
+                        if (updated !== state) updateConversation(delivery.conversationId, updated)
+                        ready += delivery
+                    }
+                    if (ready.isNotEmpty()) refreshConversationSummaries()
+                    ready
+                }
+                io.github.mangi.eta.agent.tasks.TaskConversationDeliveryPolicy.commit(acknowledge,
+                    persist = { withContext(Dispatchers.Main.immediate) { persistConversations() }.await() },
+                    acknowledge = outbox::acknowledge,
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            // Keep pending references on load/save failure; a later entry/recovery retries them.
+            AndroidAgentLogger.error("Task conversation delivery failed: type=${failure.safeLogType()}")
         }
     }
 
@@ -1264,6 +1318,7 @@ internal class AgentAppState(
                 ))
                 refreshConversationSummaries()
                 persistConversations()
+                scope.launch(Dispatchers.IO) { recoverTaskConversationDeliveries() }
                 return
             }
         }
@@ -1493,6 +1548,7 @@ internal class AgentAppState(
                 messageEdit = null,
             )
         )
+        scope.launch(Dispatchers.IO) { recoverTaskConversationDeliveries() }
     }
 
     fun messageRevisionImpact(messageId: String): MessageRevisionImpact? =
@@ -2155,6 +2211,7 @@ internal class AgentAppState(
             val stoppedDuringSettlement = runStore.wasStoppedByUser(runId)
             setConversationStreaming(runId, false)
             runStore.remove(runId)
+            scope.launch(Dispatchers.IO) { recoverTaskConversationDeliveries() }
             refreshConversationSummaries()
             if (conversationId in pendingConversationDeletes) {
                 if (resultSaved && acknowledged) {
@@ -2430,6 +2487,34 @@ internal class AgentAppState(
 
         fun newConversationId(): String = "conv-${UUID.randomUUID()}"
     }
+}
+
+/** Display-only completion receipt: never replaces model context, transcript, or draft state. */
+internal fun appendTaskConversationResult(state: AgentChatHomeUiState, result: TaskRunResult): AgentChatHomeUiState {
+    val messageId = "task-command:${result.runId}"
+    if (messageId in state.appliedRuntimeRunIds || state.messages.any { it.id == messageId }) return state
+    val status = when (result.status) {
+        io.github.mangi.eta.agent.tasks.TaskRunStatus.Succeeded -> "已完成"
+        io.github.mangi.eta.agent.tasks.TaskRunStatus.Partial -> "部分完成"
+        io.github.mangi.eta.agent.tasks.TaskRunStatus.Failed -> "失败"
+        io.github.mangi.eta.agent.tasks.TaskRunStatus.Cancelled -> "已取消"
+        io.github.mangi.eta.agent.tasks.TaskRunStatus.Unconfirmed -> "结果未确认"
+    }
+    val text = buildString {
+        append("后台命令结果：").append(status).append('\n')
+        append(result.title).append('\n')
+        append("执行 ID：").append(result.runId).append('\n')
+        if (result.summary.isNotBlank()) append('\n').append(result.summary.take(2048))
+        if (result.report.isNotBlank()) {
+            append("\n\n").append(result.report.take(6000))
+            if (result.report.length > 6000) append("\n（报告已截断，请在任务详情查看完整结果）")
+        }
+        append("\n\n完整报告及附件可从本次任务完成通知打开详情；此回执不会重新执行任务。")
+    }
+    return state.copy(
+        messages = state.messages + AgentMessageUi(id = messageId, content = text, renderMarkdown = false),
+        appliedRuntimeRunIds = state.appliedRuntimeRunIds + messageId,
+    )
 }
 
 internal data class MessageRevisionImpact(

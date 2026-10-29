@@ -59,6 +59,8 @@ internal class DetachedTaskSupervisor(
         commandTask: Boolean = false,
         description: String = "",
         timeoutMs: Long = 0,
+        taskId: String? = null,
+        conversationId: String? = null,
     ): DaemonStartResult {
         if (identity != "root" && identity != "user") return DaemonStartResult.Failed("INVALID_ARGUMENT", "执行身份无效")
         if (identity == "root" && !rootAvailable()) return DaemonStartResult.Failed("ROOT_REQUIRED", "Root 授权不可用")
@@ -73,7 +75,7 @@ internal class DetachedTaskSupervisor(
         }
         val id = (if (commandTask) "job_" else "dm_") + UUID.randomUUID().toString().take(8)
         val token = UUID.randomUUID().toString().replace("-", "")
-        if (commandTask) return startCommand(id, command, cwd, identity, environment, description, timeoutMs)
+        if (commandTask) return startCommand(id, command, cwd, identity, environment, description, timeoutMs, taskId, conversationId)
         if (identity == "user") return startUserDaemon(id, token, command, cwd, environment)
         val wireDir = wireDaemonDir(environment)
         val wirePidFile = "$wireDir/$id.pid"
@@ -203,6 +205,26 @@ internal class DetachedTaskSupervisor(
         )
     }
 
+    /** Read only this execution's generated report, never a caller-selected path or stdout. */
+    fun readStructuredResult(task: DetachedTask): String? {
+        if (!task.commandTask || task.completedAt == null) return null
+        if (task.identity == "root" && !rootAvailable()) return null
+        val expected = task.logPath + ".result.json"
+        if (task.resultPath != expected) return null // Legacy/untrusted metadata cannot select a file.
+        val limit = MAX_LOG_READ_BYTES
+        val path = shellQuote(hostDaemonPath(task, expected))
+        val result = runOneShotShell(
+            processSupervisor = oneShotSupervisor,
+            identity = task.identity,
+            command = "[ -f $path ] && [ ! -L $path ] && head -c ${limit + 1} $path 2>/dev/null",
+            timeoutSeconds = 15,
+            maxOutputBytes = limit + 1,
+        )
+        if (result.exitCode != 0 || result.output.isEmpty() || result.output.size > limit) return null
+        val text = result.output.decodeToString()
+        return text.takeIf { it.toByteArray(Charsets.UTF_8).contentEquals(result.output) }
+    }
+
     fun findTask(id: String): DetachedTask? = synchronized(RECORDS_LOCK) { loadTasksLocked().firstOrNull { it.id == id } }
 
     private class CommandProcess(val process: Process, val supervisor: ShellProcessSupervisor) {
@@ -210,7 +232,7 @@ internal class DetachedTaskSupervisor(
     }
 
     private fun startCommand(id: String, command: String, cwd: String, identity: String,
-        environment: TerminalEnvironment, description: String, timeoutMs: Long): DaemonStartResult {
+        environment: TerminalEnvironment, description: String, timeoutMs: Long, taskId: String?, conversationId: String?): DaemonStartResult {
         val workspace = if (identity == "user") TerminalRuntime.userWorkspacePath else TerminalRuntime.ROOT_WORKSPACE_PATH
         val wireDir = when {
             environment.isLinux -> LINUX_DAEMON_DIR
@@ -218,8 +240,9 @@ internal class DetachedTaskSupervisor(
             else -> daemonDir
         }
         val logPath = "$wireDir/$id.log"
+        val resultPath = "$logPath.result.json"
         val script = "mkdir -p ${shellQuote(wireDir)} && { cd ${shellQuote(cwd)} && " +
-            commandPayload(command, "$wireDir/$id.exit") + "; } > ${shellQuote(logPath)} 2>&1"
+            "{ export ETA_TASK_RESULT_PATH=${shellQuote(resultPath)}; " + commandPayload(command, "$wireDir/$id.exit") + "; }; } > ${shellQuote(logPath)} 2>&1"
         val process = oneShotSupervisor.startShellProcess(identity, script, true, environment,
             linuxRootfsPath = rootfsPath(environment), linuxSharedMounts = linuxSharedMountsProvider())
             ?: return DaemonStartResult.Failed("PROCESS_START_FAILED", "无法启动后台命令")
@@ -231,7 +254,8 @@ internal class DetachedTaskSupervisor(
         }
         val task = DetachedTask(id, ownership.pid, ownership.token, command, cwd, identity, environment,
             logPath, System.currentTimeMillis(), LinuxEnvironmentPaths.backendOf(rootfsPath(environment)), workspace,
-            commandTask = true, description = description, timeoutMs = timeoutMs, isolatedGroup = ownership.isolatedGroup)
+            commandTask = true, description = description, timeoutMs = timeoutMs, isolatedGroup = ownership.isolatedGroup,
+            resultPath = resultPath, taskId = taskId, conversationId = conversationId)
         if (!synchronized(RECORDS_LOCK) { saveTasksLocked(loadTasksLocked() + task) }) {
             oneShotSupervisor.terminateAndReap(process)
             oneShotSupervisor.unregisterProcess(process)
@@ -537,7 +561,8 @@ internal class DetachedTaskSupervisor(
             val removeScript = group.joinToString("\n") {
                 "rm -f ${shellQuote(hostDaemonPath(it.task, it.task.logPath))} " +
                     shellQuote(hostDaemonPath(it.task, it.task.logPath.removeSuffix(".log") + ".pid")) + " " +
-                    shellQuote(hostDaemonPath(it.task, it.task.logPath.removeSuffix(".log") + ".exit"))
+                    shellQuote(hostDaemonPath(it.task, it.task.logPath.removeSuffix(".log") + ".exit")) + " " +
+                    shellQuote(hostDaemonPath(it.task, it.task.logPath + ".result.json"))
             }
             runOneShotShell(
                 processSupervisor = oneShotSupervisor,

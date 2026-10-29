@@ -135,6 +135,62 @@ class BackgroundTerminalJobsTest {
         jobs.stop(id)
     }
 
+    @Test fun structuredReportUsesFixedExecutionPathAndPersistsMetadata() {
+        val supervisor = supervisor()
+        val jobs = host(supervisor)
+        val report = """{"status":"Succeeded","summary":"real result","report":"complete report"}"""
+        val started = JSONObject(jobs.start(supervisor,
+            "printf '%s' '$report' > \"\$ETA_TASK_RESULT_PATH\"", temporary.root.path,
+            "user", TerminalEnvironment.ANDROID, "Report", 5000, "user-task", "conversation"))
+        val id = started.getString("job_id")
+        jobs.waitFor(id, 5000) { false }
+        jobs.read(id)
+        val task = requireNotNull(supervisor.findTask(id))
+        assertEquals(started.getString("output_path") + ".result.json", started.getString("result_path"))
+        assertEquals("user-task", task.taskId)
+        assertEquals("conversation", task.conversationId)
+        assertEquals(report, supervisor.readStructuredResult(task))
+        assertEquals(null, supervisor.readStructuredResult(task.copy(resultPath = File(temporary.root, "other.json").path)))
+        assertEquals("user-task", requireNotNull(supervisor().findTask(id)).taskId)
+    }
+
+    @Test fun missingOrOversizedReportIsNotLoadedAndArbitraryStartPathIsRejected() {
+        val supervisor = supervisor()
+        val jobs = host(supervisor)
+        val controller = controller(supervisor, jobs)
+        try {
+            val rejected = JSONObject(controller.executeTool("terminal_job", JSONObject().put("action", "start")
+                .put("command", "printf unsafe").put("result_path", "/private/unrelated.json")))
+            assertEquals("INVALID_RESULT_PATH", rejected.getString("code"))
+            val started = JSONObject(jobs.start(supervisor, "true", temporary.root.path,
+                "user", TerminalEnvironment.ANDROID, "Missing", 5000))
+            val id = started.getString("job_id")
+            jobs.waitFor(id, 5000) { false }
+            jobs.read(id)
+            val task = requireNotNull(supervisor.findTask(id))
+            assertEquals(null, supervisor.readStructuredResult(task))
+            File(started.getString("result_path")).writeText("x".repeat(DetachedTaskSupervisor.MAX_LOG_READ_BYTES + 1))
+            assertEquals(null, supervisor.readStructuredResult(task))
+        } finally { controller.closeAll() }
+    }
+
+    @Test fun completionPersistenceFailureIsRetriedBeforeMarkingDelivered() {
+        val supervisor = supervisor()
+        val attempts = AtomicInteger()
+        val jobs = BackgroundTerminalJobs(supervisor, NoopLogger, onCompleted = {
+            if (attempts.incrementAndGet() == 1) throw java.io.IOException("save failed")
+        }).also { hosts += it }
+        val started = JSONObject(jobs.start(supervisor, "true", temporary.root.path,
+            "user", TerminalEnvironment.ANDROID, "Retry", 5000))
+        val id = started.getString("job_id")
+        jobs.waitFor(id, 5000) { false }
+        repeat(3) { jobs.list(false) }
+        assertTrue(requireNotNull(supervisor.findTask(id)).completionNotified)
+        assertEquals(2, attempts.get())
+        jobs.list(false)
+        assertEquals(2, attempts.get())
+    }
+
     private object NoopLogger : AgentLogger {
         override fun debug(message: () -> String) = Unit
         override fun info(message: String) = Unit

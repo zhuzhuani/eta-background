@@ -5,6 +5,9 @@ import android.app.Notification
 import android.app.NotificationManager
 import android.os.Looper
 import io.github.mangi.eta.agent.overlay.AgentOverlayStatus
+import io.github.mangi.eta.agent.tasks.TaskRunResult
+import io.github.mangi.eta.agent.tasks.TaskRunResultStore
+import io.github.mangi.eta.agent.tasks.TaskRunStatus
 import io.github.mangi.eta.ui.MainActivity
 import org.junit.Assert.*
 import org.junit.Test
@@ -18,36 +21,31 @@ import java.time.Duration
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36, 37], application = Application::class)
 class AgentSystemNotificationTest {
-    @Test fun completedCardOpensItsOwnTargetAppOnlyOnUserTap() {
+    @Test fun completedCardOpensItsDurableRunReportOnlyOnUserTap() {
         val controller = Robolectric.buildService(AgentExecutionService::class.java).create()
         val service = controller.get()
         val manager = service.getSystemService(NotificationManager::class.java)
         val target = "app.finished"
-        val activity = android.content.pm.ActivityInfo().apply {
-            packageName = target; name = "$target.MainActivity"; exported = true
-            applicationInfo = android.content.pm.ApplicationInfo().apply { packageName = target; enabled = true }
-        }
-        val launcher = android.content.Intent(android.content.Intent.ACTION_MAIN)
-            .addCategory(android.content.Intent.CATEGORY_LAUNCHER).setPackage(target)
-        shadowOf(service.packageManager).addResolveInfoForIntent(launcher,
-            android.content.pm.ResolveInfo().apply { activityInfo = activity })
         try {
             AgentExecutionService.acquire(service, "app-click", onStop = {})
             val running = task("app-click").copy(targetPackage = target)
             AgentExecutionService.updateTasks(service, listOf(running))
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
             val original = manager.activeNotifications.single()
+            persistReport(service, running)
             AgentExecutionService.completeTask(service, running.copy(completed = true, status = AgentOverlayStatus.ResultReady))
             shadowOf(Looper.getMainLooper()).idle()
             val finished = manager.activeNotifications.single()
             assertEquals(original.id, finished.id)
             val destination = shadowOf(finished.notification.contentIntent).savedIntent
-            assertEquals(CompletedAppActivity::class.java.name, destination.component?.className)
-            assertEquals(target, destination.getStringExtra(CompletedAppActivity.EXTRA_PACKAGE))
-            assertEquals("app-click", destination.getStringExtra(CompletedAppActivity.EXTRA_RUN_ID))
+            assertRunDestination(destination, "app-click")
+            assertNull(destination.getStringExtra(MainActivity.EXTRA_CONVERSATION_ID))
+            assertNull(destination.getStringExtra(CompletedAppActivity.EXTRA_PACKAGE))
+            assertEquals(Notification.BigTextStyle::class.java.name,
+                finished.notification.extras.getString(Notification.EXTRA_TEMPLATE))
             assertNull(shadowOf(service.application).nextStartedActivity)
             finished.notification.contentIntent.send()
-            assertEquals(CompletedAppActivity::class.java.name, shadowOf(service.application).nextStartedActivity.component?.className)
+            assertRunDestination(shadowOf(service.application).nextStartedActivity, "app-click")
             assertEquals(2, finished.notification.actions.size)
             val reply = finished.notification.actions[0]
             assertEquals(Notification.Action.SEMANTIC_ACTION_REPLY, reply.semanticAction)
@@ -61,6 +59,8 @@ class AgentSystemNotificationTest {
             val continuation = shadowOf(reply.actionIntent).savedIntent
             assertEquals(AgentExecutionService::class.java.name, continuation.component?.className)
             assertEquals(AgentExecutionService.ACTION_REPLY, continuation.action)
+            assertEquals("app-click", continuation.getStringExtra(AgentExecutionService.EXTRA_RUN_ID))
+            assertEquals(android.net.Uri.parse("eta-task://reply/app-click"), continuation.data)
             assertEquals("chat-app-click", continuation.getStringExtra(AgentExecutionService.EXTRA_CONVERSATION_ID))
             finished.notification.actions[1].actionIntent.send()
             assertEquals("chat-app-click", shadowOf(service.application).nextStartedActivity
@@ -73,6 +73,23 @@ class AgentSystemNotificationTest {
             controller.destroy()
             manager.cancelAll()
         }
+    }
+
+    private fun assertRunDestination(intent: android.content.Intent, runId: String) {
+        assertEquals(MainActivity::class.java.name, intent.component?.className)
+        assertEquals(MainActivity.ACTION_OPEN_TASK_RUN, intent.action)
+        assertEquals(runId, intent.getStringExtra(MainActivity.EXTRA_TASK_RUN_ID))
+        assertEquals(android.net.Uri.Builder().scheme("eta-task").authority("run").appendPath(runId).build(), intent.data)
+    }
+
+    private fun persistReport(context: android.content.Context, task: TaskNotificationState,
+        summary: String = "本轮已结束，详情请查看执行报告") {
+        TaskRunResultStore.forContext(context).save(TaskRunResult(
+            runId = task.runId, conversationId = task.conversationId, title = task.title,
+            status = TaskRunStatus.Unconfirmed, summary = summary,
+            report = "已查询目标页面并记录可见状态。尚无独立证据确认任务目标完成。",
+            startedAt = 1, completedAt = 2, source = "agent",
+        ))
     }
 
     private fun task(id: String, status: AgentOverlayStatus = AgentOverlayStatus.Reasoning, paused: Boolean = false) =
@@ -113,12 +130,16 @@ class AgentSystemNotificationTest {
             assertEquals(AgentExecutionService.ACTION_RESUME_RUN,
                 shadowOf(cards.getValue("chat-b").notification.actions[0].actionIntent).savedIntent.action)
             // Completion updates A in place immediately while B and C keep running.
+            persistReport(service, a)
             AgentExecutionService.completeTask(service, a.copy(completed = true, status = AgentOverlayStatus.ResultReady))
             shadowOf(Looper.getMainLooper()).idle()
             assertEquals(3, manager.activeNotifications.size)
             val completedA = manager.activeNotifications.single { it.id == cards.getValue("chat-a").id }
             assertFalse(completedA.notification.flags and Notification.FLAG_ONGOING_EVENT != 0)
             assertEquals(cards.getValue("chat-a").notification.smallIcon.resId, completedA.notification.smallIcon.resId)
+            assertRunDestination(shadowOf(completedA.notification.contentIntent).savedIntent, "a")
+            assertEquals(Notification.BigTextStyle::class.java.name,
+                completedA.notification.extras.getString(Notification.EXTRA_TEMPLATE))
             AgentExecutionService.updateTasks(service, listOf(b, c.copy(streamPreview = "新进度")))
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
             assertEquals(3, manager.activeNotifications.size)
@@ -136,6 +157,42 @@ class AgentSystemNotificationTest {
         }
     }
 
+    @Test fun failureWithoutDurableResultDoesNotPublishCompletedCard() {
+        val controller = Robolectric.buildService(AgentExecutionService::class.java).create()
+        val service = controller.get()
+        val manager = service.getSystemService(NotificationManager::class.java)
+        try {
+            AgentExecutionService.acquire(service, "missing-result-lease", onStop = {})
+            val running = task("missing-result")
+            assertNull(TaskRunResultStore.forContext(service).read(running.runId))
+            AgentExecutionService.updateTasks(service, listOf(running))
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+            val original = manager.activeNotifications.single()
+            AgentExecutionService.completeTask(service, running.copy(completed = true,
+                status = AgentOverlayStatus.RunFailed, streamPreview = "结果持久化失败"))
+            shadowOf(Looper.getMainLooper()).idle()
+            val retained = manager.activeNotifications.single()
+            assertEquals(original.id, retained.id)
+            assertTrue(retained.notification.flags and Notification.FLAG_ONGOING_EVENT != 0)
+            val destination = shadowOf(retained.notification.contentIntent).savedIntent
+            assertEquals(MainActivity.ACTION_OPEN_CONVERSATION_ID, destination.action)
+            assertEquals("chat-missing-result", destination.getStringExtra(MainActivity.EXTRA_CONVERSATION_ID))
+            assertNull(destination.getStringExtra(MainActivity.EXTRA_TASK_RUN_ID))
+            assertEquals(AgentExecutionService.ACTION_PAUSE_RUN,
+                shadowOf(retained.notification.actions[0].actionIntent).savedIntent.action)
+            AgentExecutionService.release("missing-result-lease")
+            AgentExecutionService.updateTasks(service, emptyList())
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+            assertTrue(manager.activeNotifications.isEmpty())
+        } finally {
+            AgentExecutionService.release("missing-result-lease")
+            AgentExecutionService.updateTasks(service, emptyList())
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+            controller.destroy()
+            manager.cancelAll()
+        }
+    }
+
     @Test fun completionUpdatesOriginalCardImmediatelyAndSurvivesForegroundRelease() {
         val controller = Robolectric.buildService(AgentExecutionService::class.java).create()
         val service = controller.get()
@@ -146,6 +203,8 @@ class AgentSystemNotificationTest {
                 AgentOverlayStatus.GeneratingAnswer, "处理中")))
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
             val originalId = manager.activeNotifications.single().id
+            persistReport(service, TaskNotificationState("run-complete", "chat-complete", "测试",
+                AgentOverlayStatus.ResultReady, "查询完成"), summary = "查询完成，目标状态尚待确认")
             AgentExecutionService.publishRunCompletion(service, "run-complete", "chat-complete", "已完成", "查询完成")
             shadowOf(Looper.getMainLooper()).idle()
             assertEquals(1, manager.activeNotifications.size)
@@ -158,8 +217,9 @@ class AgentSystemNotificationTest {
             assertEquals(originalId, completed.id)
             assertFalse(completed.notification.flags and Notification.FLAG_ONGOING_EVENT != 0)
             assertTrue(completed.notification.extras.getCharSequence(Notification.EXTRA_TEXT).toString().contains("查询完成"))
-            assertEquals(Notification.ProgressStyle::class.java.name, completed.notification.extras.getString(Notification.EXTRA_TEMPLATE))
-            assertEquals("chat-complete", shadowOf(completed.notification.contentIntent).savedIntent.getStringExtra(MainActivity.EXTRA_CONVERSATION_ID))
+            assertEquals(Notification.BigTextStyle::class.java.name, completed.notification.extras.getString(Notification.EXTRA_TEMPLATE))
+            assertEquals("查询完成，目标状态尚待确认", completed.notification.extras.getCharSequence(Notification.EXTRA_BIG_TEXT).toString())
+            assertRunDestination(shadowOf(completed.notification.contentIntent).savedIntent, "run-complete")
             // Repeated release callbacks must not remove the result that replaced the foreground card.
             AgentExecutionService.release("test-completion")
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))

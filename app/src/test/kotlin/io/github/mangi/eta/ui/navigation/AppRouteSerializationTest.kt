@@ -16,6 +16,19 @@ class AppRouteSerializationTest {
     }
 
     @Test
+    fun taskRunDetailRoundTripPreservesExactRunId() {
+        val route: AppRoute = AppRoute.TaskRunDetail("run:A/中文?x=1&quote=\"")
+        val encoded = Json.encodeToString(route)
+        assertEquals(route, Json.decodeFromString<AppRoute>(encoded))
+        assertEquals(
+            AppRoute.TaskRunDetail("first-run"),
+            Json.decodeFromString<AppRoute>(
+                """{"type":"io.github.mangi.eta.ui.navigation.AppRoute.TaskRunDetail","runId":"first-run"}""",
+            ),
+        )
+    }
+
+    @Test
     fun allRoutesRoundTripWithMiuixNavJsonConfiguration() {
         val routes = listOf<AppRoute>(
             AppRoute.Home,
@@ -23,6 +36,8 @@ class AppRouteSerializationTest {
             AppRoute.Browser("conversation-a"),
             AppRoute.Browser("conversation-b"),
             AppRoute.Terminal,
+            AppRoute.TaskRunDetail("task-a"),
+            AppRoute.TaskRunDetail("task-b"),
             AppRoute.Tools,
             AppRoute.WebToolsSettings,
             AppRoute.Skills,

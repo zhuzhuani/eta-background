@@ -82,6 +82,7 @@ import io.github.mangi.eta.ui.screens.memory.AgentMemoryScreen
 import io.github.mangi.eta.ui.screens.permissions.PermissionHealthScreen
 import io.github.mangi.eta.ui.screens.skills.AgentSkillsScreen
 import io.github.mangi.eta.ui.screens.subagent.SubagentSettingsScreen
+import io.github.mangi.eta.ui.screens.tasks.TaskRunDetailScreen
 import io.github.mangi.eta.ui.screens.terminal.LinuxEnvironmentScreen
 import io.github.mangi.eta.ui.screens.terminal.LinuxFilesScreen
 import io.github.mangi.eta.ui.screens.terminal.SharedFoldersScreen
@@ -122,11 +123,27 @@ fun AgentAppRoot(
     onTerminalOpened: () -> Unit = {},
     onSpeechSettingsOpened: () -> Unit = {},
     onAssistantConversationOpened: (Boolean) -> Unit = {},
+    openTaskRunId: String? = null,
+    onTaskRunOpened: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val resources = LocalResources.current
     val uiScope = rememberCoroutineScope()
     val backStack = rememberNavBackStack<AppRoute>(AppRoute.Home)
+    LaunchedEffect(openTaskRunId) {
+        val runId = openTaskRunId ?: return@LaunchedEffect
+        if (runId.isNotBlank() && runId.length <= 200 && runId.none(Char::isISOControl)) {
+            // Only navigate by this exact ID. Opening a notification never sends or resumes a run.
+            val route = AppRoute.TaskRunDetail(runId)
+            val existingIndex = backStack.indexOf(route)
+            if (existingIndex >= 0) {
+                while (backStack.lastIndex > existingIndex) backStack.removeLastOrNull()
+            } else {
+                backStack.add(route)
+            }
+        }
+        onTaskRunOpened()
+    }
     LaunchedEffect(openSpeechSettings) {
         if (openSpeechSettings) {
             if (backStack.lastOrNull() != AppRoute.SpeechSettings) backStack.add(AppRoute.SpeechSettings)
@@ -447,6 +464,9 @@ fun AgentAppRoot(
                     backStack.remove(route)
                     if (backStack.isEmpty()) backStack.add(AppRoute.Home)
                 }
+            }
+            entry<AppRoute.TaskRunDetail>(swipeDismiss = swipeDismiss) { route ->
+                TaskRunDetailScreen(runId = route.runId, onBack = ::popRoute)
             }
             entry<AppRoute.Terminal>(swipeDismiss = swipeDismiss) {
                 LaunchedEffect(Unit) { requestExecutionNotifications() }

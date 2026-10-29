@@ -23,6 +23,7 @@ internal class RootShellTerminalController(
     },
     private val rootAvailable: () -> Boolean = { TerminalRuntime.rootAvailable },
     executionContext: TerminalExecutionContext? = null,
+    private val ownerConversationId: String? = null,
 ) : AutoCloseable {
     private companion object {
         const val USER_STORAGE = "/storage/emulated/0"
@@ -84,10 +85,15 @@ internal class RootShellTerminalController(
                 val identity = normalizeIdentity(args.optString("identity").ifBlank { defaultIdentity(environment) })
                 environmentPreflight(identity, environment)?.let { return it }
                 val cwd = normalizeCwd(args.optString("cwd").ifBlank { null }, environment, identity)
+                if (args.optString("result_path").let { it.isNotBlank() && it != "auto" }) {
+                    return errorJson("INVALID_RESULT_PATH", "result_path 仅支持 auto；报告仅从本次执行生成的固定路径读取")
+                }
                 val command = args.requiredText("command")
                 if (command.isBlank()) return errorJson("INVALID_ARGUMENT", "command 不能为空")
                 jobs.start(launcher, command, cwd, identity, environment,
-                    args.optString("description", "后台命令"), args.optLong("timeout_ms", 600_000))
+                    args.optString("description", "后台命令"), args.optLong("timeout_ms", 600_000),
+                    args.optString("task_id").trim().takeIf { it.isNotEmpty() },
+                    ownerConversationId)
             }
             "list" -> jobs.list(args.optBoolean("active_only", true))
             "read" -> jobs.read(args.requiredText("job_id"), args.optInt("max_bytes", 16_000))

@@ -36,11 +36,18 @@ internal class BackgroundTerminalJobs(
         environment: TerminalEnvironment,
         description: String,
         timeoutMs: Long,
+        taskId: String? = null,
+        conversationId: String? = null,
     ): String {
         if (closed) return failure("BACKGROUND_CLOSED", "后台命令宿主已关闭")
+        if (listOfNotNull(taskId, conversationId).any { id ->
+                id.isBlank() || id.length > 200 || id.any { it.isISOControl() } ||
+                    id.toByteArray(Charsets.UTF_8).toString(Charsets.UTF_8) != id
+            }) return failure("INVALID_ARGUMENT", "任务或会话关联 ID 无效")
         if (!lease()) return failure("BACKGROUND_START_NOT_ALLOWED", "系统未允许启动后台执行，请返回 Eta 后重试")
         return when (val result = launcher.start(command, cwd, identity, environment,
-            commandTask = true, description = description, timeoutMs = timeoutMs.coerceAtLeast(0))) {
+            commandTask = true, description = description, timeoutMs = timeoutMs.coerceAtLeast(0),
+            taskId = taskId, conversationId = conversationId)) {
             is DaemonStartResult.Failed -> {
                 if (monitor == null) release()
                 failure(result.code, result.message)
@@ -112,7 +119,8 @@ internal class BackgroundTerminalJobs(
             tasks.filter { it.task.completedAt != null && !it.task.completionNotified }.forEach { status ->
                 try {
                     onCompleted(status.task)
-                    supervisor.markCompletionNotified(status.task.id)
+                    // At-least-once: retry a failed durable marker with the same result and notification tag.
+                    check(supervisor.markCompletionNotified(status.task.id)) { "Could not persist completion marker" }
                 } catch (failure: Exception) {
                     logger.warn("Background command notification failed: type=${failure.javaClass.simpleName}")
                 }
@@ -168,6 +176,10 @@ internal class BackgroundTerminalJobs(
         .put("started_at", task.startedAt).put("completed_at", task.completedAt ?: JSONObject.NULL)
         .put("exit_code", task.exitCode ?: JSONObject.NULL).put("end_reason", task.endReason ?: JSONObject.NULL)
         .put("output_path", supervisor.hostDaemonPath(task, task.logPath)).put("output_environment", "android")
+        .put("result_path", supervisor.hostDaemonPath(task, task.logPath + ".result.json"))
+        .put("result_environment", "android").put("result_path_env", "ETA_TASK_RESULT_PATH")
+        .put("task_id", task.taskId ?: JSONObject.NULL).put("conversation_id", task.conversationId ?: JSONObject.NULL)
+        .put("attachments_supported", "https_references_and_inline_base64_40KiB")
         .put("timeout_ms", task.timeoutMs)
         .put("completion_notifications_enabled", completionNotificationsEnabled())
 

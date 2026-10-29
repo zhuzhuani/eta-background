@@ -51,6 +51,7 @@ class MainActivityLaunchRequestsTest {
             archivedConversation = ArchivedConversationRequest("source", "archive"),
             speechSettings = true,
             terminal = true,
+            taskRunId = "pending-task",
         )
 
         val restored = MainActivityLaunchRequests.restore(
@@ -110,6 +111,61 @@ class MainActivityLaunchRequestsTest {
             ),
         )
     }
+
+    @Test
+    fun `任务详情冷启动保存精确 ID 且不从 URI 推断`() {
+        val intent = taskIntent("run:A/中文?x=1")
+            .setData(android.net.Uri.parse("eta://task/not-the-run-id"))
+        val pending = MainActivityLaunchRequests.restore(null, intent)
+
+        assertEquals("run:A/中文?x=1", pending.taskRunId)
+        assertEquals(pending, MainActivityLaunchRequests.restore(savedState(pending), taskIntent("stale")))
+        assertEquals(null, MainActivityLaunchRequests.restore(null,
+            Intent(MainActivity.ACTION_OPEN_TASK_RUN).setData(android.net.Uri.parse("eta://task/run-uri")),
+        ).taskRunId)
+    }
+
+    @Test
+    fun `多个连续任务通知以最新 ID 替换并在消费保存后不重放`() {
+        val firstIntent = taskIntent("first-run")
+        val first = MainActivityLaunchRequests.restore(null, firstIntent)
+        val second = first.accept(taskIntent("second-run"))
+        assertEquals("second-run", second.taskRunId)
+        val restoredPending = MainActivityLaunchRequests.restore(savedState(second), firstIntent)
+        assertEquals("second-run", restoredPending.taskRunId)
+
+        val consumed = restoredPending.copy(taskRunId = null)
+        val restoredEmpty = MainActivityLaunchRequests.restore(savedState(consumed), taskIntent("second-run"))
+        assertEquals(MainActivityLaunchRequests(), restoredEmpty)
+        assertEquals("third-run", restoredEmpty.accept(taskIntent("third-run")).taskRunId)
+        assertEquals("second-run", restoredEmpty.accept(taskIntent("second-run")).taskRunId)
+    }
+
+    @Test
+    fun `任务请求与其他待办共存且桌面再次进入不丢失任务`() {
+        val pending = MainActivityLaunchRequests(conversationId = "conversation", terminal = true)
+            .accept(taskIntent("run-id"))
+        val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        assertEquals(pending, pending.accept(launcher))
+        assertEquals("conversation", pending.conversationId)
+        assertEquals(true, pending.terminal)
+        assertEquals(pending, MainActivityLaunchRequests.restore(savedState(pending), null))
+    }
+
+    @Test
+    fun `任务 ID 缺失空白或过长不会产生跳转且边界保持原值`() {
+        for (invalid in listOf(null, "", "  ", "x".repeat(201))) {
+            assertEquals(null, MainActivityLaunchRequests().accept(taskIntent(invalid)).taskRunId)
+        }
+        val boundary = "x".repeat(200)
+        assertEquals(boundary, MainActivityLaunchRequests().accept(taskIntent(boundary)).taskRunId)
+        assertEquals(null, MainActivityLaunchRequests().accept(
+            Intent(MainActivity.ACTION_OPEN_CONVERSATION_ID).putExtra(MainActivity.EXTRA_TASK_RUN_ID, "wrong-action"),
+        ).taskRunId)
+    }
+
+    private fun taskIntent(runId: String?): Intent = Intent(MainActivity.ACTION_OPEN_TASK_RUN)
+        .putExtra(MainActivity.EXTRA_TASK_RUN_ID, runId)
 
     private fun savedState(requests: MainActivityLaunchRequests): Bundle {
         val state = Bundle().also(requests::saveTo)

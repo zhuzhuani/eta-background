@@ -530,10 +530,6 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
 
     private fun failBeforeExecution(run: RuntimeRunRegistry.Run, message: String) {
         run.releaseIncoming()
-        mainHandler.post {
-            if (!destroyed) AgentExecutionService.completeTask(this, notificationState(run).copy(
-                completed = true, status = AgentOverlayStatus.RunFailed, streamPreview = message.takeLast(240)))
-        }
         val result = AgentRuntimeWire.RunResult(
             run.runId, false, "", message,
             operation = run.request.operation, rewriteTargetMessageId = run.request.rewriteTargetMessageId,
@@ -543,8 +539,13 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             // so a late database write cannot resurrect an already completed task.
             runCatching { run.entryPersistence.join() }
             run.session.complete(result) {
-                runCatching { persistRunArtifacts(run.snapshotRequest(), result, emptyList()) }
-                    .onFailure { throwable ->
+                runCatching {
+                    persistRunArtifacts(run.snapshotRequest(), result, emptyList())
+                    mainHandler.post {
+                        if (!destroyed) AgentExecutionService.completeTask(this, notificationState(run).copy(
+                            completed = true, status = AgentOverlayStatus.RunFailed, streamPreview = message.takeLast(240)))
+                    }
+                }.onFailure { throwable ->
                         AndroidAgentLogger.error("Agent runtime preparation result persistence failed: type=${throwable.safeLogType()}")
                     }
             }
@@ -651,10 +652,8 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             }
             runCatching {
                 run.overlayState = run.overlayState.applyEvent(event)
-                if (event is AgentEvent.RunFinished || event is AgentEvent.RunFailed) {
-                    AgentExecutionService.completeTask(this, notificationState(run).copy(
-                        completed = true, status = run.overlayState.status))
-                }
+                // Completion is published by postTerminalOverlay only after durable result persistence.
+
                 if (displayedRun === run && !run.session.isTerminal) {
                     state.value = run.overlayState
                     syncActiveRunOverlayVisibility(run)
@@ -674,6 +673,10 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         events: List<AgentEvent>,
     ) {
         // outbox 是终态与在途 checkpoint 之间的提交点；失败时保留 checkpoint 供下次恢复。
+        // Save immutable history before the consumable outbox can be acknowledged.
+        val run = runs.get(request.runId)
+        AgentTaskResultDelivery.persist(this, request, result, run?.startedAt ?: System.currentTimeMillis(),
+            cancelled = run?.session?.controller?.isCancelled == true)
         persistCompletedRun(request, result)
         runCatching { persistArchivedRun(request, result, events) }
             .onFailure { throwable ->

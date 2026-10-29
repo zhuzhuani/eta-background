@@ -28,12 +28,17 @@ internal object AgentTerminalToolCatalog {
                 description = "启动可在本次回复结束后继续运行的后台命令。start 立即返回 job_id，完成或失败时发送系统通知；返回的 completion_notifications_enabled 表示当前通知是否可用。" +
                     "list 查看任务，read 查看当前状态和日志，wait 在需要结果时等待，stop 终止任务。" +
                     "日志保存为文件，read 返回 output_path；预览截断时可用 read_file 分页读取完整日志。" +
-                    "后台命令使用独立 Shell；不继承 terminal 会话。启动后可继续其他工作或回复用户，不必轮询等待。",
+                    "后台命令使用独立 Shell；不继承 terminal 会话。启动后可继续其他工作或回复用户，不必轮询等待。" +
+                    "完成通知打开任务结果详情而非终端；stdout 仅为诊断日志，不会充当结果摘要。" +
+                    "命令必须将真实结构化结果写到环境变量 ETA_TASK_RESULT_PATH 指定的本次执行文件；start 返回 result_path 为对应 Android 宿主路径。" +
+                    "JSON 必须包含 status（Succeeded/Partial/Failed/Cancelled/Unconfirmed）、summary 和 report；缺失或无效时为 Unconfirmed，exit 0 不代表任务完成。可选 attachments 数组每项含 name/mimeType，以及 HTTPS url 或 base64（二选一）；base64 解码每项最多 40KiB，整个报告文件最多 64KiB，将复制进私有持久存储。HTTPS 仅用户点击时打开且可能失效；不支持任意本地路径。",
                 parameters = parameters(
                     executionProperties()
                         .put("action", action("start", "list", "read", "wait", "stop"))
                         .put("command", text("start 要执行的完整命令。"))
-                        .put("description", text("可选的简短任务说明，用于列表和完成通知。"))
+                        .put("description", text("可选的简短任务说明，用于任务结果标题。"))
+                        .put("result_path", text("可选，仅支持 auto；不接受任意路径。通过 ETA_TASK_RESULT_PATH 环境变量写入固定的本次执行结构化 JSON。"))
+                        .put("task_id", text("可选，仅用户明确提供的关联 ID，不是身份或授权凭据。"))
                         .put("timeout_ms", integer("start 的命令运行上限，默认 600000 毫秒；0 表示不设超时。"))
                         .put("job_id", text("start 或 list 返回的任务 ID；read、wait、stop 使用。"))
                         .put("active_only", bool("list 是否只返回运行中的任务，默认 true。"))

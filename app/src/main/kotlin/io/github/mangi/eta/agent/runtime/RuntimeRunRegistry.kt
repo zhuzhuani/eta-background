@@ -22,6 +22,7 @@ internal class RuntimeRunRegistry(private val capacity: Int = MAX_ACTIVE_RUNS) {
         incoming: AgentRuntimeWire.IncomingRunRequest? = null,
         private val onRequestIngested: () -> Unit = {},
     ) {
+        val startedAt: Long = System.currentTimeMillis()
         val runId: String get() = session.runId
         val conversationId: String = AgentConversationIdentity.fromHandoff(initialRequest.handoff, initialRequest.runId)
         val notice = com.eta.shadow.ShadowNotice(initialRequest.runId, conversationId)

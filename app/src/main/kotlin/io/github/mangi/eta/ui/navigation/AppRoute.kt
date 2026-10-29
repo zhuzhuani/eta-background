@@ -16,6 +16,9 @@ sealed interface AppRoute : NavKey {
     data object Terminal : AppRoute
 
     @Serializable
+    data class TaskRunDetail(val runId: String) : AppRoute
+
+    @Serializable
     data object Tools : AppRoute
 
     @Serializable
