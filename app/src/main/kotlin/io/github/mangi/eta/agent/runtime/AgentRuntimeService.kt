@@ -117,10 +117,12 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
     private val screenReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == Intent.ACTION_SCREEN_OFF) {
-                runs.all().filterNot { it.session.isTerminal }.forEach { run ->
-                    if (!run.session.controller.isPaused) {
-                        run.pausedForScreenOff = true
-                        requestPause(run.runId)
+                if (!Prefs.isEnabled(Prefs.Keys.AGENT_SCREEN_OFF_EXECUTION)) {
+                    runs.all().filterNot { it.session.isTerminal }.forEach { run ->
+                        if (!run.session.controller.isPaused) {
+                            run.pausedForScreenOff = true
+                            requestPause(run.runId)
+                        }
                     }
                 }
                 removeAmbientWindows()
@@ -518,7 +520,7 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
                 AgentRunCheckpointStore.start(applicationContext, request)
             }, entryPersistenceIo)
         }
-        if (!isMainDisplayOn()) {
+        if (!isMainDisplayOn() && !Prefs.isEnabled(Prefs.Keys.AGENT_SCREEN_OFF_EXECUTION)) {
             run.pausedForScreenOff = true
             run.session.controller.pause()
         }

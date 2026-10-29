@@ -17,4 +17,7 @@
     <string name="background_diagnostics_failed">Could not save diagnostics</string>
     <string name="background_task_queued">Waiting to run</string>
     <string name="background_screen_off_paused">Paused while screen is off; unlock to resume</string>
+    <string name="background_experiments_title">Experimental features</string>
+    <string name="background_screen_off_execution_title">Continue while screen is off (experimental)</string>
+    <string name="background_screen_off_execution_summary">Do not automatically pause tasks when the screen turns off. May increase battery use; system background restrictions and lock screen protection still apply. Does not resume already paused tasks. Turn off before the next screen-off event to restore automatic pausing.</string>
 </resources>

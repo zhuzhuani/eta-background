@@ -807,6 +807,21 @@ private fun SettingsPageContent(
                 }
             }
 
+            item(key = "section_screen_off_experiment") {
+                EtaPreferenceGroupTitle(stringResource(R.string.background_experiments_title))
+                EtaPreferenceGroup {
+                    SwitchPref(
+                        context = context,
+                        prefs = agentPrefs,
+                        title = stringResource(R.string.background_screen_off_execution_title),
+                        summary = stringResource(R.string.background_screen_off_execution_summary),
+                        key = Prefs.Keys.AGENT_SCREEN_OFF_EXECUTION,
+                        icon = Icons.Rounded.PowerSettingsNew,
+                        iconTint = EtaPreferenceColors.Orange,
+                    )
+                }
+            }
+
             // ── 关于 ────────────────────────────────────────────────────
             item(key = "section_about") {
                 EtaPreferenceGroupTitle(stringResource(R.string.ui_about_bed172))

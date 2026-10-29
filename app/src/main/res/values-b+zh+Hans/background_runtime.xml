@@ -17,4 +17,7 @@
     <string name="background_diagnostics_failed">诊断文件保存失败</string>
     <string name="background_task_queued">等待执行</string>
     <string name="background_screen_off_paused">已息屏暂停，解锁后继续</string>
+    <string name="background_experiments_title">实验性功能</string>
+    <string name="background_screen_off_execution_title">息屏继续执行（实验性）</string>
+    <string name="background_screen_off_execution_summary">息屏时不再自动暂停任务，可能增加耗电；仍受系统后台限制及锁屏保护影响。不会恢复已暂停任务；关闭后从下一次息屏开始恢复自动暂停。</string>
 </resources>

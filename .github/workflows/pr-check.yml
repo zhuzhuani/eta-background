@@ -48,6 +48,15 @@ jobs:
             "-Peta.buildMetadata=etax.${HEAD_SHA::7}" \
             :app:lintDebug :app:assembleDebug
 
+      - name: 上传 Debug APK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: Etax-debug
+          path: app/build/outputs/apk/debug/*.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
       - name: 上传检查报告
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

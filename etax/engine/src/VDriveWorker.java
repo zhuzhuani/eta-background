@@ -1183,7 +1183,8 @@ class VDriveWorker implements VDrive.Worker {
         DPI = req.has("density") && req.optInt("density", 0) > 0
                 ? req.optInt("density") : mainDensity();
         final Frame fr = createCapture();
-        // Isolate focus from the user's display. Screen-off execution is disabled.
+        // Isolate focus from the user's display. Runtime owns the screen-off pause policy;
+        // opting in does not bypass keyguard or guarantee rendering under ROM power restrictions.
         int flags = flag("PRIVATE") | flag("OWN_CONTENT_ONLY") | flag("SUPPORTS_TOUCH")
                 | flag("TRUSTED") | flag("OWN_DISPLAY_GROUP") | flag("OWN_FOCUS")
                 | flag("STEAL_TOP_FOCUS_DISABLED") | flag("ROTATES_WITH_CONTENT")
