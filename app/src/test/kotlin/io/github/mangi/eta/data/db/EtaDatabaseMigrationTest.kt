@@ -57,6 +57,7 @@ class EtaDatabaseMigrationTest {
                 EtaDatabase.MIGRATION_20_21,
                 EtaDatabase.MIGRATION_21_22,
                 EtaDatabase.MIGRATION_22_23,
+                EtaDatabase.MIGRATION_23_24,
             )
             .build()
         try {
