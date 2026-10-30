@@ -332,6 +332,8 @@ class AgentRuntimeScreenOnTest {
 
             guiRun.session.controller.cancel()
             guiRun.session.complete(AgentRuntimeWire.RunResult(guiRun.runId, true, "完成"))
+            // A retained GUI pause must not replace the independent background task's status.
+            // Unlike upstream's single runStatus, every active task keeps its own notification.
             service.assertTaskStatuses(mapOf(background.runId to background.overlayState.status))
             val guiCoordinator = service.field<GuiControlCoordinator>("guiControl")
             assertTrue(guiCoordinator.state.value.userPaused)

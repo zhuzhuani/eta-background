@@ -58,6 +58,10 @@ class AgentPromptBuilderTest {
         assertTrue(terminal.contains("profiles"))
         assertTrue(terminal.contains("terminal_job"))
         assertTrue(terminal.contains("terminal_daemon"))
+        assertTrue(terminal.contains("ETA_TASK_RESULT_PATH"))
+        assertTrue(terminal.contains("Unconfirmed"))
+        assertTrue(terminal.contains("分页读取完整输出"))
+        assertTrue(terminal.contains("持久化任务结果详情"))
         assertFalse(terminal.contains("async=true"))
         assertFalse(terminal.contains("read_async_result"))
     }

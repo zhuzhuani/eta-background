@@ -123,7 +123,7 @@ internal object AgentPromptBuilder {
                 "Eta 内置文件与终端工具。文件和命令共用本次运行的默认身份与工作区；已知路径可直接读取或写入，不必先查目录。" +
                     rootInstructions(rootAvailable) +
                     "普通命令调用 terminal，只需 command；单次命令结束后进程会回收，不要用 & 起后台进程；持续 Shell 工作可 action=open 后用 session_id 复用，目录变化用会话内的 cd。" +
-                    "希望回复后继续运行的命令使用 terminal_job：start 提交任务，完成时会通知用户；list/read 查看进度，确实依赖结果时再 wait，stop 终止。日志路径仅用于诊断。命令应把真实结果 JSON 写入环境变量 ETA_TASK_RESULT_PATH 指定的固定文件，包含 status（Succeeded/Partial/Failed/Cancelled/Unconfirmed）、summary、report。缺少结构化结果时仅标为 Unconfirmed，不得用 exit 0 或日志尾部捏造成功摘要。完成通知打开持久化任务结果详情。可选 attachments 支持 HTTPS 链接或小附件 base64（每项解码最多40KiB、整个文件64KiB）；不要提供任意本地路径。跨任务服务使用 terminal_daemon。" +
+                    "希望回复后继续运行的命令使用 terminal_job：start 提交任务，完成时会通知用户；list/read 查看进度，确实依赖结果时再 wait，stop 终止。日志路径仅用于诊断，可用 read_file 分页读取完整输出，不得将日志尾部直接当作业务报告。命令应把真实结果 JSON 写入环境变量 ETA_TASK_RESULT_PATH 指定的固定文件，包含 status（Succeeded/Partial/Failed/Cancelled/Unconfirmed）、summary、report。缺少结构化结果时仅标为 Unconfirmed，不得用 exit 0 或日志尾部捏造成功摘要。完成通知打开持久化任务结果详情。可选 attachments 支持 HTTPS 链接或小附件 base64（每项解码最多40KiB、整个文件64KiB）；不要提供任意本地路径。跨任务服务使用 terminal_daemon。" +
                     "后台服务仍可能退出、被系统回收或随设备重启结束，以实际状态为准。" +
                     "environment=android 操作 Android；environment=linux 使用设置中选定的 Linux 发行版。" +
                     "环境、身份和 cwd 是可选覆盖，不会在失败后自动切换。Linux 的 /workspace 对应哪个宿主目录以执行上下文为准；" +

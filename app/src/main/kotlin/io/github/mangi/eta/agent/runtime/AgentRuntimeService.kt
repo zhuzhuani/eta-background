@@ -1071,6 +1071,8 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
             return
         }
         if (runs.contains(run) && !run.session.isTerminal) {
+            // Upstream refreshes the GUI owner here; our hidden/multi-run backend must also
+            // project background tasks without acquiring GUI ownership or waking the screen.
             publishExecutionState()
             return
         }

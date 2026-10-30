@@ -97,6 +97,7 @@ internal class SubagentExecutor(
         val profile = entry.profile
         val subagentId = entry.subagentId
         val childController = AgentRunController()
+        // Preserve cancellation and pause/resume propagation for screen-off/user-paused parent runs.
         val controllerBinding = parentController.linkChild(childController)
 
         val resolvedConfig = runCatching { configProvider() }.getOrElse { throwable ->

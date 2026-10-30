@@ -42,6 +42,8 @@ class AgentExecutionServiceTest {
                 assertEquals(context.getString(R.string.overlay_reasoning), notification.extras.getString("android.shortCriticalText"))
             }
 
+            // The upstream single runStatus becomes an empty per-run snapshot locally;
+            // the independent terminal lease must remain ongoing but not promoted.
             AgentExecutionService.updateTasks(context, emptyList())
             shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(1))
             val remaining = context.getSystemService(NotificationManager::class.java).activeNotifications.single().notification

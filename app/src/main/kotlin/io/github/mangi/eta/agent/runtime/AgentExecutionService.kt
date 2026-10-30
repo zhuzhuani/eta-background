@@ -278,7 +278,7 @@ internal class AgentExecutionService : Service() {
             }
         }
 
-        internal fun usesSystemTaskSurface(): Boolean = Build.VERSION.SDK_INT >= 36
+        internal fun usesSystemTaskSurface(): Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA
         internal fun taskNotificationsEnabled(context: Context): Boolean {
             val manager = context.getSystemService(NotificationManager::class.java)
             return manager.areNotificationsEnabled() &&
@@ -368,6 +368,8 @@ internal class AgentExecutionService : Service() {
                 builder.setStyle(Notification.ProgressStyle().setProgressIndeterminate(progressing)
                     .setProgressSegments(listOf(Notification.ProgressStyle.Segment(100))).setProgress(if (completed) 100 else 0))
                     .setShortCriticalText(if (completed) label.take(7) else shortText(context, task.status))
+                // Upstream's API 36-compatible promotion protocol: do not call the
+                // API 36.1-only setter, and never promote terminal-only service leases.
                 if (progressing) builder.extras.putBoolean("android.requestPromotedOngoing", true)
             }
             return builder.build()
