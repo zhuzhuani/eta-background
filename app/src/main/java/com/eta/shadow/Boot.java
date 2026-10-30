@@ -256,7 +256,27 @@ public final class Boot {
         return invalid != null ? invalid : new JSONObject().put("ok", true).put("geometry", geometry);
     }
 
+    private static final ThreadLocal<java.util.Set<AccessibilityNodeInfo>> borrowedNodes = new ThreadLocal<>();
+
+    private static AccessibilityNodeInfo borrow(AccessibilityNodeInfo node) {
+        java.util.Set<AccessibilityNodeInfo> nodes = borrowedNodes.get();
+        if (node != null && nodes != null) nodes.add(node);
+        return node;
+    }
+
     private static JSONObject handle(JSONObject req) throws Exception {
+        java.util.Set<AccessibilityNodeInfo> previous = borrowedNodes.get();
+        if (previous != null) return handleObserved(req);
+        java.util.Set<AccessibilityNodeInfo> nodes = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        borrowedNodes.set(nodes);
+        try { return handleObserved(req); }
+        finally {
+            borrowedNodes.remove();
+            for (AccessibilityNodeInfo node : nodes) try { node.recycle(); } catch (Throwable ignored) { }
+        }
+    }
+
+    private static JSONObject handleObserved(JSONObject req) throws Exception {
         if (service == null) return new JSONObject().put("ok", false).put("code", "SERVICE_NOT_READY");
         String command = req.optString("cmd");
         if ("ping".equals(command) || "notify".equals(command)) return dispatch(req);
@@ -322,26 +342,115 @@ public final class Boot {
         return idx < 0 ? null : all.valueAt(idx);
     }
 
+    /** Window selection never borrows a root from another display, an IME or an accessibility overlay
+     * when application windows exist. Multiple windows from the selected application are retained. */
+    private static List<AccessibilityWindowInfo> applicationWindows(List<AccessibilityWindowInfo> windows) {
+        List<AccessibilityWindowInfo> out = new ArrayList<>();
+        if (windows == null) return out;
+        AccessibilityWindowInfo preferred = null;
+        int rank = Integer.MIN_VALUE;
+        for (AccessibilityWindowInfo window : windows) {
+            if (window.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+            int candidate = (window.isFocused() ? 4 : 0) + (window.isActive() ? 2 : 0);
+            if (preferred == null || candidate > rank) { preferred = window; rank = candidate; }
+        }
+        // Legacy providers can omit window types. Preserve observation on this exact display only.
+        if (preferred == null) {
+            for (AccessibilityWindowInfo window : windows) {
+                int type = window.getType();
+                if (type != AccessibilityWindowInfo.TYPE_INPUT_METHOD &&
+                        type != AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY &&
+                        type != AccessibilityWindowInfo.TYPE_SYSTEM) out.add(window);
+            }
+            return out;
+        }
+        AccessibilityNodeInfo root = borrow(preferred.getRoot());
+        String pkg = root == null || root.getPackageName() == null ? "" : root.getPackageName().toString();
+        out.add(preferred);
+        if (!pkg.isEmpty()) for (AccessibilityWindowInfo window : windows) {
+            if (window == preferred || window.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+            AccessibilityNodeInfo other = borrow(window.getRoot());
+            if (other != null && pkg.contentEquals(other.getPackageName() == null ? "" : other.getPackageName())) out.add(window);
+        }
+        return out;
+    }
+
     private static List<AccessibilityNodeInfo> flatten(List<AccessibilityWindowInfo> list, int limit) {
         List<AccessibilityNodeInfo> out = new ArrayList<>();
-        if (list == null) return out;
-        for (AccessibilityWindowInfo w : list) {
-            if (out.size() >= limit) break;
-            AccessibilityNodeInfo root = w.getRoot();
+        limit = Math.max(1, Math.min(limit, 1000));
+        int visited = 0;
+        for (AccessibilityWindowInfo w : applicationWindows(list)) {
+            if (out.size() >= limit || visited >= 8000) break;
+            AccessibilityNodeInfo root = borrow(w.getRoot());
             if (root == null) continue;
             ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>();
             q.add(root);
-            while (!q.isEmpty() && out.size() < limit) {
+            while (!q.isEmpty() && out.size() < limit && visited++ < 8000) {
                 AccessibilityNodeInfo n = q.poll();
                 if (n == null) continue;
-                out.add(n);
-                for (int i = 0; i < n.getChildCount() && out.size() + q.size() < limit; i++) {
-                    AccessibilityNodeInfo ch = n.getChild(i);
+                Rect bounds = new Rect(); n.getBoundsInScreen(bounds);
+                // Hidden/container nodes may have visible descendants; traverse them, but they
+                // cannot exhaust the returned node budget before the useful application controls.
+                if (n.isVisibleToUser() && !bounds.isEmpty()) out.add(n);
+                for (int i = 0; i < n.getChildCount() && q.size() < 4096; i++) {
+                    AccessibilityNodeInfo ch = borrow(n.getChild(i));
                     if (ch != null) q.add(ch);
                 }
             }
         }
         return out;
+    }
+
+    /** Scoped evidence only, never a permanent capability disable. Every dump/list probes again. */
+    static final class TreeObservationPolicy {
+        private static final class Evidence {
+            String identity; long first; long last; int samples;
+            Evidence(String identity, long now) { this.identity = identity; first = last = now; samples = 1; }
+        }
+        private final java.util.LinkedHashMap<String, Evidence> evidence = new java.util.LinkedHashMap<>();
+        synchronized String observe(String scope, String identity, int count, long now, boolean windowsMissing) {
+            if (count > 0) { evidence.remove(scope); return "ready"; }
+            if (windowsMissing) { evidence.remove(scope); return "pending"; }
+            Evidence prior = evidence.get(scope);
+            if (prior == null || !prior.identity.equals(identity) || now < prior.last || now - prior.last > 10000) {
+                prior = new Evidence(identity, now); evidence.put(scope, prior);
+            } else if (now - prior.last >= 500) { prior.samples++; prior.last = now; }
+            while (evidence.size() > 128) evidence.remove(evidence.keySet().iterator().next());
+            // Missing windows mean the provider has not published this display yet, not that
+            // Root's session/display vanished. Do not infer an unavailable tree from that case.
+            return !windowsMissing && prior.samples >= 3 && now - prior.first >= 1500 ? "unavailable" : "pending";
+        }
+    }
+    private static final TreeObservationPolicy treeObservations = new TreeObservationPolicy();
+
+    private static JSONObject treeState(JSONObject response, JSONObject req,
+            List<AccessibilityWindowInfo> windows, int nodeCount) throws Exception {
+        int did = req.optInt("displayId", -1);
+        List<AccessibilityWindowInfo> selected = applicationWindows(windows);
+        StringBuilder identity = new StringBuilder();
+        for (AccessibilityWindowInfo window : selected) {
+            AccessibilityNodeInfo root = borrow(window.getRoot());
+            identity.append(window.getId()).append(':').append(window.isFocused()).append(':')
+                    .append(window.isActive()).append(':')
+                    .append(root == null || root.getPackageName() == null ? "" : root.getPackageName()).append('|');
+        }
+        boolean missing = windows == null || windows.isEmpty() || selected.isEmpty();
+        boolean knownPackage = false;
+        for (AccessibilityWindowInfo window : selected) {
+            AccessibilityNodeInfo root = borrow(window.getRoot());
+            if (root != null && root.getPackageName() != null && root.getPackageName().length() > 0) knownPackage = true;
+        }
+        boolean pendingIdentity = missing || !knownPackage;
+        JSONObject expected = req.optJSONObject("expectedGeometry");
+        String generation = req.optString("generation", "") + ":" + req.optString("manualInputGeneration", "")
+                + ":" + (expected == null ? "" : expected.optString("generation", ""));
+        String state = treeObservations.observe(req.optString("sessionId", "callback") + ":" + did,
+                identity.toString() + generation, nodeCount, SystemClock.elapsedRealtime(), pendingIdentity);
+        response.put("displayId", did).put("count", nodeCount).put("nodeCount", nodeCount).put("treeStatus", state);
+        if (!"ready".equals(state)) response.put("code", "pending".equals(state) ? "UI_TREE_PENDING" : "UI_TREE_UNAVAILABLE")
+                .put("reason", missing ? "ACCESSIBILITY_WINDOWS_PENDING" : "NO_VISIBLE_APPLICATION_NODES")
+                .put("hint", "无障碍树暂不可用不代表画面为空；请使用当前任务 screen_shot 观察并按该截图坐标操作，勿使用主屏或旧节点。后续观察会重新探测。 ");
+        return response;
     }
 
     private static String textOf(AccessibilityNodeInfo n) {
@@ -354,7 +463,6 @@ public final class Boot {
         int did = req.optInt("displayId", -1);
         int limit = req.optInt("limit", 250);
         List<AccessibilityWindowInfo> list = windowsOf(did);
-        if (list == null) return new JSONObject().put("ok", false).put("code", "DISPLAY_NOT_FOUND");
         JSONArray nodes = new JSONArray();
         int count = 0;
         for (AccessibilityNodeInfo n : flatten(list, limit)) {
@@ -375,7 +483,7 @@ public final class Boot {
             nodes.put(o);
             count++;
         }
-        return new JSONObject().put("ok", true).put("displayId", did).put("count", count).put("nodes", nodes);
+        return treeState(new JSONObject().put("ok", true).put("nodes", nodes), req, list, count);
     }
 
     /**
@@ -547,7 +655,7 @@ public final class Boot {
         AccessibilityNodeInfo cur = n;
         for (int i = 0; i < 6 && cur != null; i++) {
             if (cur.isClickable()) return cur;
-            cur = cur.getParent();
+            cur = borrow(cur.getParent());
         }
         return n;
     }
@@ -751,8 +859,9 @@ public final class Boot {
         int maxRows = req.optInt("maxRows", 40);
         int tol = req.optInt("tolerance", 40);
         List<Object[]> items = new ArrayList<>();
-        for (AccessibilityNodeInfo n : flatten(windowsOf(did), 500)) {
-            if (!n.isVisibleToUser()) continue;
+        List<AccessibilityWindowInfo> visibleWindows = windowsOf(did);
+        List<AccessibilityNodeInfo> visibleNodes = flatten(visibleWindows, 500);
+        for (AccessibilityNodeInfo n : visibleNodes) {
             String t = textOf(n).trim();
             if (t.isEmpty()) continue;
             Rect r = new Rect();
@@ -781,8 +890,9 @@ public final class Boot {
             cur.put(new JSONObject().put("t", it[2]));
         }
         if (cur != null && cur.length() > 0 && rows.length() < maxRows) rows.put(cur);
-        return new JSONObject().put("ok", true).put("rows", rows).put("rowCount", rows.length())
-                .put("hint", rows.length() == 0 ? "没有可读文字节点不代表画面为空；游戏和画布请改用 screen_shot" : "");
+        return treeState(new JSONObject().put("ok", true).put("rows", rows).put("rowCount", rows.length())
+                .put("hint", rows.length() == 0 ? "没有可读文字节点不代表画面为空；游戏和画布请改用 screen_shot" : ""),
+                req, visibleWindows, visibleNodes.size());
     }
 
     private static JSONObject diag(JSONObject req) throws Exception {
@@ -801,7 +911,7 @@ public final class Boot {
         JSONArray windows = new JSONArray();
         List<AccessibilityWindowInfo> visible = windowsOf(did);
         if (visible != null) for (AccessibilityWindowInfo window : visible) {
-            AccessibilityNodeInfo root = window.getRoot();
+            AccessibilityNodeInfo root = borrow(window.getRoot());
             Rect bounds = new Rect(); window.getBoundsInScreen(bounds);
             windows.put(new JSONObject().put("id", window.getId()).put("focused", window.isFocused())
                     .put("active", window.isActive()).put("type", window.getType())

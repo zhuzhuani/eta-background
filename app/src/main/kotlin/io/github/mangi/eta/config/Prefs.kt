@@ -46,6 +46,7 @@ internal object Prefs {
         const val AGENT_AUTO_COMPACTION_ENABLED = "agent_auto_compaction_enabled"
         const val AGENT_SUBAGENT_ENABLED = "agent_subagent_enabled"
         const val AGENT_SCREEN_OFF_EXECUTION = "agent_screen_off_execution"
+        const val AGENT_FLOATING_PREVIEW = "agent_floating_preview"
         const val AGENT_RUNTIME_CONFIG_JSON = "agent_runtime_config_json"
 
         /** 全部布尔开关及其默认值。 */
@@ -68,6 +69,7 @@ internal object Prefs {
             AGENT_AUTO_COMPACTION_ENABLED to true,
             AGENT_SUBAGENT_ENABLED to true,
             AGENT_SCREEN_OFF_EXECUTION to false,
+            AGENT_FLOATING_PREVIEW to false,
         )
 
         /** 由 Eta Runtime 最终裁决、不要求 Xposed 框架在线的开关。 */
@@ -81,6 +83,7 @@ internal object Prefs {
             AGENT_AUTO_COMPACTION_ENABLED,
             AGENT_SUBAGENT_ENABLED,
             AGENT_SCREEN_OFF_EXECUTION,
+            AGENT_FLOATING_PREVIEW,
         )
     }
 

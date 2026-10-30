@@ -29,6 +29,37 @@ public class ShadowToolsGeometryTest {
             ReflectionHelpers.ClassParameter.from(String.class, command), ReflectionHelpers.ClassParameter.from(JSONObject.class, args));
         return new JSONObject(result);
     }
+    @Test public void previewIsSessionBoundAndDoesNotResetOrReplaceToolGeometryOnFailure() throws Exception {
+        List<JSONObject> inputs = new ArrayList<>();
+        ShadowTools tools = tools((port, payload, timeout) -> {
+            JSONObject request = new JSONObject(payload); inputs.add(request);
+            assertEquals(ShadowTools.ENGINE_PORT, port);
+            assertEquals(2500, timeout);
+            return "{\"ok\":false,\"code\":\"SYSTEM_RESTARTED\"}";
+        });
+        JSONObject observation = geometry();
+        ReflectionHelpers.setField(tools, "observedGeometry", observation);
+        assertEquals("SYSTEM_RESTARTED", new JSONObject(tools.previewFrame()).getString("code"));
+        assertEquals(1, inputs.size());
+        assertEquals("preview", inputs.get(0).getString("cmd"));
+        assertEquals("task:8", inputs.get(0).getString("sessionId"));
+        assertEquals(8, inputs.get(0).getInt("displayId"));
+        assertEquals(8, ReflectionHelpers.<Integer>getField(tools, "display").intValue());
+        assertSame(observation, ReflectionHelpers.getField(tools, "observedGeometry"));
+    }
+    @Test public void previewRefusesMainParkedOrClosedHandlesWithoutTransport() throws Exception {
+        final int[] calls = {0};
+        ShadowTools tools = tools((port, payload, timeout) -> { calls[0]++; return "{\"ok\":true}"; });
+        ReflectionHelpers.setField(tools, "display", 0);
+        assertFalse(new JSONObject(tools.previewFrame()).getBoolean("ok"));
+        ReflectionHelpers.setField(tools, "display", 8);
+        ReflectionHelpers.setField(tools, "parked", true);
+        assertFalse(new JSONObject(tools.previewFrame()).getBoolean("ok"));
+        ReflectionHelpers.setField(tools, "parked", false);
+        ReflectionHelpers.setField(tools, "closed", true);
+        assertFalse(new JSONObject(tools.previewFrame()).getBoolean("ok"));
+        assertEquals(0, calls[0]);
+    }
     @Test public void emptyObserverGeometryCannotPoisonTheFullScreenshotGeometry() throws Exception {
         List<JSONObject> inputs = new ArrayList<>();
         ShadowTools tools = tools((port, payload, timeout) -> {

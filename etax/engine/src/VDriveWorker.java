@@ -83,6 +83,11 @@ class VDriveWorker implements VDrive.Worker {
 
     final java.util.HashMap<Integer, Frame> frames = new java.util.HashMap<>();
     JSONObject lastScreenshot;
+    // Preview pacing is independent of screenshot observations and task lifetime.
+    private long lastPreviewAt = -1;
+    private static final long PREVIEW_INTERVAL_MS = 200;
+    private static final int PREVIEW_MAX_SIDE = 640;
+    private static final int PREVIEW_MAX_JPEG_BYTES = 192 * 1024;
     DisplayGeometry lastDisplayGeometry;
     final DisplayManager.DisplayListener geometryListener = new DisplayManager.DisplayListener() {
         public void onDisplayAdded(int did) { }
@@ -722,7 +727,7 @@ class VDriveWorker implements VDrive.Worker {
     /** Commands that only look: they must not move the cursor or refresh idle clocks. */
     boolean isPassive(String cmd) {
         return "status".equals(cmd) || "ping".equals(cmd) || "sessions".equals(cmd)
-                || "clip".equals(cmd);
+                || "clip".equals(cmd) || "preview".equals(cmd);
     }
 
     /**
@@ -786,6 +791,8 @@ class VDriveWorker implements VDrive.Worker {
         }
         log("cmd=" + cmd0 + (target == null ? "" : " pkg=" + target.pkg));
         if (passive) {
+            // Preview uses the picked owner directly, never load/save the mutable cursor.
+            if ("preview".equals(cmd0)) return preview(req, target);
             // read-only: do not touch the cursor, the idle clock or the orphan flag
             return dispatch(cmd0, req);
         }
@@ -1906,6 +1913,72 @@ class VDriveWorker implements VDrive.Worker {
                 .put("inputHint", "截图坐标请传 coordinate_space=screenshot 与本次 frame_id；节点 bounds 使用 display 坐标。旋转后重新观察。")
                 // ready-to-copy next call: models kept dropping the required path argument
                 .put("read_with", readHint(path));
+    }
+
+    /** Demand-only preview: no screenshot ID, bitmap cache, observer, idle or capture lifecycle writes. */
+    JSONObject preview(JSONObject req, Session owner) throws Exception {
+        int did = req.optInt("displayId", -1);
+        if (owner == null || did <= 0 || owner.displayId != did || owner.vd == null
+                || owner.reader == null || owner.orphanAt != 0 || owner.handoffAt != 0
+                || !sessions.containsValue(owner))
+            return fail("PREVIEW_UNAVAILABLE", "preview requires an active owned hidden display");
+        long now = SystemClock.elapsedRealtime();
+        if (lastPreviewAt >= 0 && now - lastPreviewAt < PREVIEW_INTERVAL_MS)
+            return fail("PREVIEW_THROTTLED", "retry preview no more than five times per second")
+                    .put("retryAfterMs", PREVIEW_INTERVAL_MS - (now - lastPreviewAt));
+        lastPreviewAt = now;
+        Frame frame = frames.get(did);
+        if (frame == null || frame.image == null)
+            return fail("NO_FRAME", "hidden display has no captured frame");
+        DisplayGeometry geometry = geometry(did);
+        if (frame.geometry == null || !geometry.matches(frame.geometry.json()))
+            return fail("FRAME_GEOMETRY_CHANGED", "wait for a fresh hidden-display frame");
+        int fw = frame.image.getWidth(), fh = frame.image.getHeight();
+        // Bound transient full-frame allocation even if a malformed/exotic display reports huge metrics.
+        if (fw <= 0 || fh <= 0 || (long) fw * fh > 16_000_000L)
+            return fail("PREVIEW_SIZE_LIMIT", "capture dimensions exceed preview budget");
+        Image.Plane plane = frame.image.getPlanes()[0];
+        int stride = plane.getRowStride();
+        if (stride <= 0 || (long) (stride / 4) * fh > 16_000_000L)
+            return fail("PREVIEW_SIZE_LIMIT", "capture stride exceeds preview budget");
+        Bitmap raw = null, crop = null, logical = null, scaled = null;
+        try {
+            ByteBuffer pixels = CapturePixels.prepare(plane.getBuffer(), fw, fh, stride, plane.getPixelStride());
+            raw = Bitmap.createBitmap(stride / 4, fh, Bitmap.Config.ARGB_8888);
+            raw.copyPixelsFromBuffer(pixels);
+            crop = stride / 4 == fw ? raw : Bitmap.createBitmap(raw, 0, 0, fw, fh);
+            logical = geometry.logicalBitmap(crop);
+            float scale = Math.min(0.25f, (float) PREVIEW_MAX_SIDE / Math.max(geometry.width, geometry.height));
+            int width = Math.max(1, Math.round(geometry.width * scale));
+            int height = Math.max(1, Math.round(geometry.height * scale));
+            scaled = Bitmap.createScaledBitmap(logical, width, height, true);
+            // Throw before ByteArrayOutputStream grows beyond the wire budget.
+            ByteArrayOutputStream jpeg = new ByteArrayOutputStream(16 * 1024) {
+                @Override public synchronized void write(int value) {
+                    if (count >= PREVIEW_MAX_JPEG_BYTES) throw new IllegalStateException("PREVIEW_SIZE_LIMIT");
+                    super.write(value);
+                }
+                @Override public synchronized void write(byte[] bytes, int offset, int length) {
+                    if (length > PREVIEW_MAX_JPEG_BYTES - count) throw new IllegalStateException("PREVIEW_SIZE_LIMIT");
+                    super.write(bytes, offset, length);
+                }
+            };
+            if (!scaled.compress(Bitmap.CompressFormat.JPEG, 60, jpeg))
+                return fail("PREVIEW_ENCODE_FAILED", "could not encode preview");
+            if (!geometry.matches(geometry(did).json()))
+                return fail("FRAME_GEOMETRY_CHANGED", "display changed while encoding preview");
+            return new JSONObject().put("ok", true).put("displayId", did)
+                    .put("width", width).put("height", height).put("format", "jpeg")
+                    .put("imageBase64", android.util.Base64.encodeToString(jpeg.toByteArray(), android.util.Base64.NO_WRAP))
+                    .put("frameAgeMs", Math.max(0, SystemClock.elapsedRealtime() - frame.receivedAt));
+        } catch (IllegalStateException invalid) {
+            return fail("PREVIEW_UNAVAILABLE", "preview pixels or encoding unavailable");
+        } finally {
+            if (scaled != null && scaled != logical) scaled.recycle();
+            if (logical != null && logical != crop) logical.recycle();
+            if (crop != null && crop != raw) crop.recycle();
+            if (raw != null) raw.recycle();
+        }
     }
 
     boolean ensureShotDir() {

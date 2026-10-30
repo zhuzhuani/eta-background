@@ -61,6 +61,9 @@ internal object AgentToolRequirements {
             "search_recording_summaries", "search_system_memories", "search_saved_places",
             "search_qq_chat_images", "search_wechat_chat_images",
         )
+        io.github.mangi.eta.agent.model.AgentTaskToolCatalog.names.forEach {
+            put(it, LocalToolRequirement(RootRequirement.NONE))
+        }
         PersonalSearchTools.names.forEach { put(it, LocalToolRequirement(RootRequirement.REQUIRED, colorOs = true)) }
         AgentPhoneToolCatalog.entries.forEach { entry ->
             put(entry.name, LocalToolRequirement(entry.root, colorOs = entry.colorOs,

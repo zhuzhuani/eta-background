@@ -92,6 +92,40 @@ public class VDriveSessionsTest {
     }
     private int count() throws Exception { return VDrive.processLine("{\"cmd\":\"status\"}").getInt("count"); }
 
+    @Test public void previewDoesNotRefreshControllerIdleLease() throws Exception {
+        final long[] clock = {1000};
+        VDrive.clock = () -> clock[0];
+        String id = open("app.preview");
+        FakeWorker worker = made.get(id);
+        clock[0] += 299000;
+        JSONObject preview = VDrive.processLine(new JSONObject().put("cmd", "preview")
+                .put("sessionId", id).put("displayId", 12).toString());
+        assertTrue(preview.getBoolean("ok"));
+        assertEquals("preview", worker.lastRequest.getString("cmd"));
+        clock[0] += 2000;
+        VDrive.reapExpired();
+        assertTrue(worker.closeCalls > 0);
+    }
+
+    @Test public void previewCannotAcquireReviveOrFallBackToMainDisplay() throws Exception {
+        assertEquals("NO_SESSION", VDrive.processLine("{\"cmd\":\"preview\",\"sessionId\":\"never-opened\",\"displayId\":12}").getString("code"));
+        String id = open("app.preview");
+        FakeWorker worker = made.get(id);
+        JSONObject before = worker.lastRequest;
+        for (int display : new int[]{0, -1, 99}) {
+            assertEquals("PREVIEW_UNAVAILABLE", VDrive.processLine(new JSONObject().put("cmd", "preview")
+                    .put("sessionId", id).put("displayId", display).toString()).getString("code"));
+            assertSame(before, worker.lastRequest);
+        }
+        send(id, "finish");
+        before = worker.lastRequest;
+        assertEquals("PREVIEW_UNAVAILABLE", VDrive.processLine(new JSONObject().put("cmd", "preview")
+                .put("sessionId", id).put("displayId", 12).toString()).getString("code"));
+        assertSame(before, worker.lastRequest);
+        assertTrue(worker.parked);
+        assertFalse(worker.capturing);
+    }
+
     @Test public void geometryValidationDoesNotQueueBehindAWorkerWaitingForObserver() throws Exception {
         String id = open("app.private"); FakeWorker worker = made.get(id);
         ExecutorService executor = Executors.newSingleThreadExecutor();

@@ -8,7 +8,7 @@ import java.util.*;
 
 /** Root transport. Mutable display/input/capture state lives in independent workers. */
 public final class VDrive {
-    static final String BUILD = "20261028-e37-deploy";
+    static final String BUILD = "20261030-e38-preview";
     static java.util.function.BooleanSupplier health = () -> true;
     static volatile boolean systemInvalid;
     private static final String INSTANCE = UUID.randomUUID().toString();
@@ -274,8 +274,13 @@ public final class VDrive {
                     initialize = true;
                 }
                 if (slot == null) return error("NO_SESSION", "请先打开本任务的屏幕");
-                slot.touched = now();
+                if (!cmd.equals("preview")) slot.touched = now();
                 if (slot.closing && !cmd.equals("cancel")) return error("SESSION_CLOSED", "屏幕正在释放");
+                if (cmd.equals("preview") && (id.equals("legacy-mcp") || slot.parked
+                        || slot.worker == null || slot.worker.isParked() || !slot.worker.isCapturing()
+                        || req.optInt("displayId", -1) <= 0
+                        || req.optInt("displayId", -1) != slot.worker.displayId()))
+                    return error("PREVIEW_UNAVAILABLE", "预览只读取当前任务正在采集的后台屏幕");
             }
             // Reserve capacity above, but never hold the session monitor across system calls.
             if (initialize) {

@@ -185,6 +185,10 @@ internal class AgentLocalTools(
         runCatching {
             if (closed.get()) throw AgentRunCancelledException()
             val args = JSONObject(toolCall.argumentsJson.ifBlank { "{}" })
+            if (toolCall.name in io.github.mangi.eta.agent.model.AgentTaskToolCatalog.names) {
+                if (!memoryWritable) return@runCatching textResult(errorResult("TASKS_READ_ONLY", "当前角色上下文不允许修改自动任务"))
+                return@runCatching textResult(io.github.mangi.eta.agent.automation.AgentTaskTools(context).execute(toolCall.name, args))
+            }
             if (AgentToolRequirements.find(toolCall.name) != null &&
                 AgentToolRequirements.rootDenied(toolCall.name, args, rootAvailable())
             ) {

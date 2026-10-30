@@ -40,6 +40,21 @@ public class VDrivePointerTest {
         }
     }
 
+    @Test public void rejectedPreviewNeverChangesObservationOrWorkerIdleState() throws Exception {
+        JSONObject observation = new JSONObject().put("frameId", "7:existing").put("displayId", 7);
+        worker.lastScreenshot = observation;
+        worker.lastCmdAt = 123;
+        worker.orphanAt = 456;
+        assertTrue(worker.isPassive("preview"));
+        JSONObject result = worker.handle(new JSONObject().put("cmd", "preview").put("displayId", 0));
+        assertFalse(result.getBoolean("ok"));
+        assertSame(observation, worker.lastScreenshot);
+        assertEquals(123, worker.lastCmdAt);
+        assertEquals(456, worker.orphanAt);
+        assertEquals(0, worker.touches);
+        assertNull(worker.observed);
+    }
+
     @Test public void normalTapNeverBecomesNodeLongClick() throws Exception {
         worker.tap(new JSONObject().put("x", 100).put("y", 100));
         assertEquals(0, worker.observed.getInt("holdMs"));

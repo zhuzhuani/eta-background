@@ -1,6 +1,9 @@
 package io.github.mangi.eta.agent.runtime
 
 import com.eta.shadow.ShadowTools
+import io.github.mangi.eta.agent.display.EtaxPreviewRegistry
+import io.github.mangi.eta.agent.display.EtaxPreviewSession
+import io.github.mangi.eta.agent.display.EtaxPreviewSessionStore
 import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -12,6 +15,8 @@ internal interface ScreenToolConnection {
     fun execute(name: String, arguments: String): String?
     fun release(keepFinished: Boolean): Boolean
     fun keepAlive()
+    /** Dedicated engine preview command; must not mutate model screenshot/frame identity. */
+    fun previewFrame(): String? = null
 }
 
 private class ShadowScreenConnection(id: String) : ScreenToolConnection {
@@ -19,6 +24,7 @@ private class ShadowScreenConnection(id: String) : ScreenToolConnection {
     override fun execute(name: String, arguments: String) = tools.intercept(name, arguments)
     override fun release(keepFinished: Boolean) = tools.closeSession(keepFinished)
     override fun keepAlive() = tools.keepAlive()
+    override fun previewFrame() = tools.previewFrame()
 }
 
 /** Capacity is reserved before launch; a cancelled owner keeps its slot until engine cleanup ACK. */
@@ -66,11 +72,13 @@ internal class BackgroundScreenTools(
     private val registry: ScreenLeaseRegistry = sharedLeases,
     private val connectionFactory: (String) -> ScreenToolConnection = ::ShadowScreenConnection,
     private val retryDelayMs: Long = 150,
+    private val previewRegistry: EtaxPreviewSessionStore = EtaxPreviewRegistry.store,
 ) : AutoCloseable {
     private class Binding(val id: String, val app: String, val tools: ScreenToolConnection) {
         val closing = java.util.concurrent.atomic.AtomicBoolean()
         val released = CountDownLatch(1)
         var heartbeat: java.util.concurrent.ScheduledFuture<*>? = null
+        var previewRegistration: EtaxPreviewSessionStore.Registration? = null
     }
     private val lock = Any()
     private var binding: Binding? = null
@@ -143,6 +151,16 @@ internal class BackgroundScreenTools(
                 result = next.tools.execute(name, arguments)
             }
             if (runCatching { JSONObject(result.orEmpty()).optBoolean("ok") }.getOrDefault(false)) {
+                val opened = next
+                synchronized(lock) {
+                    if (!closed && !controller.isCancelled && !opened.closing.get() && binding === opened && opened.previewRegistration == null) {
+                        opened.previewRegistration = previewRegistry.register(
+                            EtaxPreviewSession(opened.id, runId, app, args.optString("app_name").trim().ifBlank { app }),
+                        ) {
+                            if (closed || controller.isCancelled || opened.closing.get()) null else opened.tools.previewFrame()
+                        }
+                    }
+                }
                 onAppOpened(app)
             }
             if (runCatching { JSONObject(result.orEmpty()).optString("code") in LOST_SESSION_CODES }.getOrDefault(false)) {
@@ -179,6 +197,10 @@ internal class BackgroundScreenTools(
 
     private fun cleanup(value: Binding, keepFinished: Boolean) {
         if (!value.closing.compareAndSet(false, true)) return
+        synchronized(lock) {
+            value.previewRegistration?.let(previewRegistry::unregister)
+            value.previewRegistration = null
+        }
         value.heartbeat?.cancel(false)
         var retries = 0
         fun attempt() {

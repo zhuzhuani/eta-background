@@ -20,16 +20,20 @@ internal object AgentTaskResultDelivery {
             report.lineSequence().map(String::trim).filter(String::isNotEmpty).joinToString(" ").take(240)
                 .ifBlank { "本轮已结束，但没有提供可读的任务报告；目标是否完成尚未确认。" }
         } else "执行失败：" + result.error.orEmpty().take(200).ifBlank { "未提供原因，请查看详情。" }
+        val automation = request.handoff?.takeIf { it.source == "automation" }
+            ?.let { AgentExternalArchivePayload.from(it.payload) }
+        val taskId = automation?.adapterPayload?.optString("taskId")?.takeIf { it.isNotBlank() }
         return store.save(TaskRunResult(
             runId = result.runId,
+            taskId = taskId,
             conversationId = AgentConversationIdentity.fromHandoff(request.handoff, request.runId),
-            title = request.prompt.take(80).ifBlank { "Agent 任务" },
+            title = automation?.title?.take(80)?.takeIf { it.isNotBlank() } ?: request.prompt.take(80).ifBlank { "Agent 任务" },
             status = status,
             summary = summary,
             report = report.ifBlank { "未提供详细结果。" },
             startedAt = startedAt,
             completedAt = System.currentTimeMillis().coerceAtLeast(startedAt),
-            source = "agent",
+            source = if (automation != null) "automation" else "agent",
         ))
     }
 }

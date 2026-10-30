@@ -19,6 +19,12 @@ sealed interface AppRoute : NavKey {
     data class TaskRunDetail(val runId: String) : AppRoute
 
     @Serializable
+    data object VirtualScreenPreview : AppRoute
+
+    @Serializable
+    data object ScheduledTasks : AppRoute
+
+    @Serializable
     data object Tools : AppRoute
 
     @Serializable

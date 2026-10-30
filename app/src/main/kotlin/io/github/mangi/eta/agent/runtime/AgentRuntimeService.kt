@@ -318,6 +318,17 @@ internal class AgentRuntimeService : Service(), LifecycleOwner, SavedStateRegist
         replyTo: Messenger?,
         isEtaProcess: Boolean,
     ) {
+        if (incoming.request.handoff?.source == "automation" &&
+            (!isEtaProcess || !io.github.mangi.eta.agent.automation.AgentTaskScheduler.isRegistered(incoming.request.runId))) {
+            incoming.close()
+            sendResultTo(replyTo, AgentRuntimeWire.RunResult(incoming.request.runId, false, "", "AUTOMATION_NOT_CLAIMED"))
+            return
+        }
+        if (incoming.request.handoff?.source == "automation" && runs.all().any { !it.session.isTerminal }) {
+            incoming.close()
+            sendResultTo(replyTo, AgentRuntimeWire.RunResult(incoming.request.runId, false, "", "AUTOMATION_RUNTIME_BUSY"))
+            return
+        }
         val run = admitRun(incoming.request, replyTo, incoming) ?: return
         enqueueRun(run) {
             thread(name = "agent-runtime-image-ingest") {

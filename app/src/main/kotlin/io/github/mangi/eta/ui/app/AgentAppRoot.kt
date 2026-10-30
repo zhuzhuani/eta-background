@@ -465,6 +465,13 @@ fun AgentAppRoot(
                     if (backStack.isEmpty()) backStack.add(AppRoute.Home)
                 }
             }
+            entry<AppRoute.VirtualScreenPreview>(swipeDismiss = swipeDismiss) {
+                io.github.mangi.eta.ui.screens.tasks.EtaxPreviewScreen(onBack = ::popRoute)
+            }
+            entry<AppRoute.ScheduledTasks>(swipeDismiss = swipeDismiss) {
+                io.github.mangi.eta.ui.screens.tasks.AgentTasksScreen(onBack = ::popRoute,
+                    onOpenRun = { pushRoute(AppRoute.TaskRunDetail(it)) })
+            }
             entry<AppRoute.TaskRunDetail>(swipeDismiss = swipeDismiss) { route ->
                 TaskRunDetailScreen(runId = route.runId, onBack = ::popRoute)
             }

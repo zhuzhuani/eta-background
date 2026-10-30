@@ -45,6 +45,7 @@ internal class AgentExecutionService : Service() {
     private var foregroundId = 0
     @Volatile private var startRejected = false
     private val replyConnections = mutableMapOf<String, NotificationReplyConnection>()
+    private var previewHost: io.github.mangi.eta.agent.display.EtaxFloatingPreviewHost? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -52,6 +53,7 @@ internal class AgentExecutionService : Service() {
         leases.attachOwner(owner)
         ensureChannel(this)
         ensureForeground()
+        previewHost = io.github.mangi.eta.agent.display.EtaxFloatingPreviewHost(this)
     }
 
     private fun ensureForeground() {
@@ -110,6 +112,8 @@ internal class AgentExecutionService : Service() {
     override fun onDestroy() {
         val current = instance === this
         if (current) instance = null
+        previewHost?.close()
+        previewHost = null
         replyConnections.values.toList().forEach { it.close() }
         stopQueue.close(leases.drainOwner(owner))
         if (current) cards.values.filterNot { it.completed }.map { it.runId }.forEach { removeCard(this, it) }

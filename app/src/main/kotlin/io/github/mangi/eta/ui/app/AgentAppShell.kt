@@ -422,6 +422,8 @@ private fun titleForRoute(route: AppRoute?): String = when (route) {
     is AppRoute.Home, is AppRoute.Browser -> ""
     is AppRoute.Terminal -> stringResource(R.string.route_terminal)
     is AppRoute.TaskRunDetail -> "任务详情"
+    is AppRoute.VirtualScreenPreview -> "虚拟屏预览"
+    is AppRoute.ScheduledTasks -> "自动任务"
     is AppRoute.Tools -> stringResource(R.string.route_tools)
     is AppRoute.WebToolsSettings -> stringResource(R.string.web_tools_settings_title)
     is AppRoute.Skills -> stringResource(R.string.route_skills)

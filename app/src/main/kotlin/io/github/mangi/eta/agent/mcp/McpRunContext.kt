@@ -284,8 +284,10 @@ internal class RoutingToolExecutor(
     private val local: AgentModelClient.ToolExecutor,
     private val mcp: McpToolExecutor,
     private val shadow: io.github.mangi.eta.agent.runtime.BackgroundScreenTools? = null,
+    private val beforeRouting: (String) -> String? = { null },
 ) : AgentModelClient.ToolExecutor, AutoCloseable {
     override fun execute(toolCall: AgentModelClient.ToolCall): AgentModelClient.ToolResult {
+        beforeRouting(toolCall.name)?.let { return AgentModelClient.ToolResult(it) }
         // etax: screen_* 后台虚拟屏工具，以及 terminal 里的界面类 shell 命令拦截
         shadow?.execute(toolCall.name, toolCall.argumentsJson)
             ?.let { return AgentModelClient.ToolResult(it) }

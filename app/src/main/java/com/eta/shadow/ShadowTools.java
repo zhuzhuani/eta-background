@@ -41,6 +41,18 @@ public final class ShadowTools {
                 + ",\"display\":" + display + "}";
     }
 
+    /** UI-only passive frame read. Never starts/restarts an engine or changes tool observations. */
+    public String previewFrame() {
+        if (closed || parked || !"hidden".equals(mode) || display <= 0)
+            return "{\"ok\":false,\"code\":\"PREVIEW_UNAVAILABLE\"}";
+        try {
+            return eng("preview", new JSONObject());
+        } catch (Throwable unavailable) {
+            // In particular do not call resetSession/received/Engine.warm on preview failure.
+            return "{\"ok\":false,\"code\":\"PREVIEW_UNAVAILABLE\"}";
+        }
+    }
+
     // ---------------------------------------------------------------- entry
 
     /**
@@ -434,6 +446,11 @@ public final class ShadowTools {
         }
         if (observedGeometry != null && ("tap".equals(cmd) || "press".equals(cmd) || "drag".equals(cmd) || "swipe".equals(cmd)))
             q.put("expectedGeometry", observedGeometry);
+        if ("preview".equals(cmd)) {
+            // Bypass received(): a stale UI preview must not invalidate/restart the agent's session.
+            q.put("sessionId", sessionId);
+            return send(ENGINE_PORT, q.toString(), 2500);
+        }
         String response = engine(q.toString());
         JSONObject result = new JSONObject(response);
         if ("shot".equals(cmd) && result.optBoolean("ok")) rememberGeometry(result);

@@ -807,6 +807,21 @@ private fun SettingsPageContent(
                 }
             }
 
+            item(key = "section_automation_preview") {
+                EtaPreferenceGroupTitle("后台实验功能")
+                EtaPreferenceGroup {
+                    SwitchPref(context = context, prefs = agentPrefs, title = "虚拟屏悬浮预览（实验性）",
+                        summary = "默认关闭，需要悬浮窗权限；可拖动、折叠和关闭，不发送触摸到后台App。",
+                        key = Prefs.Keys.AGENT_FLOATING_PREVIEW, icon = Icons.Rounded.Visibility,
+                        iconTint = EtaPreferenceColors.Blue)
+                    EtaPreferenceDivider()
+                    EtaArrowPreference(title = "查看后台虚拟屏", summary = "只读画面预览，离开页面或锁屏后停止抓帧",
+                        onClick = { onNavigate(AppRoute.VirtualScreenPreview) })
+                    EtaPreferenceDivider()
+                    EtaArrowPreference(title = "定时与事件任务", summary = "持久规则、执行历史与权限状态；可能受系统调度延迟影响",
+                        onClick = { onNavigate(AppRoute.ScheduledTasks) })
+                }
+            }
             item(key = "section_screen_off_experiment") {
                 EtaPreferenceGroupTitle(stringResource(R.string.background_experiments_title))
                 EtaPreferenceGroup {

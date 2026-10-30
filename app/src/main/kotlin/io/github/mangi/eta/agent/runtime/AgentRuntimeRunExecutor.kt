@@ -248,6 +248,7 @@ internal class AgentRuntimeRunExecutor(
                 local = executor,
                 mcp = McpToolExecutor(mcpSnapshot),
                 shadow = BackgroundScreenTools(request.runId, runController, onBackgroundScreenPhase, onBackgroundAppOpened),
+                beforeRouting = { name -> if (request.handoff?.source == "automation") AutomationToolPolicy.rejection(name) else null },
             )
             toolExecutor = routingExecutor
             toolsBinding = runController.register(routingExecutor::close)
@@ -261,7 +262,7 @@ internal class AgentRuntimeRunExecutor(
                 }
             }
             val subagentAllowed = {
-                request.config.subagentTools && currentPermissions().subagentTools
+                request.handoff?.source != "automation" && request.config.subagentTools && currentPermissions().subagentTools
             }
             val subagentExecutor = SubagentExecutor(
                 conversationKey = browserKey,
